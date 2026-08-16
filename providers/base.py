@@ -59,6 +59,13 @@ class Provider(ABC):
         model: str,
         messages: list[ChatMessage],
         tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
     ) -> ChatResponse:
-        """Send a chat completion request. Raises ProviderError on failure."""
+        """
+        Send a chat completion request. Raises ProviderError on failure.
+
+        tool_choice lets a caller force a specific tool (e.g. /graph-data
+        forcing render_chart) instead of leaving it to "auto", which is
+        the default when tools are provided but tool_choice isn't set.
+        """
         raise NotImplementedError

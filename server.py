@@ -103,28 +103,35 @@ def handle_message(adapter: MessagingAdapter, msg: IncomingMessage) -> None:
     else:
         result = parse_message(msg.text)
 
-    reply_text = _handle_parse_result(result, msg.chat_id)
+    reply_text, attachments = _handle_parse_result(result, msg.chat_id)
 
     try:
         adapter.send_message(msg.chat_id, reply_text)
+        for image_bytes, filename, caption in attachments:
+            adapter.send_file(msg.chat_id, image_bytes, filename, caption=caption)
     except MessagingError:
         pass  # nothing more we can do if the reply itself fails to send
 
 
-def _handle_parse_result(result: ParseResult, chat_id: str) -> str:
+def _handle_parse_result(result: ParseResult, chat_id: str) -> tuple[str, list[tuple[bytes, str, str]]]:
     if result.kind == "commands":
         results = run_chain(result.steps)
-        return format_summary(results)
+        attachments = [
+            (r.image_bytes, r.image_filename or "chart.png", r.text)
+            for r in results if r.image_bytes
+        ]
+        return format_summary(results), attachments
 
     if result.kind == "near_miss":
         with _pending_lock:
             _pending_confirmations[chat_id] = result
         return (
             f"Did you mean /{result.near_miss_suggestion}? "
-            f"(you typed \"{result.near_miss_word}\") — reply yes/no."
+            f"(you typed \"{result.near_miss_word}\") — reply yes/no.",
+            [],
         )
 
-    return _dispatcher_chat_reply(result.raw_text)
+    return _dispatcher_chat_reply(result.raw_text), []
 
 
 class WebhookHandler(BaseHTTPRequestHandler):

@@ -71,6 +71,31 @@ def save_result(command: str, topic_slug: str, filename: str, content: str) -> s
     return remote_path
 
 
+def save_bytes(command: str, topic_slug: str, filename: str, content: bytes) -> str:
+    """Same as save_result, but for binary content (e.g. a rendered chart
+    PNG) rather than text."""
+    remote_path = _rclone_path(command, topic_slug, filename)
+
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=f"_{filename}", delete=False) as f:
+        f.write(content)
+        tmp_path = f.name
+
+    try:
+        try:
+            result = subprocess.run(
+                ["rclone", "copyto", tmp_path, remote_path],
+                capture_output=True, text=True, timeout=60,
+            )
+        except OSError as e:
+            raise StorageError(f"rclone not available: {e}")
+        if result.returncode != 0:
+            raise StorageError(f"rclone failed: {result.stderr.strip()}")
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    return remote_path
+
+
 def save_file(command: str, topic_slug: str, local_path: str, filename: str | None = None) -> str:
     """Same as save_result, but for a file that already exists on disk (e.g.
     an image, a generated code file already written locally)."""

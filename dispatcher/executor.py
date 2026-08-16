@@ -21,7 +21,8 @@ from dispatcher.parser import Step
 from dispatcher.slugify import assign_slugs
 from providers.base import ChatMessage, ChatResponse, Provider, ProviderError
 from providers.registry import get_provider
-from storage.filen import StorageError, save_result
+from storage.filen import StorageError, save_bytes, save_result
+from tools.charts import CHART_TOOL_CHOICE, CHART_TOOL_NAME, CHART_TOOL_SCHEMA, ChartError, render_chart
 from tools.registry import TOOL_SCHEMAS
 from tools.registry import dispatch as dispatch_tool
 
@@ -29,7 +30,7 @@ from tools.registry import dispatch as dispatch_tool
 EXTENSION_FOR_COMMAND = {
     "research": "md",
     "code": "py",  # best-guess default; language-specific naming can improve this later
-    "graph-data": "md",
+    "graph-data": "png",
     "create-image": "png",
     "brainstorm": "md",
 }
@@ -38,6 +39,17 @@ EXTENSION_FOR_COMMAND = {
 # available to their provider calls. Research is the only one that needs
 # to look things up live; the others work from the prompt text alone.
 TOOL_ENABLED_COMMANDS = {"research"}
+
+# /graph-data doesn't get the research tool belt — it gets exactly one
+# forced tool (render_chart), so the model can't just answer in prose.
+# The model supplies the numbers; matplotlib draws the pixels, so the
+# chart can't hallucinate a wrong-looking trend.
+GRAPH_DATA_SYSTEM_PROMPT = (
+    "Extract the data needed to answer this into the render_chart tool call. "
+    "Use real numbers only — if exact figures aren't available in the given "
+    "context, use your best reasonable estimate rather than inventing precision "
+    "you don't have. Don't reply in prose; the only valid response is the tool call."
+)
 
 # Ceiling on tool-call round-trips per step, so a model that keeps calling
 # tools instead of answering can't spin forever and burn the day's quota.
@@ -96,6 +108,52 @@ class StepResult:
     contaminated_by: list[str] = field(default_factory=list)  # commands whose degradation fed this step
     saved_path: str | None = None
     save_error: str | None = None
+    # Set only for /graph-data — the rendered chart, sent as an attachment
+    # rather than (or alongside) plain text.
+    image_bytes: bytes | None = None
+    image_filename: str | None = None
+
+
+def _parse_tool_args(raw_args) -> dict:
+    if isinstance(raw_args, str):
+        try:
+            return json.loads(raw_args)
+        except json.JSONDecodeError:
+            return {}
+    return raw_args or {}
+
+
+def _run_graph_data_step(
+    provider: Provider, model: str, messages: list[ChatMessage]
+) -> tuple[bytes, str, str]:
+    """
+    Forces a render_chart tool call, renders it, and returns
+    (png_bytes, filename, caption_text). Raises ProviderError or
+    ChartError on failure — callers handle those the same way a normal
+    chat failure would (rotate to the next fallback).
+    """
+    response = provider.chat(
+        model=model, messages=messages, tools=[CHART_TOOL_SCHEMA], tool_choice=CHART_TOOL_CHOICE,
+    )
+    if not response.tool_calls:
+        raise ProviderError(f"{model} didn't call {CHART_TOOL_NAME} despite it being forced")
+
+    args = _parse_tool_args(response.tool_calls[0].arguments)
+    try:
+        png_bytes = render_chart(
+            chart_type=args["chart_type"],
+            title=args["title"],
+            labels=args["labels"],
+            series=args["series"],
+            x_label=args.get("x_label", ""),
+            y_label=args.get("y_label", ""),
+        )
+    except (KeyError, ChartError) as e:
+        raise ChartError(f"Model produced unusable chart data: {e}")
+
+    title = args.get("title", "chart")
+    filename = f"{title[:40].strip().replace(' ', '-') or 'chart'}.png"
+    return png_bytes, filename, f"📊 {title}"
 
 
 def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
@@ -116,11 +174,14 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
             last_error = str(e)
             continue
 
+        is_graph_data = step.command == "graph-data"
         use_tools = step.command in TOOL_ENABLED_COMMANDS
         tools = TOOL_SCHEMAS if use_tools else None
 
         messages = []
-        if use_tools:
+        if is_graph_data:
+            messages.append(ChatMessage(role="system", content=GRAPH_DATA_SYSTEM_PROMPT))
+        elif use_tools:
             messages.append(ChatMessage(role="system", content=CITATION_STYLE_PROMPT))
         if prior_context:
             messages.append(ChatMessage(
@@ -130,6 +191,17 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
         messages.append(ChatMessage(role="user", content=step.text))
 
         try:
+            if is_graph_data:
+                png_bytes, filename, caption = _run_graph_data_step(provider, model, messages)
+                return StepResult(
+                    step=step,
+                    text=caption,
+                    degraded=(i > 0),
+                    fallback_used=attempt if i > 0 else None,
+                    image_bytes=png_bytes,
+                    image_filename=filename,
+                )
+
             response = provider.chat(model=model, messages=messages, tools=tools)
             if use_tools:
                 response = _run_tool_loop(
@@ -142,7 +214,7 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
                 degraded=(i > 0),  # true if this wasn't the primary
                 fallback_used=attempt if i > 0 else None,
             )
-        except ProviderError as e:
+        except (ProviderError, ChartError) as e:
             last_error = str(e)
             continue
 
@@ -176,7 +248,17 @@ def run_chain(steps: list[Step]) -> list[StepResult]:
         # losing something the user thinks got archived is its own kind
         # of failure worth disclosing, same principle as the degradation
         # disclosure above.
-        if result.text:
+        if result.image_bytes:
+            try:
+                result.saved_path = save_bytes(
+                    command=step.command,
+                    topic_slug=step.topic_slug,
+                    filename=result.image_filename or f"{step.command}.png",
+                    content=result.image_bytes,
+                )
+            except StorageError as e:
+                result.save_error = str(e)
+        elif result.text:
             ext = EXTENSION_FOR_COMMAND.get(step.command, "txt")
             filename = f"{step.command}.{ext}"
             try:
