@@ -1,0 +1,27 @@
+# render.yaml
+#
+# Optional infra-as-code reference for the Render web service. If the
+# service was already created by hand via the Render dashboard ("Sign in
+# with GitHub"), just make sure its Build Command / Start Command match
+# these — no need to switch to Blueprint deploys just for this file to
+# matter.
+services:
+  - type: web
+    name: navi
+    runtime: python
+    plan: free
+    buildCommand: bash scripts/render_build.sh
+    startCommand: bash scripts/render_start.sh
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: RCLONE_CONF_B64
+        sync: false

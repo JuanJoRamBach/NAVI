@@ -1,0 +1,29 @@
+name: Daily opportunity scan
+
+on:
+  schedule:
+    # 07:15 UTC daily — a few minutes after the model digest so they don't
+    # compete for the same GitHub Actions minute, though free tier has
+    # plenty of headroom for both.
+    - cron: "15 7 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run opportunity scan
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python jobs/daily_opportunity_scan.py

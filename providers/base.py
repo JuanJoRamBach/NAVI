@@ -1,0 +1,64 @@
+"""
+providers/base.py
+
+The shared contract every provider (OpenRouter, Groq, NVIDIA NIM, whatever
+gets added later) implements. Modeled on the transport-interface pattern
+from LocalCodeCli: one shape in, one shape out, so swapping or adding a
+provider never touches calling code.
+"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ChatMessage:
+    role: str  # "system" | "user" | "assistant" | "tool"
+    content: str
+    tool_call_id: str | None = None
+    name: str | None = None
+    # Raw OpenAI-format tool_calls list, set on an assistant message that
+    # requested tool calls — needed to replay that turn back to the API
+    # when continuing a tool-call loop (see dispatcher/executor.py).
+    tool_calls: list[dict] | None = None
+
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict
+
+
+@dataclass
+class ChatResponse:
+    text: str | None
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    model_used: str = ""
+    raw: dict | None = None
+
+
+class ProviderError(Exception):
+    """Raised for any provider failure. Callers decide whether to rotate."""
+    def __init__(self, message: str, is_rate_limit: bool = False):
+        super().__init__(message)
+        self.is_rate_limit = is_rate_limit
+
+
+class Provider(ABC):
+    """Base class every concrete provider transport implements."""
+
+    name: str = "base"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    @abstractmethod
+    def chat(
+        self,
+        model: str,
+        messages: list[ChatMessage],
+        tools: list[dict] | None = None,
+    ) -> ChatResponse:
+        """Send a chat completion request. Raises ProviderError on failure."""
+        raise NotImplementedError
