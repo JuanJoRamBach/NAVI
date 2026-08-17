@@ -36,6 +36,10 @@ class ChatResponse:
     tool_calls: list[ToolCall] = field(default_factory=list)
     model_used: str = ""
     raw: dict | None = None
+    # Optional human-readable cost/usage note (e.g. "2.7 Neurons" on
+    # Cloudflare). Providers with no comparable per-call cost metric
+    # (Groq, OpenRouter, Ollama Cloud) just leave this None.
+    usage_note: str | None = None
 
 
 class ProviderError(Exception):

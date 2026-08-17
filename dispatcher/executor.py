@@ -112,6 +112,9 @@ class StepResult:
     # rather than (or alongside) plain text.
     image_bytes: bytes | None = None
     image_filename: str | None = None
+    # Provider-reported per-call cost, e.g. "2.7 Neurons" on Cloudflare.
+    # None for providers with no comparable metric.
+    usage_note: str | None = None
 
 
 def _parse_tool_args(raw_args) -> dict:
@@ -213,6 +216,7 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
                 text=response.text or "",
                 degraded=(i > 0),  # true if this wasn't the primary
                 fallback_used=attempt if i > 0 else None,
+                usage_note=response.usage_note,
             )
         except (ProviderError, ChartError) as e:
             last_error = str(e)
@@ -305,6 +309,8 @@ def format_summary(results: list[StepResult]) -> str:
 
         lines.append(header)
         lines.append(r.text)
+        if r.usage_note:
+            lines.append(f"⚡ {r.usage_note}")
         lines.append("")  # blank line between steps
 
     return "\n".join(lines).strip()

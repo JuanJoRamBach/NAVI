@@ -93,9 +93,13 @@ class CloudflareProvider(Provider):
                 arguments=tc.get("arguments") or tc.get("function", {}).get("arguments", {}),
             ))
 
+        neurons = result.get("usage", {}).get("neurons")
+        usage_note = f"{neurons:.2f} Neurons" if neurons is not None else None
+
         return ChatResponse(
             text=result.get("response"),
             tool_calls=tool_calls,
             model_used=model,
             raw=data,
+            usage_note=usage_note,
         )
