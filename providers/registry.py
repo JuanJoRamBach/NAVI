@@ -10,12 +10,15 @@ transport class, add one line here. Nothing else in the codebase changes.
 from config.store import config
 from providers.base import Provider
 from providers.groq import GroqProvider
+from providers.ollama_cloud import OllamaCloudProvider
 from providers.openrouter import OpenRouterProvider
 
 _TRANSPORTS: dict[str, type[Provider]] = {
     "openrouter": OpenRouterProvider,
     "groq": GroqProvider,
+    "ollama_cloud": OllamaCloudProvider,
     # "nvidia_nim": NvidiaNimProvider,  # add when built
+    # "cloudflare": CloudflareProvider,  # add when built
 }
 
 

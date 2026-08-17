@@ -59,8 +59,18 @@ DEFAULTS = {
         # chain. When one fails, the executor rotates through the fallback
         # list and flags the step as degraded in the final reply.
         "research": {
-            "primary": {"provider": "openrouter", "model": "meta-llama/llama-3.3-70b-instruct:free"},
-            "fallback": [{"provider": "openrouter", "model": "openai/gpt-oss-120b:free"}],
+            # Staged trial on Ollama Cloud (2026-08-17): minimax-m3:cloud this
+            # week, then gemma4:31b-cloud — swap the model string below to
+            # rotate. deepseek-v4-flash:cloud was the original third candidate
+            # but returned 403 "requires a subscription" on this account when
+            # tested directly, so it's dropped from the trial entirely, not
+            # just deprioritized. Picking a permanent winner once real usage
+            # (via Ollama's /api/usage) shows which one actually holds up.
+            # No fallback configured on purpose: a failure here IS the signal
+            # we're trying to observe, not something to mask behind an
+            # equally-untested backup.
+            "primary": {"provider": "ollama_cloud", "model": "minimax-m3:cloud"},
+            "fallback": [],
         },
         "code": {
             "primary": {"provider": "openrouter", "model": "openai/gpt-oss-120b:free"},

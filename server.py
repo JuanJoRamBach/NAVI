@@ -192,7 +192,12 @@ def _seed_keys_from_env() -> None:
     or set via chat once that lands), so env vars only matter until the
     real config takes over.
     """
-    for provider_name, env_var in (("groq", "GROQ_API_KEY"), ("openrouter", "OPENROUTER_API_KEY")):
+    for provider_name, env_var in (
+        ("groq", "GROQ_API_KEY"),
+        ("openrouter", "OPENROUTER_API_KEY"),
+        ("ollama_cloud", "OLLAMA_API_KEY"),
+        ("cloudflare", "CLOUDFLARE_API_KEY"),
+    ):
         if config.get_provider_key(provider_name):
             continue
         value = os.environ.get(env_var)
