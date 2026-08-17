@@ -67,8 +67,13 @@ DEFAULTS = {
             "fallback": [{"provider": "openrouter", "model": "meta-llama/llama-3.3-70b-instruct:free"}],
         },
         "graph-data": {
-            "primary": {"provider": "openrouter", "model": "meta-llama/llama-3.3-70b-instruct:free"},
-            "fallback": [{"provider": "openrouter", "model": "openai/gpt-oss-120b:free"}],
+            # Verified against OpenRouter's live /api/v1/models on 2026-08-17 —
+            # free pricing AND supports the "tools" param (required for the
+            # forced render_chart call). The two originally hardcoded here
+            # went stale within the same day they were written — exactly
+            # the churn problem the daily-ranking job is meant to solve.
+            "primary": {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
+            "fallback": [{"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}],
         },
         "create-image": {
             "primary": {"provider": "openrouter", "model": None},  # filled in only on days one's free
