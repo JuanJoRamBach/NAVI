@@ -73,8 +73,12 @@ DEFAULTS = {
             "fallback": [],
         },
         "code": {
-            "primary": {"provider": "openrouter", "model": "openai/gpt-oss-120b:free"},
-            "fallback": [{"provider": "openrouter", "model": "meta-llama/llama-3.3-70b-instruct:free"}],
+            # Verified directly against Cloudflare Workers AI on 2026-08-17 —
+            # real coding-specialist model, real 200 response, 2.7 Neurons for
+            # the test call (10,000/day free). No fallback yet since this is
+            # the first real thing wired in for /code.
+            "primary": {"provider": "cloudflare", "model": "@cf/qwen/qwen2.5-coder-32b-instruct"},
+            "fallback": [],
         },
         "graph-data": {
             # Verified against OpenRouter's live /api/v1/models on 2026-08-17 —
