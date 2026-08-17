@@ -2,10 +2,10 @@ name: Daily opportunity scan
 
 on:
   schedule:
-    # 07:15 UTC daily — a few minutes after the model digest so they don't
-    # compete for the same GitHub Actions minute, though free tier has
-    # plenty of headroom for both.
-    - cron: "15 7 * * *"
+    # 08:15 UTC = 10:15 Spain time during CEST (summer, UTC+2) — a few
+    # minutes after the model digest. Same DST caveat as that workflow:
+    # will read as 09:15 Spain time once winter CET kicks in.
+    - cron: "15 8 * * *"
   workflow_dispatch: {}
 
 jobs:

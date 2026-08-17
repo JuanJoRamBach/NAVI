@@ -39,18 +39,22 @@ DEFAULTS = {
         # notice and feel if something's wrong.
         #
         # dispatcher_autonomous: handles the two GitHub Actions jobs (daily
-        # model digest, daily opportunity scan). Deliberately uses the
-        # deprecated-but-generous model instead — low stakes if it breaks
-        # (you just miss a day's digest), and keeping it off the chat
-        # quota means a chatty day never eats into what the autonomous
-        # jobs need, or vice versa.
+        # model digest, daily opportunity scan). Kept off the chat quota so
+        # a chatty day never eats into what the autonomous jobs need, or
+        # vice versa. Uses gpt-oss-120b (2026-08-17) rather than the
+        # deprecated llama-3.1-8b-instant: each job runs once/day, so the
+        # smaller 1,000 RPD ceiling is irrelevant capacity-wise, and the
+        # opportunity-scan job specifically benefits from gpt-oss-120b's
+        # stronger instruction-following (it has to reliably refuse to
+        # speculate, not just summarize).
         #
-        # Current free-tier numbers (2026-08-16, verify in Groq console —
+        # Current free-tier numbers (2026-08-17, verify in Groq console —
         # these move):
         #   openai/gpt-oss-20b:    30 RPM / 1,000 RPD / 200K TPD
+        #   openai/gpt-oss-120b:   30 RPM / 1,000 RPD / 200K TPD
         #   llama-3.1-8b-instant:  30 RPM / 14,400 RPD / 500K TPD (deprecated)
         "dispatcher_chat": {"provider": "groq", "model": "openai/gpt-oss-20b"},
-        "dispatcher_autonomous": {"provider": "groq", "model": "llama-3.1-8b-instant"},
+        "dispatcher_autonomous": {"provider": "groq", "model": "openai/gpt-oss-120b"},
     },
     "task_routing": {
         # Placeholder routing per command until the live daily-ranked model

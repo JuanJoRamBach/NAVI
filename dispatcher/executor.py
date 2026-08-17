@@ -23,6 +23,7 @@ from providers.base import ChatMessage, ChatResponse, Provider, ProviderError
 from providers.registry import get_provider
 from storage.filen import StorageError, save_bytes, save_result
 from tools.charts import CHART_TOOL_CHOICE, CHART_TOOL_NAME, CHART_TOOL_SCHEMA, ChartError, render_chart
+from tools.image_gen import ImageGenError, generate_image
 from tools.registry import TOOL_SCHEMAS
 from tools.registry import dispatch as dispatch_tool
 
@@ -159,7 +160,26 @@ def _run_graph_data_step(
     return png_bytes, filename, f"📊 {title}"
 
 
+def _run_create_image_step(step: Step) -> StepResult:
+    """
+    /create-image has no LLM/provider involved at all — a fixed free
+    endpoint (see tools/image_gen.py), not something task_routing's
+    primary/fallback shape fits. Bypasses the routing/attempts loop below
+    entirely rather than forcing a "provider" that doesn't exist onto it.
+    """
+    try:
+        image_bytes = generate_image(step.text)
+    except ImageGenError as e:
+        return StepResult(step=step, text="", error=str(e))
+
+    filename = f"{step.topic_slug or 'image'}.png"
+    return StepResult(step=step, text=f"🎨 {step.text[:80]}", image_bytes=image_bytes, image_filename=filename)
+
+
 def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
+    if step.command == "create-image":
+        return _run_create_image_step(step)
+
     routing = config.get_task_routing(step.command)
     if not routing:
         return StepResult(step=step, text="", error=f"No routing configured for /{step.command}")
