@@ -19,6 +19,64 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402 — already a matplotlib dependency, no new install
+from matplotlib.colors import to_rgb  # noqa: E402
+
+# Dark, clean, "futuristic but grounded" theme — deliberately not just a
+# color swap: no chart-box border, minimal single-axis gridlines, generous
+# spacing, a soft ambient glow behind the plot, and vertical gradients on
+# bars are doing as much of the work as the palette is.
+_BG = "#12141c"
+_TEXT = "#e5e7eb"
+_MUTED = "#7d8394"
+_GRID = "#2a2d3a"
+_ACCENTS = ["#22d3ee", "#f472b6", "#4ade80", "#fbbf24", "#a78bfa", "#fb7185"]
+
+
+def _draw_ambient_glow(fig) -> None:
+    """Soft diffused radial glow blobs behind the whole figure — plain
+    numpy math (no scipy/blur dependency), just a smooth Gaussian falloff
+    per blob, alpha-blended over the dark background."""
+    bg_ax = fig.add_axes((0, 0, 1, 1), zorder=-10)
+    bg_ax.set_facecolor(_BG)
+    bg_ax.axis("off")
+
+    size = 300
+    yy, xx = np.mgrid[0:size, 0:size]
+    base = np.array(to_rgb(_BG))
+    canvas = np.tile(base, (size, size, 1))
+
+    blobs = [(0.12, 0.9, _ACCENTS[0], 0.20), (0.92, 0.08, _ACCENTS[1], 0.15)]
+    for cx, cy, color_hex, strength in blobs:
+        cx_px, cy_px = cx * size, (1 - cy) * size
+        dist = np.sqrt((xx - cx_px) ** 2 + (yy - cy_px) ** 2)
+        falloff = np.exp(-(dist ** 2) / (2 * (size * 0.42) ** 2)) * strength
+        color = np.array(to_rgb(color_hex))
+        canvas = canvas * (1 - falloff[..., None]) + color * falloff[..., None]
+
+    bg_ax.imshow(canvas, extent=(0, 1, 0, 1), origin="lower", aspect="auto")
+
+
+def _gradient_bars(ax, positions: list[float], heights: list[float], width: float, color_hex: str) -> None:
+    """Draws each bar as a vertical gradient (base accent color at the
+    bottom, fading toward a lighter tint at the top) instead of a flat
+    fill — clips a gradient image to each bar's exact rectangle."""
+    base = np.array(to_rgb(color_hex))
+    light = base + (1 - base) * 0.6
+    grad = np.linspace(0, 1, 256).reshape(256, 1, 1)
+    grad_rgb = light.reshape(1, 1, 3) * grad + base.reshape(1, 1, 3) * (1 - grad)
+    grad_rgba = np.concatenate([grad_rgb, np.full((256, 1, 1), 0.88)], axis=2)
+
+    for xpos, h in zip(positions, heights):
+        if h == 0:
+            continue
+        y0, y1 = (h, 0) if h < 0 else (0, h)
+        im = ax.imshow(
+            grad_rgba, extent=(xpos - width / 2, xpos + width / 2, y0, y1),
+            origin="lower", aspect="auto", zorder=3,
+        )
+        rect = plt.Rectangle((xpos - width / 2, y0), width, y1 - y0, transform=ax.transData)
+        im.set_clip_path(rect)
 
 CHART_TOOL_NAME = "render_chart"
 
@@ -95,41 +153,73 @@ def render_chart(
                 f"but there are {len(labels)} labels — they must match."
             )
 
-    fig, ax = plt.subplots(figsize=(8, 5), dpi=100)
+    fig = plt.figure(figsize=(8, 5), dpi=140)
+    fig.patch.set_facecolor(_BG)
+    _draw_ambient_glow(fig)
+    ax = fig.add_axes((0.09, 0.12, 0.85, 0.72))
+    ax.set_facecolor("none")
 
     if chart_type == "pie":
         values = series[0]["values"]
-        ax.pie(values, labels=labels, autopct="%1.1f%%")
+        wedges, _, autotexts = ax.pie(
+            values, labels=labels, autopct="%1.1f%%",
+            colors=_ACCENTS, startangle=90,
+            wedgeprops={"linewidth": 2, "edgecolor": _BG, "alpha": 0.92},
+            textprops={"color": _TEXT, "fontsize": 10},
+        )
+        for at in autotexts:
+            at.set_color(_BG)
+            at.set_fontweight("bold")
         ax.axis("equal")
     elif chart_type == "line":
-        for s in series:
-            ax.plot(labels, s["values"], marker="o", label=s["name"])
-        ax.set_xlabel(x_label)
-        ax.set_ylabel(y_label)
-        if len(series) > 1:
-            ax.legend()
-        ax.grid(True, alpha=0.3)
+        for i, s in enumerate(series):
+            color = _ACCENTS[i % len(_ACCENTS)]
+            ax.plot(labels, s["values"], marker="o", markersize=5, linewidth=2.2,
+                     color=color, alpha=0.9, label=s["name"])
+            ax.fill_between(range(len(labels)), s["values"], alpha=0.08, color=color)
+        _style_axes(ax, x_label, y_label, len(series) > 1)
     elif chart_type == "bar":
-        x = range(len(labels))
+        x = list(range(len(labels)))
         width = 0.8 / max(len(series), 1)
         for i, s in enumerate(series):
             offsets = [xi + i * width for xi in x]
-            ax.bar(offsets, s["values"], width=width, label=s["name"])
+            _gradient_bars(ax, offsets, s["values"], width * 0.88, _ACCENTS[i % len(_ACCENTS)])
+            ax.plot([], [], color=_ACCENTS[i % len(_ACCENTS)], linewidth=6, label=s["name"])  # legend swatch
         ax.set_xticks([xi + width * (len(series) - 1) / 2 for xi in x])
         ax.set_xticklabels(labels)
-        ax.set_xlabel(x_label)
-        ax.set_ylabel(y_label)
-        if len(series) > 1:
-            ax.legend()
-        ax.grid(True, axis="y", alpha=0.3)
+        ax.set_xlim(-0.5, len(labels) - 0.5)
+        ax.set_ylim(0, max(v for s in series for v in s["values"]) * 1.12)
+        _style_axes(ax, x_label, y_label, len(series) > 1)
     else:
         plt.close(fig)
         raise ChartError(f"Unknown chart_type: {chart_type}")
 
-    ax.set_title(title)
-    fig.tight_layout()
+    ax.set_title(title, color=_TEXT, fontsize=14, fontweight="bold", pad=16, loc="left")
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png")
+    fig.savefig(buf, format="png", facecolor=_BG)
     plt.close(fig)
     return buf.getvalue()
+
+
+def _style_axes(ax, x_label: str, y_label: str, show_legend: bool) -> None:
+    """Shared dark-theme styling for bar/line axes: no boxed border, only
+    a faint horizontal grid, muted tick labels — the details that make it
+    read as designed rather than as matplotlib's defaults."""
+    for spine in ("top", "right", "left"):
+        ax.spines[spine].set_visible(False)
+    ax.spines["bottom"].set_color(_GRID)
+
+    ax.tick_params(colors=_MUTED, length=0)
+    for label in ax.get_xticklabels() + ax.get_yticklabels():
+        label.set_color(_MUTED)
+
+    ax.set_xlabel(x_label, color=_MUTED, fontsize=10)
+    ax.set_ylabel(y_label, color=_MUTED, fontsize=10)
+
+    ax.grid(True, axis="y", color=_GRID, linewidth=0.8, alpha=0.7)
+    ax.set_axisbelow(True)
+
+    if show_legend:
+        legend = ax.legend(frameon=False, labelcolor=_TEXT, fontsize=9)
+        legend.get_frame().set_facecolor(_BG)
