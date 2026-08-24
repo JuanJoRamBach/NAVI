@@ -107,9 +107,16 @@ def _scan_lane(lane_name: str, queries: list[str]) -> str:
     return f"Scan failed for this lane on both compound models ({last_error}) — disclosed rather than silently skipped."
 
 
+LANE_COOLDOWN_SECONDS = 120  # let one lane's RPM window clear before starting the next
+
+
 def build_report() -> str:
+    import time
+
     sections = [f"Opportunity scan — {__import__('datetime').date.today().isoformat()}"]
-    for lane_name, queries in LANES:
+    for i, (lane_name, queries) in enumerate(LANES):
+        if i > 0:
+            time.sleep(LANE_COOLDOWN_SECONDS)
         sections.append(f"\n{lane_name}:")
         sections.append(_scan_lane(lane_name, queries))
     return "\n".join(sections)
