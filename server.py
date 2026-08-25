@@ -37,8 +37,15 @@ from messaging.telegram import TelegramAdapter
 from config.store import config
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher
+from push.sender import PushError, add_subscription, send_push, subscription_count
 
 PORT = int(os.environ.get("PORT", "10000"))
+
+# The PWA (navi-ui, on GitHub Pages) calls /push/* from a different
+# origin than this server — browsers block that without an explicit
+# CORS allow. Scoped to the one real frontend origin rather than "*",
+# since this endpoint accepts push subscription data.
+PWA_ORIGIN = "https://juanjorambach.github.io"
 
 CHAT_SYSTEM_PROMPT = (
     "You are NAVI, a personal AI agent for JuanJo (a UX/game designer job-hunting "
@@ -149,11 +156,33 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body.encode())
 
+    def _respond_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", PWA_ORIGIN)
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if self.path == "/":
             self._respond(200, "NAVI is running")
         else:
             self._respond(404, "not found")
+
+    def do_OPTIONS(self):
+        # CORS preflight — the browser sends this before the actual POST
+        # to /push/* because it's a cross-origin request with a JSON
+        # content type. Only the push routes need it; nothing else on
+        # this server is called cross-origin.
+        if self.path in ("/push/subscribe", "/push/test"):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", PWA_ORIGIN)
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+            return
+        self._respond(404, "not found")
 
     def do_POST(self):
         if self.path == "/webhook/telegram":
@@ -170,6 +199,27 @@ class WebhookHandler(BaseHTTPRequestHandler):
         if self.path == "/webhook/discord":
             self._read_json()
             self._respond(200)  # outbound-only phase — nothing to act on yet
+            return
+
+        if self.path == "/push/subscribe":
+            payload = self._read_json()
+            if not payload.get("endpoint"):
+                self._respond_json(400, {"error": "missing 'endpoint'"})
+                return
+            add_subscription(payload)
+            self._respond_json(200, {"ok": True, "subscriptions": subscription_count()})
+            return
+
+        if self.path == "/push/test":
+            try:
+                errors = send_push(
+                    "NAVI",
+                    "Test notification — if you see this, push is wired up correctly.",
+                )
+            except PushError as e:
+                self._respond_json(400, {"ok": False, "error": str(e)})
+                return
+            self._respond_json(200, {"ok": True, "errors": errors})
             return
 
         self._respond(404, "not found")

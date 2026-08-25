@@ -25,3 +25,7 @@ services:
         sync: false
       - key: RCLONE_CONF_B64
         sync: false
+      - key: VAPID_PRIVATE_KEY_B64
+        sync: false
+      - key: VAPID_SUBJECT
+        sync: false
