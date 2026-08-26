@@ -30,7 +30,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from dispatcher.executor import format_summary, run_chain
-from dispatcher.parser import ParseResult, parse_message
+from dispatcher.parser import COMMANDS, ParseResult, parse_message
 from messaging.base import IncomingMessage, MessagingAdapter, MessagingError
 from messaging.discord import DiscordAdapter
 from messaging.telegram import TelegramAdapter
@@ -167,6 +167,18 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             self._respond(200, "NAVI is running")
+        elif self.path == "/config/routing":
+            # Real provider/model roster for the PWA's "Today's models" and
+            # "Routing & fallbacks" panels — no API keys in here, just
+            # provider + model names, so it's safe to expose publicly.
+            self._respond_json(200, {
+                "roles": {
+                    "dispatcher_chat": config.get_role("dispatcher_chat"),
+                    "dispatcher_autonomous": config.get_role("dispatcher_autonomous"),
+                },
+                "task_routing": {cmd: config.get_task_routing(cmd) for cmd in COMMANDS},
+                "enabled_providers": config.enabled_providers(),
+            })
         else:
             self._respond(404, "not found")
 
