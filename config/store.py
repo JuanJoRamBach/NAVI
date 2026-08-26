@@ -109,10 +109,11 @@ DEFAULTS = {
             "primary": {"provider": "openrouter", "model": None},  # filled in only on days one's free
             "fallback": [],
         },
-        "brainstorm": {
-            "primary": {"provider": "openrouter", "model": "openai/gpt-oss-120b:free"},
-            "fallback": [{"provider": "openrouter", "model": "meta-llama/llama-3.3-70b-instruct:free"}],
-        },
+        # No "brainstorm" entry — retired as a standalone command (2026-08-27):
+        # Brainstorm mode's own conversational chat (dispatcher/modes/
+        # BRAINSTORM.md) does its job better, since the command was a
+        # one-shot fire with no continuity while the mode explicitly
+        # supports iterating on ideas across turns.
     },
     "storage": {
         "filen_configured": False,

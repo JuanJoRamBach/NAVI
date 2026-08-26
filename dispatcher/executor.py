@@ -60,7 +60,6 @@ EXTENSION_FOR_COMMAND = {
     "code": "py",  # best-guess default; language-specific naming can improve this later
     "graph-data": "png",
     "create-image": "png",
-    "brainstorm": "md",
 }
 
 # /graph-data doesn't get the research tool belt — it gets exactly one

@@ -17,7 +17,7 @@ the same output. Three possible results:
 import re
 from dataclasses import dataclass
 
-COMMANDS = ["research", "code", "graph-data", "create-image", "brainstorm"]
+COMMANDS = ["research", "code", "graph-data", "create-image"]
 
 # Max edit distance to flag as a "near miss" worth confirming. 2 catches
 # single-letter typos and transpositions without being so loose it flags
