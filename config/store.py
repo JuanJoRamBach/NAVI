@@ -54,13 +54,18 @@ DEFAULTS = {
         #   openai/gpt-oss-20b:    30 RPM / 1,000 RPD / 200K TPD
         #   openai/gpt-oss-120b:   30 RPM / 1,000 RPD / 200K TPD
         #   llama-3.1-8b-instant:  30 RPM / 14,400 RPD / 500K TPD (deprecated)
-        # DeepSeek-V4-Flash-0731 via LLM7 (2026-08-26): benchmarks clearly
-        # ahead of gpt-oss-20b/120b (52 vs 24 Artificial Analysis
-        # Intelligence Index, wins 6/6 shared benchmarks, 1M context vs
-        # 130k) and LLM7's free "turbo" tier (~1M tokens/day) comfortably
-        # covers normal chat volume. See the migration below for how this
-        # actually takes effect on an already-configured instance.
-        "dispatcher_chat": {"provider": "llm7", "model": "DeepSeek-V4-Flash-0731"},
+        # Tried DeepSeek-V4-Flash-0731 via LLM7 (2026-08-26) — benchmarks
+        # clearly ahead of gpt-oss-20b/120b on paper (52 vs 24 Artificial
+        # Analysis Intelligence Index, 1M context vs 130k), but real
+        # traffic that same day hit rate-limit + 503 "model temporarily
+        # busy" three times in a row. dispatcher_chat has no fallback on
+        # purpose (see above) specifically so a bad model choice here is
+        # felt immediately rather than silently degrading — reverted to
+        # gpt-oss-120b (proven-reliable Groq, and a real upgrade over the
+        # original 20b) rather than leave chat flaky. LLM7/DeepSeek stays
+        # registered as a provider — worth revisiting for a role with
+        # fallback room (task_routing), just not this one.
+        "dispatcher_chat": {"provider": "groq", "model": "openai/gpt-oss-120b"},
         "dispatcher_autonomous": {"provider": "groq", "model": "openai/gpt-oss-120b"},
     },
     "task_routing": {
@@ -221,3 +226,22 @@ def _migrate_dispatcher_chat_to_llm7():
 
 
 _migrate_dispatcher_chat_to_llm7()
+
+
+def _migrate_dispatcher_chat_off_llm7():
+    """
+    One-time revert (same day, 2026-08-26) — the LLM7 switch above hit
+    rate-limit + repeated 503 "model temporarily busy" under real traffic
+    within hours of shipping. dispatcher_chat has no fallback on purpose,
+    so this needs to be felt and fixed immediately, not left flaky. Own
+    guard flag, separate from the migration above, so both stay in the
+    history and this doesn't just silently undo it for instances that
+    never got the LLM7 migration in the first place.
+    """
+    if config.get("migrated_dispatcher_chat_off_llm7"):
+        return
+    config.set_role("dispatcher_chat", "groq", "openai/gpt-oss-120b")
+    config.set("migrated_dispatcher_chat_off_llm7", True)
+
+
+_migrate_dispatcher_chat_off_llm7()
