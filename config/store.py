@@ -109,6 +109,15 @@ DEFAULTS = {
             "primary": {"provider": "openrouter", "model": None},  # filled in only on days one's free
             "fallback": [],
         },
+        "summarize": {
+            # Own quota bucket, same reasoning as dispatcher_autonomous vs
+            # dispatcher_chat: a plain digest call is frequent and cheap
+            # enough that it shouldn't compete with dispatcher_chat's
+            # (no-fallback, felt-immediately) quota. gpt-oss-20b rather
+            # than 120b — summarization doesn't need the bigger model.
+            "primary": {"provider": "groq", "model": "openai/gpt-oss-20b"},
+            "fallback": [],
+        },
         # No "brainstorm" entry — retired as a standalone command (2026-08-27):
         # Brainstorm mode's own conversational chat (dispatcher/modes/
         # BRAINSTORM.md) does its job better, since the command was a
@@ -246,3 +255,21 @@ def _migrate_dispatcher_chat_off_llm7():
 
 
 _migrate_dispatcher_chat_off_llm7()
+
+
+def _migrate_add_summarize_routing():
+    """
+    One-time addition (2026-08-26) for instances whose config.json already
+    existed before /summarize's task_routing entry was added to DEFAULTS —
+    editing DEFAULTS alone only materializes for a brand-new store.
+    """
+    if config.get("migrated_add_summarize_routing"):
+        return
+    if not config.get_task_routing("summarize"):
+        config.set_task_routing(
+            "summarize", {"provider": "groq", "model": "openai/gpt-oss-20b"}, [],
+        )
+    config.set("migrated_add_summarize_routing", True)
+
+
+_migrate_add_summarize_routing()

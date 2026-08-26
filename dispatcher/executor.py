@@ -27,7 +27,7 @@ from providers.registry import ProviderNotConfigured, get_provider
 from storage.filen import StorageError, save_bytes, save_result
 from tools.charts import CHART_TOOL_CHOICE, CHART_TOOL_NAME, CHART_TOOL_SCHEMA, ChartError, render_chart
 from tools.image_gen import ImageGenError, generate_image
-from tools.registry import TOOL_SCHEMAS
+from tools.registry import TOOL_SCHEMAS, schemas_for
 from tools.registry import dispatch as dispatch_tool
 
 # DeepSeek-V4-Flash-0731 via LLM7 — the synthesis-phase model for
@@ -60,7 +60,21 @@ EXTENSION_FOR_COMMAND = {
     "code": "py",  # best-guess default; language-specific naming can improve this later
     "graph-data": "png",
     "create-image": "png",
+    "summarize": "md",
 }
+
+# /summarize gets exactly one tool (fetch_page), not the full research
+# belt — it's a single-phase digest, not a gather-then-synthesize
+# pipeline like /research. The model decides whether to call it: if
+# the input is already pasted text, there's nothing to fetch.
+SUMMARIZE_SYSTEM_PROMPT = (
+    "Produce a tight, faithful digest of the given content. If the message "
+    "contains a URL, call fetch_page to read it first, then summarize what you "
+    "fetched — don't just describe the link. If it's already pasted text, "
+    "summarize that directly. Keep it dense: hit the key points, skip padding, "
+    "no filler intro like 'Here is a summary'. Preserve concrete numbers, names, "
+    "and dates from the source."
+)
 
 # /graph-data doesn't get the research tool belt — it gets exactly one
 # forced tool (render_chart), so the model can't just answer in prose.
@@ -361,11 +375,59 @@ def _run_research_step(step: Step, prior_context: str | None) -> StepResult:
     )
 
 
+def _run_summarize_step(step: Step, prior_context: str | None) -> StepResult:
+    routing = config.get_task_routing("summarize")
+    if not routing:
+        return StepResult(step=step, text="", error="No routing configured for /summarize")
+
+    attempts = [routing["primary"]] + routing.get("fallback", [])
+    last_error = None
+
+    for i, attempt in enumerate(attempts):
+        model = attempt.get("model")
+        if not model:
+            continue
+        try:
+            provider = get_provider(attempt["provider"])
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        messages = [ChatMessage(role="system", content=SUMMARIZE_SYSTEM_PROMPT)]
+        if prior_context:
+            messages.append(ChatMessage(
+                role="system",
+                content=f"Context from a previous step in this chain:\n{prior_context}",
+            ))
+        messages.append(ChatMessage(role="user", content=step.text))
+
+        try:
+            response = provider.chat(model=model, messages=messages, tools=schemas_for(["fetch_page"]))
+            response, _ = run_tool_loop(
+                provider, model, messages, response,
+                context={"command": "summarize", "topic_slug": step.topic_slug},
+            )
+            return StepResult(
+                step=step,
+                text=response.text or "",
+                degraded=(i > 0),
+                fallback_used=attempt if i > 0 else None,
+                usage_note=response.usage_note,
+            )
+        except ProviderError as e:
+            last_error = str(e)
+            continue
+
+    return StepResult(step=step, text="", error=last_error or "All summarize providers failed")
+
+
 def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
     if step.command == "create-image":
         return _run_create_image_step(step)
     if step.command == "research":
         return _run_research_step(step, prior_context)
+    if step.command == "summarize":
+        return _run_summarize_step(step, prior_context)
 
     routing = config.get_task_routing(step.command)
     if not routing:
