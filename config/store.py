@@ -139,6 +139,14 @@ DEFAULTS = {
             "primary": {"provider": "groq", "model": "openai/gpt-oss-20b"},
             "fallback": [],
         },
+        "design-read": {
+            # The only vision-capable model in the current roster — LLM7's
+            # turbo-tier gemini-3.1-flash-lite. Nothing else configured
+            # (Groq/OpenRouter/Cloudflare/Ollama Cloud roster here) does
+            # vision, so no fallback chain yet.
+            "primary": {"provider": "llm7", "model": "gemini-3.1-flash-lite"},
+            "fallback": [],
+        },
         # No "brainstorm" entry — retired as a standalone command (2026-08-27):
         # Brainstorm mode's own conversational chat (dispatcher/modes/
         # BRAINSTORM.md) does its job better, since the command was a
@@ -339,3 +347,16 @@ def _migrate_add_tailor_routing():
 
 
 _migrate_add_tailor_routing()
+
+
+def _migrate_add_design_read_routing():
+    """One-time addition (2026-08-26) — same reasoning as
+    _migrate_add_summarize_routing, for /design-read."""
+    if config.get("migrated_add_design_read_routing"):
+        return
+    if not config.get_task_routing("design-read"):
+        config.set_task_routing("design-read", {"provider": "llm7", "model": "gemini-3.1-flash-lite"}, [])
+    config.set("migrated_add_design_read_routing", True)
+
+
+_migrate_add_design_read_routing()

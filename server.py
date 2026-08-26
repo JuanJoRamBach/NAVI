@@ -96,6 +96,11 @@ def handle_message(adapter: MessagingAdapter, msg: IncomingMessage) -> None:
     else:
         result = parse_message(msg.text)
 
+    if msg.image_data_url and result.kind == "commands":
+        for s in result.steps:
+            if s.command == "design-read":
+                s.image_data_url = msg.image_data_url
+
     reply_text, attachments = _handle_parse_result(result, msg.chat_id)
 
     try:

@@ -14,7 +14,12 @@ from dataclasses import dataclass, field
 @dataclass
 class ChatMessage:
     role: str  # "system" | "user" | "assistant" | "tool"
-    content: str
+    # Plain text for every existing use. A list of OpenAI-format content
+    # parts (e.g. [{"type": "text", ...}, {"type": "image_url", ...}]) is
+    # also accepted — every provider's _serialize_message forwards
+    # `content` through untouched, so vision content (see /design-read)
+    # needs no per-provider changes, just this wider type.
+    content: str | list[dict]
     tool_call_id: str | None = None
     name: str | None = None
     # Raw OpenAI-format tool_calls list, set on an assistant message that

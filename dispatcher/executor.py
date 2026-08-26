@@ -68,6 +68,7 @@ EXTENSION_FOR_COMMAND = {
     "note": "md",
     "remind": "md",
     "tailor": "md",
+    "design-read": "md",
 }
 
 # /summarize gets exactly one tool (fetch_page), not the full research
@@ -552,6 +553,74 @@ def _run_summarize_step(step: Step, prior_context: str | None) -> StepResult:
     return _run_text_transform_step(step, prior_context, "summarize", SUMMARIZE_SYSTEM_PROMPT, ["fetch_page"])
 
 
+# The only command whose input is an image, not text — routed to a
+# vision-capable model (see config/store.py's task_routing entry) via a
+# ChatMessage.content list (see providers/base.py) instead of a plain
+# string. Currently only reachable via a Telegram photo (see
+# messaging/telegram.py) — the PWA has no upload UI yet, deliberately
+# deferred (see NAVI v2 handoff notes).
+DESIGN_READ_SYSTEM_PROMPT = (
+    "You're given a screenshot of a UI or design. Identify the design pattern(s) "
+    "in use (e.g. 'card grid with sticky filter bar', 'stepped onboarding wizard', "
+    "'inline validation form') — be specific, not generic. Then write a ready-to-"
+    "paste prompt for Claude Code that would recreate this UI in a real codebase: "
+    "specific about layout, spacing, states, and interaction, not vague. "
+    "Structure your reply exactly as:\n\n"
+    "Pattern: <name>\n\n"
+    "Claude Code prompt:\n<the prompt, ready to paste as-is>"
+)
+
+
+def _run_design_read_step(step: Step, prior_context: str | None) -> StepResult:
+    if not step.image_data_url:
+        return StepResult(
+            step=step, text="",
+            error="No image attached — send a screenshot along with /design-read.",
+        )
+
+    routing = config.get_task_routing("design-read")
+    if not routing:
+        return StepResult(step=step, text="", error="No routing configured for /design-read")
+
+    attempts = [routing["primary"]] + routing.get("fallback", [])
+    last_error = None
+
+    user_content = [
+        {"type": "text", "text": step.text or "Read this design."},
+        {"type": "image_url", "image_url": {"url": step.image_data_url}},
+    ]
+
+    for i, attempt in enumerate(attempts):
+        model = attempt.get("model")
+        if not model:
+            continue
+        try:
+            provider = get_provider(attempt["provider"])
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        messages = [
+            ChatMessage(role="system", content=DESIGN_READ_SYSTEM_PROMPT),
+            ChatMessage(role="user", content=user_content),
+        ]
+
+        try:
+            response = provider.chat(model=model, messages=messages)
+            return StepResult(
+                step=step,
+                text=response.text or "",
+                degraded=(i > 0),
+                fallback_used=attempt if i > 0 else None,
+                usage_note=response.usage_note,
+            )
+        except ProviderError as e:
+            last_error = str(e)
+            continue
+
+    return StepResult(step=step, text="", error=last_error or "All design-read providers failed")
+
+
 # The CV lives at a link JuanJo controls (portfolio site, hosted PDF, etc.)
 # rather than pasted text or stored raw — set once via "/tailor cv: <link>",
 # read back on every later /tailor call. A deterministic "cv:" prefix
@@ -615,6 +684,8 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
         return _run_remind_step(step, prior_context)
     if step.command == "tailor":
         return _run_tailor_step(step, prior_context)
+    if step.command == "design-read":
+        return _run_design_read_step(step, prior_context)
 
     routing = config.get_task_routing(step.command)
     if not routing:

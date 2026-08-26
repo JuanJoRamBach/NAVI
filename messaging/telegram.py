@@ -10,6 +10,7 @@ idle). set_webhook() below is a one-time setup call, not something that
 runs on every message.
 """
 
+import base64
 import html
 import re
 
@@ -18,6 +19,7 @@ import requests
 from messaging.base import IncomingMessage, MessagingAdapter, MessagingError
 
 API_ROOT = "https://api.telegram.org/bot{token}/{method}"
+FILE_ROOT = "https://api.telegram.org/file/bot{token}/{file_path}"
 
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 
@@ -35,9 +37,25 @@ class TelegramAdapter(MessagingAdapter):
         message = payload.get("message") or payload.get("edited_message")
         if not message:
             return None  # e.g. a channel_post, callback_query, etc. — not handled yet
+
+        photos = message.get("photo")
         text = message.get("text")
-        if not text:
-            return None  # photo/sticker/etc. with no text — nothing for the parser to act on
+        image_data_url = None
+
+        if photos:
+            # A photo message routes straight to /design-read regardless
+            # of caption wording — sending a screenshot to the bot has no
+            # other purpose in this app, so requiring the user to also
+            # type the command every time would just be friction. The
+            # caption (if any) becomes extra instruction text for the step.
+            caption = (message.get("caption") or "").strip()
+            text = f"/design-read {caption}".strip()
+            try:
+                image_data_url = self._download_photo(photos[-1]["file_id"])
+            except MessagingError:
+                image_data_url = None  # step will surface "no image attached" itself
+        elif not text:
+            return None  # sticker/etc. with no text — nothing for the parser to act on
 
         chat = message.get("chat", {})
         sender = message.get("from", {})
@@ -47,7 +65,32 @@ class TelegramAdapter(MessagingAdapter):
             sender_id=str(sender.get("id", "")),
             sender_name=sender.get("username") or sender.get("first_name", ""),
             raw=payload,
+            image_data_url=image_data_url,
         )
+
+    def _download_photo(self, file_id: str) -> str:
+        """Resolves a Telegram file_id to bytes via getFile, then encodes
+        as a data: URL ready to drop into a vision-model ChatMessage."""
+        try:
+            resp = requests.get(self._url("getFile"), params={"file_id": file_id}, timeout=30)
+        except requests.RequestException as e:
+            raise MessagingError(f"Telegram getFile failed: {e}")
+        if resp.status_code >= 400:
+            raise MessagingError(f"Telegram getFile error {resp.status_code}: {resp.text[:300]}")
+
+        file_path = resp.json().get("result", {}).get("file_path", "")
+        try:
+            file_resp = requests.get(
+                FILE_ROOT.format(token=self.bot_token, file_path=file_path), timeout=30,
+            )
+        except requests.RequestException as e:
+            raise MessagingError(f"Telegram file download failed: {e}")
+        if file_resp.status_code >= 400:
+            raise MessagingError(f"Telegram file download error {file_resp.status_code}")
+
+        mime = "image/jpeg" if file_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
+        encoded = base64.b64encode(file_resp.content).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
 
     def send_message(self, chat_id: str, text: str) -> None:
         # Telegram caps messages at 4096 chars — split rather than truncate,
