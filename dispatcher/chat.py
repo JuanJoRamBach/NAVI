@@ -33,7 +33,7 @@ def run_mode_chat(mode: str, text: str) -> str:
     try:
         response = provider.chat(model=model, messages=messages, tools=tools)
         if tools and response.tool_calls:
-            response = run_tool_loop(
+            response, _messages = run_tool_loop(
                 provider, model, messages, response,
                 context={"command": f"chat-{mode}", "topic_slug": "chat"},
             )

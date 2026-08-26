@@ -32,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dispatcher.chat import run_mode_chat
 from dispatcher.executor import format_summary, run_chain
 from dispatcher.parser import COMMANDS, ParseResult, parse_message
+from dispatcher.research_status import get_status, set_status
 from messaging.base import IncomingMessage, MessagingAdapter, MessagingError
 from messaging.discord import DiscordAdapter
 from messaging.telegram import TelegramAdapter
@@ -45,6 +46,13 @@ PORT = int(os.environ.get("PORT", "10000"))
 # CORS allow. Scoped to the one real frontend origin rather than "*",
 # since this endpoint accepts push subscription data.
 PWA_ORIGIN = "https://juanjorambach.github.io"
+
+# Conservative — Web Push payloads are capped around 4KB total by the
+# push service itself (title + body + JSON overhead + encryption), not
+# something we control. A long /research report gets split across
+# several pushes rather than silently failing to deliver — same idea as
+# TelegramAdapter's own 4096-char chunking, just a smaller ceiling.
+PUSH_CHUNK_SIZE = 3000
 
 # In-memory only, deliberately not persisted: if a near-miss confirmation
 # is still pending across a Render restart, the worst case is the user
@@ -105,6 +113,14 @@ def _handle_parse_result(
             (r.image_bytes, r.image_filename or "chart.png", r.text)
             for r in results if r.image_bytes
         ]
+        # A step with a snippet (currently only /research) is long-form —
+        # the full report goes as an attached document, not chunked
+        # inline text; format_summary() already uses the snippet for the
+        # message body itself.
+        attachments += [
+            (r.text.encode("utf-8"), f"{r.step.command}.md", "")
+            for r in results if r.snippet and r.text
+        ]
         return format_summary(results), attachments
 
     if result.kind == "near_miss":
@@ -122,6 +138,38 @@ def _handle_parse_result(
     # and always pass the default ("normal"); the PWA sends whichever
     # mode the user has selected.
     return run_mode_chat(mode, result.raw_text), []
+
+
+def _deliver_via_push(title: str, text: str) -> None:
+    """Splits `text` across multiple pushes if it's too big for one
+    payload — each chunk becomes its own message bubble in the PWA via
+    the existing service-worker push handler, no frontend changes
+    needed. Best-effort: a failed push here has no user-facing fallback,
+    since the HTTP request that triggered the work is long gone."""
+    chunks = [text[i:i + PUSH_CHUNK_SIZE] for i in range(0, len(text), PUSH_CHUNK_SIZE)] or [""]
+    for i, chunk in enumerate(chunks):
+        chunk_title = title if len(chunks) == 1 else f"{title} ({i + 1}/{len(chunks)})"
+        try:
+            send_push(chunk_title, chunk)
+        except PushError:
+            pass
+
+
+def _run_research_async(result: ParseResult) -> None:
+    """Runs a /research command chain in the background — see /chat/send,
+    which acks immediately rather than blocking on this (gathering plus
+    up to 3 minutes of synthesis retries is too long to hold an HTTP
+    request open). Delivers the finished result via push; dispatcher/
+    research_status.py carries live progress in the meantime."""
+    try:
+        results = run_chain(result.steps)
+        text = format_summary(results)
+    except Exception as e:
+        set_status(None)
+        _deliver_via_push("NAVI — research failed", f"Something went wrong: {e}")
+        return
+    set_status(None)
+    _deliver_via_push("NAVI — research ready", text)
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -162,6 +210,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 "task_routing": {cmd: config.get_task_routing(cmd) for cmd in COMMANDS},
                 "enabled_providers": config.enabled_providers(),
             })
+        elif self.path == "/research/status":
+            # Polled by the PWA while an async /research job runs in the
+            # background — see dispatcher/research_status.py. `status` is
+            # null when nothing's in flight.
+            self._respond_json(200, {"status": get_status()})
         else:
             self._respond(404, "not found")
 
@@ -207,6 +260,19 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self._respond_json(400, {"error": "missing 'text'"})
                 return
             result = parse_message(text)
+
+            if result.kind == "commands" and any(s.command == "research" for s in result.steps):
+                # /research can take minutes (gathering, plus up to 3min
+                # of synthesis retries) — too long to hold this request
+                # open. Ack immediately, run in the background, deliver
+                # the finished report via push (see _run_research_async).
+                threading.Thread(target=_run_research_async, args=(result,), daemon=True).start()
+                self._respond_json(200, {
+                    "reply": "Researching — I'll ping you when it's ready. Feel free to keep chatting.",
+                    "async": True,
+                })
+                return
+
             # Attachments (e.g. a /graph-data chart image) aren't supported
             # over this channel yet — the PWA has no attachment UI built,
             # so they're dropped rather than silently mismatched.

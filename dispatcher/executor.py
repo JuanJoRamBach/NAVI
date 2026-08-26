@@ -14,18 +14,45 @@ depend on earlier ones' actual output). For each step:
 """
 
 import json
+import time
 from dataclasses import dataclass, field
 
 from config.store import config
+from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.parser import Step
+from dispatcher.research_status import set_status
 from dispatcher.slugify import assign_slugs
 from providers.base import ChatMessage, ChatResponse, Provider, ProviderError
-from providers.registry import get_provider
+from providers.registry import ProviderNotConfigured, get_provider
 from storage.filen import StorageError, save_bytes, save_result
 from tools.charts import CHART_TOOL_CHOICE, CHART_TOOL_NAME, CHART_TOOL_SCHEMA, ChartError, render_chart
 from tools.image_gen import ImageGenError, generate_image
 from tools.registry import TOOL_SCHEMAS
 from tools.registry import dispatch as dispatch_tool
+
+# DeepSeek-V4-Flash-0731 via LLM7 — the synthesis-phase model for
+# /research (see _run_research_step). Hardcoded rather than a
+# task_routing entry since this role is very specific: one-shot,
+# no-tools, huge-context synthesis over already-gathered material, not
+# a general dispatcher role.
+SYNTHESIS_PROVIDER = "llm7"
+SYNTHESIS_MODEL = "DeepSeek-V4-Flash-0731"
+
+# Retry a flaky synthesis call every 30s for 3 minutes before giving up
+# and falling back to the gathering model's own synthesis instead. LLM7's
+# free tier proved to have real shared-capacity hiccups ("model
+# temporarily busy") under light load — worth a few retries before
+# accepting the fallback's lower quality.
+SYNTHESIS_RETRY_DELAY_S = 30
+SYNTHESIS_MAX_ATTEMPTS = 6
+
+# Caps the gathered-material document handed to the synthesis model at
+# roughly gpt-oss-120b's ~130k-token context (assuming ~4 chars/token) —
+# not DeepSeek's much larger ~400k. This is deliberate: if DeepSeek is
+# unavailable, the fallback synthesis (see below) needs to read the same
+# document, so the cap has to fit whichever model actually ends up
+# reading it, not just the best case.
+RESEARCH_DOC_CHAR_BUDGET = 130_000 * 4
 
 # File extension per command — used when saving each step's output.
 EXTENSION_FOR_COMMAND = {
@@ -35,11 +62,6 @@ EXTENSION_FOR_COMMAND = {
     "create-image": "png",
     "brainstorm": "md",
 }
-
-# Which commands get the tool belt (web_search, fetch_page, save_note)
-# available to their provider calls. Research is the only one that needs
-# to look things up live; the others work from the prompt text alone.
-TOOL_ENABLED_COMMANDS = {"research"}
 
 # /graph-data doesn't get the research tool belt — it gets exactly one
 # forced tool (render_chart), so the model can't just answer in prose.
@@ -68,10 +90,13 @@ CITATION_STYLE_PROMPT = (
 
 def run_tool_loop(
     provider: Provider, model: str, messages: list[ChatMessage], response: ChatResponse, context: dict
-) -> ChatResponse:
+) -> tuple[ChatResponse, list[ChatMessage]]:
     """Executes any tool_calls in `response`, feeds results back to the
     model, and repeats until the model stops asking for tools or the
-    iteration ceiling is hit. Returns the final ChatResponse.
+    iteration ceiling is hit. Returns (final ChatResponse, full message
+    transcript) — the transcript lets a caller extract raw tool results
+    (see _extract_tool_results) without needing the model's own final
+    prose synthesis.
 
     Public (not `_`-prefixed) because dispatcher/chat.py reuses this for
     free-form mode-based chat, not just /research's command chain."""
@@ -99,7 +124,20 @@ def run_tool_loop(
         response = provider.chat(model=model, messages=messages, tools=TOOL_SCHEMAS)
         iterations += 1
 
-    return response
+    return response, messages
+
+
+def _extract_tool_results(messages: list[ChatMessage]) -> str:
+    """Concatenates every tool-result message from a run_tool_loop
+    transcript into one readable document — the raw gathered material
+    (search snippets, fetched page text), not the model's own prose
+    synthesis. Used by /research to hand DeepSeek the source material
+    directly rather than a re-summarized version of it."""
+    parts = []
+    for m in messages:
+        if m.role == "tool":
+            parts.append(f"### Result from {m.name}\n{m.content}")
+    return "\n\n".join(parts)
 
 
 @dataclass
@@ -119,6 +157,12 @@ class StepResult:
     # Provider-reported per-call cost, e.g. "2.7 Neurons" on Cloudflare.
     # None for providers with no comparable metric.
     usage_note: str | None = None
+    # Set only for /research — `text` is the full report (used for the
+    # Filen save and for chunked delivery where there's no real
+    # attachment support, e.g. push/PWA); `snippet` is a short version
+    # for channels that can send the full report as a real file
+    # alongside it (Telegram's caption + attached .md).
+    snippet: str | None = None
 
 
 def _parse_tool_args(raw_args) -> dict:
@@ -179,9 +223,150 @@ def _run_create_image_step(step: Step) -> StepResult:
     return StepResult(step=step, text=f"🎨 {step.text[:80]}", image_bytes=image_bytes, image_filename=filename)
 
 
+def _make_snippet(text: str, max_chars: int = 600) -> str:
+    """A short teaser for channels that can attach the full report as a
+    real file alongside it (Telegram). Cuts at the last paragraph break
+    before the limit when there is one, so it doesn't end mid-sentence."""
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    break_at = cut.rfind("\n\n")
+    if break_at > max_chars // 2:  # only use it if it's not absurdly early
+        cut = cut[:break_at]
+    return cut.rstrip() + "…"
+
+
+def _run_research_gather_phase(step: Step, prior_context: str | None) -> tuple[str, str, bool, dict | None, str | None]:
+    """
+    Phase 1 — runs the existing tool-calling loop (web_search/fetch_page/
+    save_note) using /research's configured primary/fallback chain,
+    unchanged from before. Returns (gathered_document, gathering_model's
+    own draft answer, degraded, fallback_used, error). `gathered_document`
+    is the raw tool-result transcript, not the model's prose — that's
+    what phase 2 (_run_research_synthesis) actually works from.
+    """
+    routing = config.get_task_routing("research")
+    if not routing:
+        return "", "", False, None, "No routing configured for /research"
+
+    attempts = [routing["primary"]] + routing.get("fallback", [])
+    last_error = None
+
+    for i, attempt in enumerate(attempts):
+        model = attempt.get("model")
+        if not model:
+            continue
+        try:
+            provider = get_provider(attempt["provider"])
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        messages = [ChatMessage(role="system", content=CITATION_STYLE_PROMPT)]
+        if prior_context:
+            messages.append(ChatMessage(
+                role="system",
+                content=f"Context from a previous step in this chain:\n{prior_context}",
+            ))
+        messages.append(ChatMessage(role="user", content=step.text))
+
+        try:
+            set_status(f"Researching — gathering sources ({attempt['provider']}/{model})…")
+            response = provider.chat(model=model, messages=messages, tools=TOOL_SCHEMAS)
+            response, full_messages = run_tool_loop(
+                provider, model, messages, response,
+                context={"command": "research", "topic_slug": step.topic_slug},
+            )
+            doc = _extract_tool_results(full_messages)
+            return doc, response.text or "", (i > 0), (attempt if i > 0 else None), None
+        except ProviderError as e:
+            last_error = str(e)
+            continue
+
+    return "", "", False, None, last_error or "All research providers failed during gathering"
+
+
+def _run_research_synthesis(step: Step, gathered_doc: str, gather_fallback: dict | None, routing: dict) -> tuple[str, bool]:
+    """
+    Phase 2 — one-shot synthesis over the gathered material, via DeepSeek/
+    LLM7 for its large context, retried on transient failure (30s x 6 =
+    3min) before falling back to the same model that did the gathering.
+    Returns (final_text, degraded).
+    """
+    doc = gathered_doc
+    if len(doc) > RESEARCH_DOC_CHAR_BUDGET:
+        doc = doc[:RESEARCH_DOC_CHAR_BUDGET] + "\n\n[...truncated — gathered material exceeded the safe context budget]"
+
+    brief = get_mode_brief("research")
+    synth_messages = [
+        ChatMessage(role="system", content=brief.system_prompt),
+        ChatMessage(role="user", content=f"Research question: {step.text}\n\nGathered material:\n{doc}"),
+    ]
+
+    try:
+        synth_provider = get_provider(SYNTHESIS_PROVIDER)
+    except ProviderNotConfigured:
+        synth_provider = None
+
+    if synth_provider:
+        for attempt_num in range(1, SYNTHESIS_MAX_ATTEMPTS + 1):
+            try:
+                set_status(f"Researching — synthesizing with DeepSeek (attempt {attempt_num}/{SYNTHESIS_MAX_ATTEMPTS})…")
+                resp = synth_provider.chat(model=SYNTHESIS_MODEL, messages=synth_messages)
+                return resp.text or "", False
+            except ProviderError:
+                if attempt_num < SYNTHESIS_MAX_ATTEMPTS:
+                    set_status(f"Researching — DeepSeek busy, retrying in {SYNTHESIS_RETRY_DELAY_S}s ({attempt_num}/{SYNTHESIS_MAX_ATTEMPTS})…")
+                    time.sleep(SYNTHESIS_RETRY_DELAY_S)
+
+    # DeepSeek never came through — fall back to the gathering model
+    # itself doing the synthesis instead of losing the result outright.
+    set_status("Researching — DeepSeek unavailable, finishing with the gathering model…")
+    fallback_attempt = gather_fallback or routing["primary"]
+    try:
+        provider = get_provider(fallback_attempt["provider"])
+        resp = provider.chat(model=fallback_attempt["model"], messages=synth_messages)
+        return resp.text or "", True
+    except ProviderError:
+        return "", True
+
+
+def _run_research_step(step: Step, prior_context: str | None) -> StepResult:
+    routing = config.get_task_routing("research")
+    if not routing:
+        return StepResult(step=step, text="", error="No routing configured for /research")
+
+    gathered_doc, draft_text, gather_degraded, gather_fallback, gather_error = _run_research_gather_phase(step, prior_context)
+    if gather_error:
+        set_status(None)
+        return StepResult(step=step, text="", error=gather_error)
+
+    if not gathered_doc.strip():
+        # No tool calls happened — model answered from reasoning alone,
+        # nothing gathered to synthesize from.
+        set_status(None)
+        return StepResult(step=step, text=draft_text, degraded=gather_degraded, fallback_used=gather_fallback)
+
+    final_text, synth_degraded = _run_research_synthesis(step, gathered_doc, gather_fallback, routing)
+    set_status(None)
+
+    if not final_text:
+        return StepResult(step=step, text="", error="Research gathering succeeded but synthesis failed on every attempt")
+
+    return StepResult(
+        step=step,
+        text=final_text,
+        snippet=_make_snippet(final_text),
+        degraded=gather_degraded or synth_degraded,
+        fallback_used=gather_fallback,
+    )
+
+
 def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
     if step.command == "create-image":
         return _run_create_image_step(step)
+    if step.command == "research":
+        return _run_research_step(step, prior_context)
 
     routing = config.get_task_routing(step.command)
     if not routing:
@@ -201,14 +386,10 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
             continue
 
         is_graph_data = step.command == "graph-data"
-        use_tools = step.command in TOOL_ENABLED_COMMANDS
-        tools = TOOL_SCHEMAS if use_tools else None
 
         messages = []
         if is_graph_data:
             messages.append(ChatMessage(role="system", content=GRAPH_DATA_SYSTEM_PROMPT))
-        elif use_tools:
-            messages.append(ChatMessage(role="system", content=CITATION_STYLE_PROMPT))
         if prior_context:
             messages.append(ChatMessage(
                 role="system",
@@ -228,12 +409,7 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
                     image_filename=filename,
                 )
 
-            response = provider.chat(model=model, messages=messages, tools=tools)
-            if use_tools:
-                response = run_tool_loop(
-                    provider, model, messages, response,
-                    context={"command": step.command, "topic_slug": step.topic_slug},
-                )
+            response = provider.chat(model=model, messages=messages)
             return StepResult(
                 step=step,
                 text=response.text or "",
@@ -331,7 +507,10 @@ def format_summary(results: list[StepResult]) -> str:
             header += f"\n\u26a0\ufe0f Not saved to storage: {r.save_error}"
 
         lines.append(header)
-        lines.append(r.text)
+        # A step with a snippet (currently only /research) is long-form —
+        # the snippet goes inline, the full r.text is delivered as an
+        # attached file instead (see server.py's attachment handling).
+        lines.append(r.snippet or r.text)
         if r.usage_note:
             lines.append(f"⚡ {r.usage_note}")
         lines.append("")  # blank line between steps
