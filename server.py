@@ -213,6 +213,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def _respond(self, status: int, body: str = "ok") -> None:
         self.send_response(status)
         self.send_header("Content-Type", "text/plain")
+        # Needed since the PWA's server-status indicator (see App.tsx)
+        # does a plain cross-origin GET to "/" to check if NAVI is awake —
+        # without this, the browser blocks the response as a CORS
+        # violation before the frontend ever sees it, same reasoning as
+        # _respond_json already applies to every JSON route.
+        self.send_header("Access-Control-Allow-Origin", PWA_ORIGIN)
         self.end_headers()
         self.wfile.write(body.encode())
 
