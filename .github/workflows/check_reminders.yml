@@ -1,0 +1,17 @@
+name: Check reminders
+
+on:
+  schedule:
+    # Every 5 minutes — GitHub's scheduler doesn't guarantee exact timing
+    # (can run a few minutes late, especially on the free plan), so
+    # reminders fire on a "within a few minutes" basis, not to the second.
+    # Fine for a personal reminder tool; not fine to promise precision on.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /reminders/check
+        run: curl -sf https://navi-fih8.onrender.com/reminders/check

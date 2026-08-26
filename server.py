@@ -32,7 +32,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dispatcher.chat import run_mode_chat
 from dispatcher.executor import format_summary, run_chain
 from dispatcher.parser import COMMANDS, ParseResult, parse_message
+from dispatcher.reminders import due_reminders, mark_delivered
 from dispatcher.research_status import get_status, set_status
+from tools.telegram_send import TelegramSendError, send_to_telegram
 from messaging.base import IncomingMessage, MessagingAdapter, MessagingError
 from messaging.discord import DiscordAdapter
 from messaging.telegram import TelegramAdapter
@@ -237,6 +239,29 @@ class WebhookHandler(BaseHTTPRequestHandler):
             # background — see dispatcher/research_status.py. `status` is
             # null when nothing's in flight.
             self._respond_json(200, {"status": get_status()})
+        elif self.path == "/reminders/check":
+            # Hit periodically by a GitHub Actions cron (see
+            # .github/workflows/check_reminders.yml) rather than run as a
+            # standalone job — this way delivery reads the config
+            # singleton this live process already has loaded, no separate
+            # Filen round-trip needed just to check reminders. Delivers
+            # via both push (PWA bubble) and Telegram (instant, no PWA
+            # dependency) — best-effort each, one channel failing doesn't
+            # block the other or leave the reminder stuck.
+            delivered = 0
+            for r in due_reminders():
+                text = f"⏰ Reminder: {r['message']}"
+                try:
+                    send_push("NAVI", text)
+                except PushError:
+                    pass
+                try:
+                    send_to_telegram(text)
+                except TelegramSendError:
+                    pass
+                mark_delivered(r["id"])
+                delivered += 1
+            self._respond_json(200, {"delivered": delivered})
         else:
             self._respond(404, "not found")
 

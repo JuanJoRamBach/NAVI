@@ -128,6 +128,13 @@ DEFAULTS = {
             "primary": {"provider": "groq", "model": "openai/gpt-oss-20b"},
             "fallback": [],
         },
+        "remind": {
+            # Needs a forced tool_choice call (same requirement as
+            # graph-data's render_chart) — reusing the same openrouter
+            # models already verified to support that.
+            "primary": {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
+            "fallback": [{"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}],
+        },
         # No "brainstorm" entry — retired as a standalone command (2026-08-27):
         # Brainstorm mode's own conversational chat (dispatcher/modes/
         # BRAINSTORM.md) does its job better, since the command was a
@@ -298,3 +305,20 @@ def _migrate_add_recap_note_routing():
 
 
 _migrate_add_recap_note_routing()
+
+
+def _migrate_add_remind_routing():
+    """One-time addition (2026-08-26) — same reasoning as
+    _migrate_add_summarize_routing, for /remind."""
+    if config.get("migrated_add_remind_routing"):
+        return
+    if not config.get_task_routing("remind"):
+        config.set_task_routing(
+            "remind",
+            {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
+            [{"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}],
+        )
+    config.set("migrated_add_remind_routing", True)
+
+
+_migrate_add_remind_routing()

@@ -16,10 +16,13 @@ depend on earlier ones' actual output). For each step:
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from config.store import config
 from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.parser import Step
+from dispatcher.reminders import add_reminder
 from dispatcher.research_status import set_status
 from dispatcher.slugify import assign_slugs
 from providers.base import ChatMessage, ChatResponse, Provider, ProviderError
@@ -63,6 +66,7 @@ EXTENSION_FOR_COMMAND = {
     "summarize": "md",
     "recap": "md",
     "note": "md",
+    "remind": "md",
 }
 
 # /summarize gets exactly one tool (fetch_page), not the full research
@@ -452,6 +456,97 @@ def _run_text_transform_step(
     return StepResult(step=step, text="", error=last_error or f"All {command} providers failed")
 
 
+# /remind forces a tool call (same reasoning as /graph-data's render_chart)
+# so the model can't just reply in prose "sure, I'll remind you" without
+# actually recording anything. The model resolves whatever time phrasing
+# the user gave into an absolute UTC timestamp itself — current time (both
+# UTC and JuanJo's local Europe/Madrid) is given in the system prompt so
+# relative ("in 20 minutes") and local ("tomorrow at 9am") phrasing both
+# resolve correctly.
+REMIND_TOOL_NAME = "set_reminder"
+REMIND_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": REMIND_TOOL_NAME,
+        "description": "Records a reminder with an absolute fire time.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fire_at_utc": {
+                    "type": "string",
+                    "description": "Absolute UTC timestamp, ISO 8601, e.g. 2026-08-27T14:30:00+00:00",
+                },
+                "message": {"type": "string", "description": "What to remind the user about."},
+            },
+            "required": ["fire_at_utc", "message"],
+        },
+    },
+}
+REMIND_TOOL_CHOICE = {"type": "function", "function": {"name": REMIND_TOOL_NAME}}
+
+USER_TIMEZONE = "Europe/Madrid"
+
+
+def _run_remind_step(step: Step, prior_context: str | None) -> StepResult:
+    routing = config.get_task_routing("remind")
+    if not routing:
+        return StepResult(step=step, text="", error="No routing configured for /remind")
+
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(ZoneInfo(USER_TIMEZONE))
+    system_prompt = (
+        f"Current time is {now_utc.isoformat()} (UTC), which is "
+        f"{now_local.strftime('%Y-%m-%d %H:%M')} in {USER_TIMEZONE}. "
+        "The user wants a reminder set. Resolve whatever time they gave — relative "
+        f"('in 20 minutes') or local ('tomorrow at 9am', assume {USER_TIMEZONE} if no "
+        "timezone is stated) — into an absolute UTC timestamp, and call set_reminder "
+        "with that plus a short message describing what to remind them about."
+    )
+
+    attempts = [routing["primary"]] + routing.get("fallback", [])
+    last_error = None
+
+    for i, attempt in enumerate(attempts):
+        model = attempt.get("model")
+        if not model:
+            continue
+        try:
+            provider = get_provider(attempt["provider"])
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        messages = [
+            ChatMessage(role="system", content=system_prompt),
+            ChatMessage(role="user", content=step.text),
+        ]
+
+        try:
+            response = provider.chat(
+                model=model, messages=messages, tools=[REMIND_TOOL_SCHEMA], tool_choice=REMIND_TOOL_CHOICE,
+            )
+            if not response.tool_calls:
+                raise ProviderError(f"{model} didn't call {REMIND_TOOL_NAME} despite it being forced")
+
+            args = _parse_tool_args(response.tool_calls[0].arguments)
+            fire_at = datetime.fromisoformat(args["fire_at_utc"])
+            message = args["message"]
+            add_reminder(fire_at, message)
+
+            local_str = fire_at.astimezone(ZoneInfo(USER_TIMEZONE)).strftime("%a %d %b, %H:%M")
+            return StepResult(
+                step=step,
+                text=f"⏰ Reminder set for {local_str} ({USER_TIMEZONE}): {message}",
+                degraded=(i > 0),
+                fallback_used=attempt if i > 0 else None,
+            )
+        except (ProviderError, KeyError, ValueError) as e:
+            last_error = str(e)
+            continue
+
+    return StepResult(step=step, text="", error=last_error or "Couldn't set the reminder — all providers failed")
+
+
 def _run_summarize_step(step: Step, prior_context: str | None) -> StepResult:
     return _run_text_transform_step(step, prior_context, "summarize", SUMMARIZE_SYSTEM_PROMPT, ["fetch_page"])
 
@@ -475,6 +570,8 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
         return _run_recap_step(step, prior_context)
     if step.command == "note":
         return _run_note_step(step, prior_context)
+    if step.command == "remind":
+        return _run_remind_step(step, prior_context)
 
     routing = config.get_task_routing(step.command)
     if not routing:
