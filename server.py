@@ -175,7 +175,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         # to /push/* because it's a cross-origin request with a JSON
         # content type. Only the push routes need it; nothing else on
         # this server is called cross-origin.
-        if self.path in ("/push/subscribe", "/push/test"):
+        if self.path in ("/push/subscribe", "/push/test", "/chat/send"):
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", PWA_ORIGIN)
             self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -199,6 +199,23 @@ class WebhookHandler(BaseHTTPRequestHandler):
         if self.path == "/webhook/discord":
             self._read_json()
             self._respond(200)  # outbound-only phase — nothing to act on yet
+            return
+
+        if self.path == "/chat/send":
+            # The PWA's own chat surface — synchronous unlike the Telegram/
+            # Discord webhooks above (no adapter to hand off to; the
+            # frontend just awaits this response directly).
+            payload = self._read_json()
+            text = (payload.get("text") or "").strip()
+            if not text:
+                self._respond_json(400, {"error": "missing 'text'"})
+                return
+            result = parse_message(text)
+            # Attachments (e.g. a /graph-data chart image) aren't supported
+            # over this channel yet — the PWA has no attachment UI built,
+            # so they're dropped rather than silently mismatched.
+            reply_text, _attachments = _handle_parse_result(result, "pwa")
+            self._respond_json(200, {"reply": reply_text})
             return
 
         if self.path == "/push/subscribe":
@@ -247,6 +264,7 @@ def _seed_keys_from_env() -> None:
         ("openrouter", "OPENROUTER_API_KEY"),
         ("ollama_cloud", "OLLAMA_API_KEY"),
         ("cloudflare", "CLOUDFLARE_API_KEY"),
+        ("llm7", "LLM7_API_KEY"),
     ):
         if config.get_provider_key(provider_name):
             continue

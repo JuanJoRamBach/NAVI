@@ -28,6 +28,7 @@ DEFAULTS = {
         # name -> { "api_key": str | None, "enabled": bool }
         "openrouter": {"api_key": None, "enabled": True},
         "groq": {"api_key": None, "enabled": True},
+        "llm7": {"api_key": None, "enabled": True},
         "nvidia_nim": {"api_key": None, "enabled": False},
     },
     "roles": {

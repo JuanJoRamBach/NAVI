@@ -11,6 +11,7 @@ from config.store import config
 from providers.base import Provider
 from providers.cloudflare import CloudflareProvider
 from providers.groq import GroqProvider
+from providers.llm7 import LLM7Provider
 from providers.ollama_cloud import OllamaCloudProvider
 from providers.openrouter import OpenRouterProvider
 
@@ -19,6 +20,7 @@ _TRANSPORTS: dict[str, type[Provider]] = {
     "groq": GroqProvider,
     "ollama_cloud": OllamaCloudProvider,
     "cloudflare": CloudflareProvider,
+    "llm7": LLM7Provider,
     # "nvidia_nim": NvidiaNimProvider,  # add when built
 }
 
