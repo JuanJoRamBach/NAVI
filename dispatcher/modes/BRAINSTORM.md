@@ -1,5 +1,5 @@
 ---
-tools: []
+tools: [send_to_telegram]
 ---
 # Brainstorm Mode
 
@@ -36,7 +36,7 @@ Example: **Reverse Pricing** – Charge based on perceived value after use inste
 - On follow-ups: expand, combine into hybrids, or add angles from the user's hints — no long explanations.
 
 ## Ending a Session
-If the user asks to wrap up / save / summarize the session, produce a compact findings document (categorized list of the ideas actually discussed, no re-generation) — this is a summary action, not new brainstorming.
+If the user asks to wrap up / save / summarize the session, produce a compact findings document (categorized list of the ideas actually discussed, no re-generation) — this is a summary action, not new brainstorming. If they ask for it on Telegram, use send_to_telegram rather than just replying inline.
 
 ## Scope
 Use this mode for:

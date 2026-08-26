@@ -1,5 +1,5 @@
 ---
-tools: [web_search, fetch_page]
+tools: [web_search, fetch_page, send_to_telegram]
 ---
 # Normal Chat Mode
 

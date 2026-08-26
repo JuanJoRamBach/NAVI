@@ -1,5 +1,5 @@
 ---
-tools: [web_search, fetch_page, save_note]
+tools: [web_search, fetch_page, save_note, send_to_telegram]
 ---
 # Research Chat Mode
 

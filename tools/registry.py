@@ -15,6 +15,7 @@ model as the tool result.
 from tools.fetch import FetchError, fetch_page
 from tools.notes import NoteError, save_note
 from tools.search import SearchError, web_search
+from tools.telegram_send import TelegramSendError, send_to_telegram
 
 TOOL_SCHEMAS = [
     {
@@ -50,6 +51,23 @@ TOOL_SCHEMAS = [
                     "url": {"type": "string", "description": "The URL to fetch."},
                 },
                 "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_to_telegram",
+            "description": "Sends a text message to the user's Telegram, regardless of "
+                            "which chat channel this conversation is happening in. Use when "
+                            "the user asks to send/save something to Telegram, or wants a "
+                            "document/finding delivered there.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The message or document content to send."},
+                },
+                "required": ["text"],
             },
         },
     },
@@ -116,9 +134,12 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
             )
             return f"Saved to {path}"
 
+        if name == "send_to_telegram":
+            return send_to_telegram(arguments["text"])
+
         raise ToolExecutionError(f"Unknown tool: {name}")
 
-    except (SearchError, FetchError, NoteError) as e:
+    except (SearchError, FetchError, NoteError, TelegramSendError) as e:
         # A failed tool call isn't fatal to the step — it's reported back
         # to the model as a tool result, same as a successful one, so the
         # model can decide how to proceed (retry, try another source, note
