@@ -140,13 +140,35 @@ def _handle_parse_result(
     return run_mode_chat(mode, result.raw_text), []
 
 
+def _chunk_text_at_boundary(text: str, size: int) -> list[str]:
+    """Like a fixed-size split, but tries to break at a paragraph, then
+    a sentence, then a word boundary before falling back to a hard cut —
+    a blind text[i:i+size] slice reads badly when it lands mid-word."""
+    chunks = []
+    remaining = text
+    while len(remaining) > size:
+        window = remaining[:size]
+        cut = window.rfind("\n\n")
+        if cut < size // 2:
+            sentence_cut = window.rfind(". ")
+            cut = sentence_cut + 1 if sentence_cut >= size // 2 else cut
+        if cut < size // 2:
+            word_cut = window.rfind(" ")
+            cut = word_cut if word_cut >= size // 2 else size
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks or [""]
+
+
 def _deliver_via_push(title: str, text: str) -> None:
     """Splits `text` across multiple pushes if it's too big for one
     payload — each chunk becomes its own message bubble in the PWA via
     the existing service-worker push handler, no frontend changes
     needed. Best-effort: a failed push here has no user-facing fallback,
     since the HTTP request that triggered the work is long gone."""
-    chunks = [text[i:i + PUSH_CHUNK_SIZE] for i in range(0, len(text), PUSH_CHUNK_SIZE)] or [""]
+    chunks = _chunk_text_at_boundary(text, PUSH_CHUNK_SIZE)
     for i, chunk in enumerate(chunks):
         chunk_title = title if len(chunks) == 1 else f"{title} ({i + 1}/{len(chunks)})"
         try:
