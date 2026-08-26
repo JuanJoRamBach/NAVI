@@ -54,7 +54,13 @@ DEFAULTS = {
         #   openai/gpt-oss-20b:    30 RPM / 1,000 RPD / 200K TPD
         #   openai/gpt-oss-120b:   30 RPM / 1,000 RPD / 200K TPD
         #   llama-3.1-8b-instant:  30 RPM / 14,400 RPD / 500K TPD (deprecated)
-        "dispatcher_chat": {"provider": "groq", "model": "openai/gpt-oss-20b"},
+        # DeepSeek-V4-Flash-0731 via LLM7 (2026-08-26): benchmarks clearly
+        # ahead of gpt-oss-20b/120b (52 vs 24 Artificial Analysis
+        # Intelligence Index, wins 6/6 shared benchmarks, 1M context vs
+        # 130k) and LLM7's free "turbo" tier (~1M tokens/day) comfortably
+        # covers normal chat volume. See the migration below for how this
+        # actually takes effect on an already-configured instance.
+        "dispatcher_chat": {"provider": "llm7", "model": "DeepSeek-V4-Flash-0731"},
         "dispatcher_autonomous": {"provider": "groq", "model": "openai/gpt-oss-120b"},
     },
     "task_routing": {
@@ -198,3 +204,20 @@ class ConfigStore:
 
 # Module-level singleton — the rest of the app imports this directly.
 config = ConfigStore()
+
+
+def _migrate_dispatcher_chat_to_llm7():
+    """
+    One-time switch (2026-08-26) for instances that already had
+    dispatcher_chat persisted (via Filen backup) before DEFAULTS changed
+    above — editing DEFAULTS alone only affects a brand new store, not
+    one already materialized on disk. Guarded so it only runs once; if
+    dispatcher_chat gets manually reassigned later, this won't fight it.
+    """
+    if config.get("migrated_dispatcher_chat_to_llm7"):
+        return
+    config.set_role("dispatcher_chat", "llm7", "DeepSeek-V4-Flash-0731")
+    config.set("migrated_dispatcher_chat_to_llm7", True)
+
+
+_migrate_dispatcher_chat_to_llm7()
