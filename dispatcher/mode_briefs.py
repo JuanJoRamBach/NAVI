@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 MODES_DIR = Path(__file__).parent / "modes"
+SOUL_PATH = Path(__file__).parent.parent / "SOUL.md"
 
 MODE_FILES = {
     "normal": "NORMAL_CHAT.md",
@@ -52,6 +53,19 @@ def _parse_frontmatter(raw: str) -> tuple[list[str], str]:
 _cache: dict[str, ModeBrief] = {}
 
 
+def _load_soul() -> str:
+    """SOUL.md establishes who NAVI actually is (name, voice, boundaries) —
+    without it prepended, the model has no identity framing at all and
+    defaults to announcing itself as the underlying model ("I'm ChatGPT"),
+    which is exactly what happened before this was wired in. Read once,
+    same as a mode brief; missing file degrades to no identity framing
+    rather than crashing chat entirely."""
+    try:
+        return SOUL_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def get_mode_brief(mode: str) -> ModeBrief:
     """Unknown modes fall back to Normal rather than raising — a stale or
     unexpected mode string from the client shouldn't break the chat."""
@@ -61,6 +75,8 @@ def get_mode_brief(mode: str) -> ModeBrief:
 
     raw = (MODES_DIR / MODE_FILES[key]).read_text(encoding="utf-8")
     tools, body = _parse_frontmatter(raw)
-    brief = ModeBrief(system_prompt=body.strip(), tools=tools)
+    soul = _load_soul()
+    system_prompt = f"{soul}\n\n---\n\n{body.strip()}" if soul else body.strip()
+    brief = ModeBrief(system_prompt=system_prompt, tools=tools)
     _cache[key] = brief
     return brief
