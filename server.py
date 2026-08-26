@@ -29,14 +29,13 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from dispatcher.chat import run_mode_chat
 from dispatcher.executor import format_summary, run_chain
 from dispatcher.parser import COMMANDS, ParseResult, parse_message
 from messaging.base import IncomingMessage, MessagingAdapter, MessagingError
 from messaging.discord import DiscordAdapter
 from messaging.telegram import TelegramAdapter
 from config.store import config
-from providers.base import ChatMessage, ProviderError
-from providers.registry import ProviderNotConfigured, get_dispatcher
 from push.sender import PushError, add_subscription, send_push, subscription_count
 
 PORT = int(os.environ.get("PORT", "10000"))
@@ -46,12 +45,6 @@ PORT = int(os.environ.get("PORT", "10000"))
 # CORS allow. Scoped to the one real frontend origin rather than "*",
 # since this endpoint accepts push subscription data.
 PWA_ORIGIN = "https://juanjorambach.github.io"
-
-CHAT_SYSTEM_PROMPT = (
-    "You are NAVI, a personal AI agent for JuanJo (a UX/game designer job-hunting "
-    "in the EU/US). Reply directly and concisely — this is a live chat message, "
-    "not a research task."
-)
 
 # In-memory only, deliberately not persisted: if a near-miss confirmation
 # is still pending across a Render restart, the worst case is the user
@@ -69,23 +62,6 @@ def _telegram_adapter() -> TelegramAdapter | None:
 def _discord_adapter() -> DiscordAdapter | None:
     token = os.environ.get("DISCORD_BOT_TOKEN")
     return DiscordAdapter(token) if token else None
-
-
-def _dispatcher_chat_reply(text: str) -> str:
-    try:
-        provider, model = get_dispatcher(context="chat")
-    except ProviderNotConfigured as e:
-        return f"⚠️ Can't reply right now — dispatcher_chat isn't configured: {e}"
-
-    try:
-        response = provider.chat(model=model, messages=[
-            ChatMessage(role="system", content=CHAT_SYSTEM_PROMPT),
-            ChatMessage(role="user", content=text),
-        ])
-    except ProviderError as e:
-        return f"⚠️ dispatcher_chat failed and has no fallback by design: {e}"
-
-    return response.text or "(empty reply)"
 
 
 def _reconstruct_confirmed_text(pending: ParseResult) -> str:
@@ -120,7 +96,9 @@ def handle_message(adapter: MessagingAdapter, msg: IncomingMessage) -> None:
         pass  # nothing more we can do if the reply itself fails to send
 
 
-def _handle_parse_result(result: ParseResult, chat_id: str) -> tuple[str, list[tuple[bytes, str, str]]]:
+def _handle_parse_result(
+    result: ParseResult, chat_id: str, mode: str = "normal",
+) -> tuple[str, list[tuple[bytes, str, str]]]:
     if result.kind == "commands":
         results = run_chain(result.steps)
         attachments = [
@@ -138,7 +116,12 @@ def _handle_parse_result(result: ParseResult, chat_id: str) -> tuple[str, list[t
             [],
         )
 
-    return _dispatcher_chat_reply(result.raw_text), []
+    # Plain chat — not a typed /command. `mode` selects which brief in
+    # dispatcher/modes/ governs the system prompt and which tools (if
+    # any) the model can reach for. Telegram/Discord have no mode concept
+    # and always pass the default ("normal"); the PWA sends whichever
+    # mode the user has selected.
+    return run_mode_chat(mode, result.raw_text), []
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -219,6 +202,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             # frontend just awaits this response directly).
             payload = self._read_json()
             text = (payload.get("text") or "").strip()
+            mode = payload.get("mode") or "normal"
             if not text:
                 self._respond_json(400, {"error": "missing 'text'"})
                 return
@@ -226,7 +210,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             # Attachments (e.g. a /graph-data chart image) aren't supported
             # over this channel yet — the PWA has no attachment UI built,
             # so they're dropped rather than silently mismatched.
-            reply_text, _attachments = _handle_parse_result(result, "pwa")
+            reply_text, _attachments = _handle_parse_result(result, "pwa", mode)
             self._respond_json(200, {"reply": reply_text})
             return
 

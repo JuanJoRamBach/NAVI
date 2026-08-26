@@ -66,12 +66,15 @@ CITATION_STYLE_PROMPT = (
 )
 
 
-def _run_tool_loop(
+def run_tool_loop(
     provider: Provider, model: str, messages: list[ChatMessage], response: ChatResponse, context: dict
 ) -> ChatResponse:
     """Executes any tool_calls in `response`, feeds results back to the
     model, and repeats until the model stops asking for tools or the
-    iteration ceiling is hit. Returns the final ChatResponse."""
+    iteration ceiling is hit. Returns the final ChatResponse.
+
+    Public (not `_`-prefixed) because dispatcher/chat.py reuses this for
+    free-form mode-based chat, not just /research's command chain."""
     iterations = 0
     while response.tool_calls and iterations < MAX_TOOL_ITERATIONS:
         raw_choice = ((response.raw or {}).get("choices") or [{}])[0].get("message", {})
@@ -227,7 +230,7 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
 
             response = provider.chat(model=model, messages=messages, tools=tools)
             if use_tools:
-                response = _run_tool_loop(
+                response = run_tool_loop(
                     provider, model, messages, response,
                     context={"command": step.command, "topic_slug": step.topic_slug},
                 )

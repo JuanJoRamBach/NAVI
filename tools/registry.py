@@ -73,6 +73,13 @@ TOOL_SCHEMAS = [
 ]
 
 
+def schemas_for(names: list[str]) -> list[dict]:
+    """Filters TOOL_SCHEMAS down to the subset a mode's brief allows —
+    used so a mode's frontmatter `tools: [...]` list controls what the
+    model can actually call, not just what it's told in prose."""
+    return [s for s in TOOL_SCHEMAS if s["function"]["name"] in names]
+
+
 class ToolExecutionError(Exception):
     pass
 
