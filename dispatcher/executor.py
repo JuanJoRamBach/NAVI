@@ -67,6 +67,7 @@ EXTENSION_FOR_COMMAND = {
     "recap": "md",
     "note": "md",
     "remind": "md",
+    "tailor": "md",
 }
 
 # /summarize gets exactly one tool (fetch_page), not the full research
@@ -551,6 +552,46 @@ def _run_summarize_step(step: Step, prior_context: str | None) -> StepResult:
     return _run_text_transform_step(step, prior_context, "summarize", SUMMARIZE_SYSTEM_PROMPT, ["fetch_page"])
 
 
+# The CV lives at a link JuanJo controls (portfolio site, hosted PDF, etc.)
+# rather than pasted text or stored raw — set once via "/tailor cv: <link>",
+# read back on every later /tailor call. A deterministic "cv:" prefix
+# rather than guessing intent from a bare URL, since a job posting can
+# also be just a link.
+TAILOR_SYSTEM_PROMPT_TEMPLATE = (
+    "You're helping tailor a job application. The user's CV is at this link — "
+    "call fetch_page on it to read it: {cv_link}\n\n"
+    "The job posting is given below in the user's message; if it's a URL, call "
+    "fetch_page on that too, otherwise it's already pasted text.\n\n"
+    "Produce two clearly separated sections:\n"
+    "1. A tailored cover note — short, specific to this posting, grounded only "
+    "in what's actually in the CV, no invented experience.\n"
+    "2. An honest fit rundown: why they'd likely fit, and where they might not "
+    "— a realistic read is more useful than a flattering one."
+)
+
+
+def _run_tailor_step(step: Step, prior_context: str | None) -> StepResult:
+    text = step.text.strip()
+
+    if text.lower().startswith("cv:"):
+        link = text[3:].strip()
+        if not link:
+            return StepResult(step=step, text="", error="No link given after 'cv:'")
+        config.set("cv_link", link)
+        return StepResult(step=step, text=f"CV link saved: {link}")
+
+    cv_link = config.get("cv_link")
+    if not cv_link:
+        return StepResult(
+            step=step, text="",
+            error="No CV link on file yet — set one first with /tailor cv: <link>",
+        )
+
+    tailor_step = Step(command=step.command, text=text, topic_slug=step.topic_slug)
+    system_prompt = TAILOR_SYSTEM_PROMPT_TEMPLATE.format(cv_link=cv_link)
+    return _run_text_transform_step(tailor_step, prior_context, "tailor", system_prompt, ["fetch_page"])
+
+
 def _run_recap_step(step: Step, prior_context: str | None) -> StepResult:
     return _run_text_transform_step(step, prior_context, "recap", RECAP_SYSTEM_PROMPT, ["send_to_telegram"])
 
@@ -572,6 +613,8 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
         return _run_note_step(step, prior_context)
     if step.command == "remind":
         return _run_remind_step(step, prior_context)
+    if step.command == "tailor":
+        return _run_tailor_step(step, prior_context)
 
     routing = config.get_task_routing(step.command)
     if not routing:

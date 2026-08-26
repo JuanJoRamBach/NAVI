@@ -135,6 +135,10 @@ DEFAULTS = {
             "primary": {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
             "fallback": [{"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}],
         },
+        "tailor": {
+            "primary": {"provider": "groq", "model": "openai/gpt-oss-20b"},
+            "fallback": [],
+        },
         # No "brainstorm" entry — retired as a standalone command (2026-08-27):
         # Brainstorm mode's own conversational chat (dispatcher/modes/
         # BRAINSTORM.md) does its job better, since the command was a
@@ -322,3 +326,16 @@ def _migrate_add_remind_routing():
 
 
 _migrate_add_remind_routing()
+
+
+def _migrate_add_tailor_routing():
+    """One-time addition (2026-08-26) — same reasoning as
+    _migrate_add_summarize_routing, for /tailor."""
+    if config.get("migrated_add_tailor_routing"):
+        return
+    if not config.get_task_routing("tailor"):
+        config.set_task_routing("tailor", {"provider": "groq", "model": "openai/gpt-oss-20b"}, [])
+    config.set("migrated_add_tailor_routing", True)
+
+
+_migrate_add_tailor_routing()
