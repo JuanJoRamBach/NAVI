@@ -118,6 +118,16 @@ DEFAULTS = {
             "primary": {"provider": "groq", "model": "openai/gpt-oss-20b"},
             "fallback": [],
         },
+        "recap": {
+            # Same reasoning as /summarize's routing — own quota, small
+            # model, single-phase call.
+            "primary": {"provider": "groq", "model": "openai/gpt-oss-20b"},
+            "fallback": [],
+        },
+        "note": {
+            "primary": {"provider": "groq", "model": "openai/gpt-oss-20b"},
+            "fallback": [],
+        },
         # No "brainstorm" entry — retired as a standalone command (2026-08-27):
         # Brainstorm mode's own conversational chat (dispatcher/modes/
         # BRAINSTORM.md) does its job better, since the command was a
@@ -273,3 +283,18 @@ def _migrate_add_summarize_routing():
 
 
 _migrate_add_summarize_routing()
+
+
+def _migrate_add_recap_note_routing():
+    """One-time addition (2026-08-26) — same reasoning as
+    _migrate_add_summarize_routing, for /recap and /note."""
+    if config.get("migrated_add_recap_note_routing"):
+        return
+    if not config.get_task_routing("recap"):
+        config.set_task_routing("recap", {"provider": "groq", "model": "openai/gpt-oss-20b"}, [])
+    if not config.get_task_routing("note"):
+        config.set_task_routing("note", {"provider": "groq", "model": "openai/gpt-oss-20b"}, [])
+    config.set("migrated_add_recap_note_routing", True)
+
+
+_migrate_add_recap_note_routing()

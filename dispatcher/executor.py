@@ -61,6 +61,8 @@ EXTENSION_FOR_COMMAND = {
     "graph-data": "png",
     "create-image": "png",
     "summarize": "md",
+    "recap": "md",
+    "note": "md",
 }
 
 # /summarize gets exactly one tool (fetch_page), not the full research
@@ -375,10 +377,39 @@ def _run_research_step(step: Step, prior_context: str | None) -> StepResult:
     )
 
 
-def _run_summarize_step(step: Step, prior_context: str | None) -> StepResult:
-    routing = config.get_task_routing("summarize")
+# Recap distills; Note preserves. Both deliver to Telegram themselves via
+# the send_to_telegram tool (named explicitly in prose — see tools/registry.py's
+# note on DeepSeek needing it spelled out to reliably call it from casual phrasing).
+RECAP_SYSTEM_PROMPT = (
+    "Turn the given material into a durable recap worth keeping, structured "
+    "like a memory note: a claim/fact stated plainly, a 'Why:' line giving the "
+    "reasoning or motivation behind it, and an 'Open threads:' line for anything "
+    "unresolved or worth following up on (omit that line if there's nothing open). "
+    "Distill, don't just restate — cut anything not worth remembering later. "
+    "Always call send_to_telegram with the finished recap so it's delivered, "
+    "then also return it as your reply."
+)
+NOTE_SYSTEM_PROMPT = (
+    "Lightly capture the given material as a casual note — something worth "
+    "preserving but not worth structuring or distilling. Keep it close to how "
+    "it was said; don't force it into a claim/reasoning format. A sentence or "
+    "two of your own framing is fine if it helps future-you understand the "
+    "context, but don't summarize away the specifics. "
+    "Always call send_to_telegram with the finished note so it's delivered, "
+    "then also return it as your reply."
+)
+
+
+def _run_text_transform_step(
+    step: Step, prior_context: str | None, command: str, system_prompt: str, tool_names: list[str],
+) -> StepResult:
+    """Shared shape for single-phase, tool-optional commands (/summarize,
+    /recap, /note): one provider call over the given text, with a small
+    tool belt available. Differs from /research's two-phase gather-then-
+    synthesize pipeline — these are simple enough for one call."""
+    routing = config.get_task_routing(command)
     if not routing:
-        return StepResult(step=step, text="", error="No routing configured for /summarize")
+        return StepResult(step=step, text="", error=f"No routing configured for /{command}")
 
     attempts = [routing["primary"]] + routing.get("fallback", [])
     last_error = None
@@ -393,7 +424,7 @@ def _run_summarize_step(step: Step, prior_context: str | None) -> StepResult:
             last_error = str(e)
             continue
 
-        messages = [ChatMessage(role="system", content=SUMMARIZE_SYSTEM_PROMPT)]
+        messages = [ChatMessage(role="system", content=system_prompt)]
         if prior_context:
             messages.append(ChatMessage(
                 role="system",
@@ -402,10 +433,10 @@ def _run_summarize_step(step: Step, prior_context: str | None) -> StepResult:
         messages.append(ChatMessage(role="user", content=step.text))
 
         try:
-            response = provider.chat(model=model, messages=messages, tools=schemas_for(["fetch_page"]))
+            response = provider.chat(model=model, messages=messages, tools=schemas_for(tool_names))
             response, _ = run_tool_loop(
                 provider, model, messages, response,
-                context={"command": "summarize", "topic_slug": step.topic_slug},
+                context={"command": command, "topic_slug": step.topic_slug},
             )
             return StepResult(
                 step=step,
@@ -418,7 +449,19 @@ def _run_summarize_step(step: Step, prior_context: str | None) -> StepResult:
             last_error = str(e)
             continue
 
-    return StepResult(step=step, text="", error=last_error or "All summarize providers failed")
+    return StepResult(step=step, text="", error=last_error or f"All {command} providers failed")
+
+
+def _run_summarize_step(step: Step, prior_context: str | None) -> StepResult:
+    return _run_text_transform_step(step, prior_context, "summarize", SUMMARIZE_SYSTEM_PROMPT, ["fetch_page"])
+
+
+def _run_recap_step(step: Step, prior_context: str | None) -> StepResult:
+    return _run_text_transform_step(step, prior_context, "recap", RECAP_SYSTEM_PROMPT, ["send_to_telegram"])
+
+
+def _run_note_step(step: Step, prior_context: str | None) -> StepResult:
+    return _run_text_transform_step(step, prior_context, "note", NOTE_SYSTEM_PROMPT, ["send_to_telegram"])
 
 
 def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
@@ -428,6 +471,10 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
         return _run_research_step(step, prior_context)
     if step.command == "summarize":
         return _run_summarize_step(step, prior_context)
+    if step.command == "recap":
+        return _run_recap_step(step, prior_context)
+    if step.command == "note":
+        return _run_note_step(step, prior_context)
 
     routing = config.get_task_routing(step.command)
     if not routing:
