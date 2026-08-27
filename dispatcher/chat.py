@@ -41,4 +41,7 @@ def run_mode_chat(mode: str, text: str) -> str:
     except ProviderError as e:
         return f"⚠️ dispatcher_chat failed and has no fallback by design: {e}"
 
-    return response.text or "(empty reply)"
+    reply = response.text or "(empty reply)"
+    if response.usage_note:
+        reply += f"\n\n⚡ {response.usage_note}"
+    return reply

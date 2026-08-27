@@ -78,9 +78,20 @@ class OpenRouterProvider(Provider):
                 arguments=tc["function"]["arguments"],
             ))
 
+        # Every OpenAI-compatible response includes a "usage" object — the
+        # provider needs it for their own billing, so it's returned
+        # unconditionally, not gated behind any particular tier. Was
+        # already arriving in `data` on every call, just never extracted.
+        usage = data.get("usage") or {}
+        usage_note = (
+            f"{usage.get('prompt_tokens', '?')} in / {usage.get('completion_tokens', '?')} out / {usage['total_tokens']} total tokens"
+            if usage.get("total_tokens") is not None else None
+        )
+
         return ChatResponse(
             text=choice.get("content"),
             tool_calls=tool_calls,
             model_used=data.get("model", model),
             raw=data,
+            usage_note=usage_note,
         )
