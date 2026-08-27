@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from config.store import config
-from dispatcher.mode_briefs import get_mode_brief
+from dispatcher.mode_briefs import get_mode_brief, get_phase_brief
 from dispatcher.parser import Step
 from dispatcher.reminders import add_reminder
 from dispatcher.research_status import set_status
@@ -110,7 +110,8 @@ CITATION_STYLE_PROMPT = (
 
 
 def run_tool_loop(
-    provider: Provider, model: str, messages: list[ChatMessage], response: ChatResponse, context: dict
+    provider: Provider, model: str, messages: list[ChatMessage], response: ChatResponse, context: dict,
+    tools: list[dict] | None = None,
 ) -> tuple[ChatResponse, list[ChatMessage]]:
     """Executes any tool_calls in `response`, feeds results back to the
     model, and repeats until the model stops asking for tools or the
@@ -119,8 +120,15 @@ def run_tool_loop(
     (see _extract_tool_results) without needing the model's own final
     prose synthesis.
 
+    `tools` should be whatever scoped list the caller's *first* call to
+    the model already used — every follow-up call inside this loop reuses
+    it, so a caller that scoped down to e.g. just fetch_page doesn't
+    silently regain the full tool belt on iteration 2 (defaults to
+    TOOL_SCHEMAS only for callers that genuinely want the whole belt).
+
     Public (not `_`-prefixed) because dispatcher/chat.py reuses this for
     free-form mode-based chat, not just /research's command chain."""
+    tools = tools if tools is not None else TOOL_SCHEMAS
     iterations = 0
     while response.tool_calls and iterations < MAX_TOOL_ITERATIONS:
         raw_choice = ((response.raw or {}).get("choices") or [{}])[0].get("message", {})
@@ -142,7 +150,7 @@ def run_tool_loop(
                 role="tool", content=result_text, tool_call_id=tc.id, name=tc.name,
             )]
 
-        response = provider.chat(model=model, messages=messages, tools=TOOL_SCHEMAS)
+        response = provider.chat(model=model, messages=messages, tools=tools)
         iterations += 1
 
     return response, messages
@@ -259,16 +267,21 @@ def _make_snippet(text: str, max_chars: int = 600) -> str:
 
 def _run_research_gather_phase(step: Step, prior_context: str | None) -> tuple[str, str, bool, dict | None, str | None]:
     """
-    Phase 1 — runs the existing tool-calling loop (web_search/fetch_page/
-    save_note) using /research's configured primary/fallback chain,
-    unchanged from before. Returns (gathered_document, gathering_model's
-    own draft answer, degraded, fallback_used, error). `gathered_document`
-    is the raw tool-result transcript, not the model's prose — that's
-    what phase 2 (_run_research_synthesis) actually works from.
+    Phase 1 — runs the tool-calling loop (web_search/fetch_page/save_note,
+    scoped via GATHERING.md — not the full unscoped TOOL_SCHEMAS, which
+    included send_to_telegram for no reason relevant to gathering) using
+    /research's configured primary/fallback chain. Returns
+    (gathered_document, gathering_model's own draft answer, degraded,
+    fallback_used, error). `gathered_document` is the raw tool-result
+    transcript, not the model's prose — that's what phase 2
+    (_run_research_synthesis) actually works from.
     """
     routing = config.get_task_routing("research")
     if not routing:
         return "", "", False, None, "No routing configured for /research"
+
+    gathering_brief = get_phase_brief("GATHERING.md")
+    gathering_tools = schemas_for(gathering_brief.tools)
 
     attempts = [routing["primary"]] + routing.get("fallback", [])
     last_error = None
@@ -283,7 +296,7 @@ def _run_research_gather_phase(step: Step, prior_context: str | None) -> tuple[s
             last_error = str(e)
             continue
 
-        messages = [ChatMessage(role="system", content=CITATION_STYLE_PROMPT)]
+        messages = [ChatMessage(role="system", content=gathering_brief.system_prompt)]
         if prior_context:
             messages.append(ChatMessage(
                 role="system",
@@ -293,10 +306,11 @@ def _run_research_gather_phase(step: Step, prior_context: str | None) -> tuple[s
 
         try:
             set_status(f"Researching — gathering sources ({attempt['provider']}/{model})…")
-            response = provider.chat(model=model, messages=messages, tools=TOOL_SCHEMAS)
+            response = provider.chat(model=model, messages=messages, tools=gathering_tools)
             response, full_messages = run_tool_loop(
                 provider, model, messages, response,
                 context={"command": "research", "topic_slug": step.topic_slug},
+                tools=gathering_tools,
             )
             doc = _extract_tool_results(full_messages)
             if doc.strip():
@@ -323,20 +337,42 @@ def _run_research_gather_phase(step: Step, prior_context: str | None) -> tuple[s
 
 def _run_research_synthesis(step: Step, gathered_doc: str, gather_fallback: dict | None, routing: dict) -> tuple[str, bool]:
     """
-    Phase 2 — one-shot synthesis over the gathered material, via DeepSeek/
-    LLM7 for its large context, retried on transient failure (30s x 6 =
-    3min) before falling back to the same model that did the gathering.
+    Phase 2 — synthesis over the gathered material, via DeepSeek/LLM7 for
+    its large context, retried on transient failure (30s x 6 = 3min)
+    before falling back to the same model that did the gathering.
     Returns (final_text, degraded).
+
+    Uses ANALYSIS.md (its own dedicated brief — NOT RESEARCHER.md's, see
+    ollama/ollama#17836 in the project notes for why that mattered: a
+    prior version reused RESEARCHER.md's system prompt here, which
+    describes a full tool belt this call was never actually given, and
+    the model narrating/attempting a tool call the request didn't
+    support is a plausible trigger for a real crash hit in production).
+    ANALYSIS.md scopes exactly one real tool (fetch_page) so a model that
+    identifies a genuine gap in the gathered material — "I need one more
+    specific page on X" — can actually act on it via a real tool loop,
+    instead of either hallucinating a tool call that doesn't exist or
+    silently ignoring a gap it correctly spotted.
     """
     doc = gathered_doc
     if len(doc) > RESEARCH_DOC_CHAR_BUDGET:
         doc = doc[:RESEARCH_DOC_CHAR_BUDGET] + "\n\n[...truncated — gathered material exceeded the safe context budget]"
 
-    brief = get_mode_brief("research")
+    analysis_brief = get_phase_brief("ANALYSIS.md")
+    analysis_tools = schemas_for(analysis_brief.tools)
     synth_messages = [
-        ChatMessage(role="system", content=brief.system_prompt),
+        ChatMessage(role="system", content=analysis_brief.system_prompt),
         ChatMessage(role="user", content=f"Research question: {step.text}\n\nGathered material:\n{doc}"),
     ]
+
+    def _run_synthesis_call(provider: Provider, model: str) -> str:
+        response = provider.chat(model=model, messages=synth_messages, tools=analysis_tools)
+        response, _ = run_tool_loop(
+            provider, model, synth_messages, response,
+            context={"command": "research", "topic_slug": step.topic_slug},
+            tools=analysis_tools,
+        )
+        return response.text or ""
 
     try:
         synth_provider = get_provider(SYNTHESIS_PROVIDER)
@@ -347,8 +383,7 @@ def _run_research_synthesis(step: Step, gathered_doc: str, gather_fallback: dict
         for attempt_num in range(1, SYNTHESIS_MAX_ATTEMPTS + 1):
             try:
                 set_status(f"Researching — synthesizing with DeepSeek (attempt {attempt_num}/{SYNTHESIS_MAX_ATTEMPTS})…")
-                resp = synth_provider.chat(model=SYNTHESIS_MODEL, messages=synth_messages)
-                return resp.text or "", False
+                return _run_synthesis_call(synth_provider, SYNTHESIS_MODEL), False
             except ProviderError:
                 if attempt_num < SYNTHESIS_MAX_ATTEMPTS:
                     set_status(f"Researching — DeepSeek busy, retrying in {SYNTHESIS_RETRY_DELAY_S}s ({attempt_num}/{SYNTHESIS_MAX_ATTEMPTS})…")
@@ -360,8 +395,7 @@ def _run_research_synthesis(step: Step, gathered_doc: str, gather_fallback: dict
     fallback_attempt = gather_fallback or routing["primary"]
     try:
         provider = get_provider(fallback_attempt["provider"])
-        resp = provider.chat(model=fallback_attempt["model"], messages=synth_messages)
-        return resp.text or "", True
+        return _run_synthesis_call(provider, fallback_attempt["model"]), True
     except ProviderError:
         return "", True
 
@@ -453,10 +487,12 @@ def _run_text_transform_step(
         messages.append(ChatMessage(role="user", content=step.text))
 
         try:
-            response = provider.chat(model=model, messages=messages, tools=schemas_for(tool_names))
+            scoped_tools = schemas_for(tool_names)
+            response = provider.chat(model=model, messages=messages, tools=scoped_tools)
             response, _ = run_tool_loop(
                 provider, model, messages, response,
                 context={"command": command, "topic_slug": step.topic_slug},
+                tools=scoped_tools,
             )
             return StepResult(
                 step=step,

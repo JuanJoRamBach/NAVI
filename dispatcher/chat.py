@@ -36,6 +36,7 @@ def run_mode_chat(mode: str, text: str) -> str:
             response, _messages = run_tool_loop(
                 provider, model, messages, response,
                 context={"command": f"chat-{mode}", "topic_slug": "chat"},
+                tools=tools,
             )
     except ProviderError as e:
         return f"⚠️ dispatcher_chat failed and has no fallback by design: {e}"
