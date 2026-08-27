@@ -62,7 +62,10 @@ class LLM7Provider(Provider):
             raise ProviderError(f"LLM7 error {resp.status_code}: {resp.text[:300]}")
 
         data = resp.json()
-        choice = data["choices"][0]["message"]
+        choices = data.get("choices") or []
+        if not choices or not choices[0].get("message"):
+            raise ProviderError(f"LLM7 returned a malformed response (no message): {str(data)[:300]}")
+        choice = choices[0]["message"]
 
         tool_calls = []
         for tc in choice.get("tool_calls") or []:
