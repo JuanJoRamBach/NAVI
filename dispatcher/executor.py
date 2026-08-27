@@ -287,6 +287,7 @@ class StepResult:
     # alongside the plain-text reply, not a replacement for it.
     rendered_file_bytes: bytes | None = None
     rendered_file_name: str | None = None
+    rendered_file_saved_path: str | None = None  # "filen:..." — set once actually saved
     # Set only for /code — overrides EXTENSION_FOR_COMMAND's hardcoded
     # ".py" default when the actual generated language can be detected
     # from a fenced code block, so a JS or Go snippet doesn't get saved
@@ -961,7 +962,7 @@ def run_chain(steps: list[Step]) -> list[StepResult]:
         # plain .md regardless of what else gets attached.
         if result.rendered_file_bytes and result.rendered_file_name:
             try:
-                save_bytes(
+                result.rendered_file_saved_path = save_bytes(
                     command=step.command,
                     topic_slug=step.topic_slug,
                     filename=result.rendered_file_name,

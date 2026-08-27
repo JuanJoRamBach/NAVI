@@ -25,9 +25,11 @@ retrying/duplicating an update because our model calls took a while.
 """
 
 import json
+import mimetypes
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote, unquote, urlparse, parse_qs
 
 from dispatcher.chat import run_mode_chat
 from dispatcher.executor import format_summary, run_chain
@@ -40,14 +42,26 @@ from messaging.discord import DiscordAdapter
 from messaging.telegram import TelegramAdapter
 from config.store import config
 from push.sender import PushError, add_subscription, send_push, subscription_count
+from storage.filen import StorageError, download_for_reply
 
 PORT = int(os.environ.get("PORT", "10000"))
+NAVI_BASE_URL = "https://navi-fih8.onrender.com"
 
 # The PWA (navi-ui, on GitHub Pages) calls /push/* from a different
 # origin than this server — browsers block that without an explicit
 # CORS allow. Scoped to the one real frontend origin rather than "*",
 # since this endpoint accepts push subscription data.
 PWA_ORIGIN = "https://juanjorambach.github.io"
+
+# Gates GET /files/<path> — unlike Telegram (which gets real file
+# attachments via sendDocument) the PWA has no attachment channel of its
+# own, so a saved artifact reaches it as a plain download URL embedded
+# in the reply text. That endpoint serves real document content (research,
+# recaps, tailored CVs), not just reminder text like the other
+# unauthenticated routes — worth a real credential, not just an
+# unguessable path. Fails closed: if this isn't set, every request 403s
+# rather than silently serving without a check.
+NAVI_FILES_TOKEN = os.environ.get("NAVI_FILES_TOKEN")
 
 # Conservative — Web Push payloads are capped around 4KB total by the
 # push service itself (title + body + JSON overhead + encryption), not
@@ -72,6 +86,37 @@ def _telegram_adapter() -> TelegramAdapter | None:
 def _discord_adapter() -> DiscordAdapter | None:
     token = os.environ.get("DISCORD_BOT_TOKEN")
     return DiscordAdapter(token) if token else None
+
+
+def _file_download_url(saved_path: str | None) -> str | None:
+    """saved_path is a full 'filen:...' path as returned by save_result/
+    save_bytes. Returns None (rather than a link that would just 403)
+    if NAVI_FILES_TOKEN isn't configured or the path is missing."""
+    if not NAVI_FILES_TOKEN or not saved_path or not saved_path.startswith("filen:"):
+        return None
+    relative = saved_path[len("filen:"):]
+    return f"{NAVI_BASE_URL}/files/{quote(relative)}?token={NAVI_FILES_TOKEN}"
+
+
+def _pwa_download_links(results: list) -> str:
+    """The PWA has no file-attachment channel (unlike Telegram's real
+    sendDocument) — a saved artifact reaches it as a plain download URL
+    appended to the reply text instead, which the frontend detects and
+    renders as a clickable chip. Skips image results (graph-data/
+    create-image) since those aren't meant to be re-downloaded as a
+    separate file — they're the image."""
+    lines = []
+    for r in results:
+        if r.rendered_file_saved_path and r.rendered_file_name:
+            url = _file_download_url(r.rendered_file_saved_path)
+            if url:
+                lines.append(f"📎 {r.rendered_file_name}: {url}")
+        elif r.saved_path and not r.image_bytes:
+            filename = r.saved_path.rsplit("/", 1)[-1]
+            url = _file_download_url(r.saved_path)
+            if url:
+                lines.append(f"📎 {filename}: {url}")
+    return ("\n\n" + "\n".join(lines)) if lines else ""
 
 
 def _reconstruct_confirmed_text(pending: ParseResult) -> str:
@@ -112,7 +157,7 @@ def handle_message(adapter: MessagingAdapter, msg: IncomingMessage) -> None:
 
 
 def _handle_parse_result(
-    result: ParseResult, chat_id: str, mode: str = "normal",
+    result: ParseResult, chat_id: str, mode: str = "normal", channel: str = "generic",
 ) -> tuple[str, list[tuple[bytes, str, str]]]:
     if result.kind == "commands":
         results = run_chain(result.steps)
@@ -135,7 +180,13 @@ def _handle_parse_result(
             (r.rendered_file_bytes, r.rendered_file_name, "")
             for r in results if r.rendered_file_bytes and r.rendered_file_name
         ]
-        return format_summary(results), attachments
+        reply_text = format_summary(results)
+        if channel == "pwa":
+            # The PWA never receives the `attachments` list above (see
+            # /chat/send) — a download link embedded in the text is the
+            # only way a saved artifact reaches it at all.
+            reply_text += _pwa_download_links(results)
+        return reply_text, attachments
 
     if result.kind == "near_miss":
         with _pending_lock:
@@ -199,7 +250,11 @@ def _run_research_async(result: ParseResult) -> None:
     research_status.py carries live progress in the meantime."""
     try:
         results = run_chain(result.steps)
-        text = format_summary(results)
+        # Only reachable from /chat/send (see the call site below) — a
+        # PWA-bound delivery, so the download-link treatment always
+        # applies here, unlike _handle_parse_result which needs the
+        # explicit channel="pwa" flag to tell it apart from Telegram.
+        text = format_summary(results) + _pwa_download_links(results)
     except Exception as e:
         set_status(None)
         _deliver_via_push("NAVI — research failed", f"Something went wrong: {e}")
@@ -280,8 +335,43 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 mark_delivered(r["id"])
                 delivered += 1
             self._respond_json(200, {"delivered": delivered})
+        elif self.path.startswith("/files/"):
+            self._handle_file_download()
         else:
             self._respond(404, "not found")
+
+    def _handle_file_download(self) -> None:
+        """Serves a saved Filen artifact back down — the only way a
+        rendered document or /research report reaches the PWA, which has
+        no real attachment channel the way Telegram's sendDocument does.
+        Fails closed on a missing/wrong token rather than falling back to
+        open access, since this serves real document content."""
+        parsed = urlparse(self.path)
+        token = (parse_qs(parsed.query).get("token") or [None])[0]
+        if not NAVI_FILES_TOKEN or token != NAVI_FILES_TOKEN:
+            self._respond(403, "forbidden")
+            return
+
+        relative_path = unquote(parsed.path[len("/files/"):])
+        if not relative_path or ".." in relative_path:
+            self._respond(400, "bad path")
+            return
+
+        try:
+            content = download_for_reply(f"filen:{relative_path}")
+        except StorageError as e:
+            self._respond(404, f"not found: {e}")
+            return
+
+        filename = relative_path.rsplit("/", 1)[-1]
+        content_type, _ = mimetypes.guess_type(filename)
+        self.send_response(200)
+        self.send_header("Content-Type", content_type or "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Access-Control-Allow-Origin", PWA_ORIGIN)
+        self.end_headers()
+        self.wfile.write(content)
 
     def do_OPTIONS(self):
         # CORS preflight — the browser sends this before the actual POST
@@ -338,10 +428,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 })
                 return
 
-            # Attachments (e.g. a /graph-data chart image) aren't supported
-            # over this channel yet — the PWA has no attachment UI built,
-            # so they're dropped rather than silently mismatched.
-            reply_text, _attachments = _handle_parse_result(result, "pwa", mode)
+            # Image attachments (e.g. a /graph-data chart) still aren't
+            # supported over this channel — the PWA has no image-render
+            # UI built, so those are dropped. Saved-file attachments
+            # (rendered documents, /research's report, etc.) reach the
+            # PWA as a download link embedded in reply_text instead —
+            # see _pwa_download_links via channel="pwa" below.
+            reply_text, _attachments = _handle_parse_result(result, "pwa", mode, channel="pwa")
             self._respond_json(200, {"reply": reply_text})
             return
 
