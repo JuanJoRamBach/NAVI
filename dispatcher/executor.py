@@ -33,13 +33,22 @@ from tools.image_gen import ImageGenError, generate_image
 from tools.registry import TOOL_SCHEMAS, schemas_for
 from tools.registry import dispatch as dispatch_tool
 
-# DeepSeek-V4-Flash-0731 via LLM7 — the synthesis-phase model for
-# /research (see _run_research_step). Hardcoded rather than a
-# task_routing entry since this role is very specific: one-shot,
-# no-tools, huge-context synthesis over already-gathered material, not
-# a general dispatcher role.
+# LLM7's turbo (free) tier — the synthesis-phase model for /research
+# (see _run_research_step). Hardcoded rather than a task_routing entry
+# since this role is very specific: one-shot, huge-context synthesis
+# over already-gathered material, not a general dispatcher role.
+#
+# Was DeepSeek-V4-Flash-0731 — moved to LLM7's paid "pro" tier
+# (usage_based_only) at some point after this was first wired in, with
+# no billing/payment method on this account. Every retry against it was
+# hitting a permanent wall, not a transient "busy" state — the full 3min
+# retry window burned on every single /research run for nothing before
+# ever reaching the fallback. Verified live against LLM7's /v1/models
+# endpoint (2026-08-27): gpt-oss is confirmed still on the free turbo
+# tier (usage_based_only: false), has tool calling + reasoning, and
+# 92.9% recent availability — a real number, not DeepSeek's permanent 0%.
 SYNTHESIS_PROVIDER = "llm7"
-SYNTHESIS_MODEL = "DeepSeek-V4-Flash-0731"
+SYNTHESIS_MODEL = "gpt-oss"
 
 # Retry a flaky synthesis call every 30s for 3 minutes before giving up
 # and falling back to the gathering model's own synthesis instead. LLM7's
@@ -49,13 +58,16 @@ SYNTHESIS_MODEL = "DeepSeek-V4-Flash-0731"
 SYNTHESIS_RETRY_DELAY_S = 30
 SYNTHESIS_MAX_ATTEMPTS = 6
 
-# Caps the gathered-material document handed to the synthesis model at
-# roughly gpt-oss-120b's ~130k-token context (assuming ~4 chars/token) —
-# not DeepSeek's much larger ~400k. This is deliberate: if DeepSeek is
-# unavailable, the fallback synthesis (see below) needs to read the same
-# document, so the cap has to fit whichever model actually ends up
-# reading it, not just the best case.
-RESEARCH_DOC_CHAR_BUDGET = 130_000 * 4
+# Caps the gathered-material document handed to the synthesis model.
+# gpt-oss's real context is 131,072 tokens (verified live) — noticeably
+# smaller than DeepSeek's ~400k-1M this was originally sized against, so
+# the document alone can't be allowed to eat the whole window: it still
+# has to leave real room for the system prompt, the question, tool
+# round-trips (ANALYSIS.md can call fetch_page), and the model's own
+# output. Capped well under the ceiling on purpose, not right up against
+# it — if the fallback synthesis model ends up being someone else
+# entirely, this budget has to fit that one too, not just the best case.
+RESEARCH_DOC_CHAR_BUDGET = 100_000 * 4
 
 # File extension per command — used when saving each step's output.
 EXTENSION_FOR_COMMAND = {
