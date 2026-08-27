@@ -2,3 +2,6 @@ requests
 matplotlib
 pywebpush
 py-vapid
+fpdf2
+python-docx
+python-pptx

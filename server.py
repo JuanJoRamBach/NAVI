@@ -128,6 +128,13 @@ def _handle_parse_result(
             (r.text.encode("utf-8"), f"{r.step.command}.md", "")
             for r in results if r.snippet and r.text
         ]
+        # An opt-in file request ("--file pdf" on /summarize, /recap,
+        # /note) — additive alongside the plain-text reply, same as
+        # /research's attachment above.
+        attachments += [
+            (r.rendered_file_bytes, r.rendered_file_name, "")
+            for r in results if r.rendered_file_bytes and r.rendered_file_name
+        ]
         return format_summary(results), attachments
 
     if result.kind == "near_miss":

@@ -14,6 +14,7 @@ depend on earlier ones' actual output). For each step:
 """
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -29,9 +30,85 @@ from providers.base import ChatMessage, ChatResponse, Provider, ProviderError
 from providers.registry import ProviderNotConfigured, get_provider
 from storage.filen import StorageError, save_bytes, save_result
 from tools.charts import CHART_TOOL_CHOICE, CHART_TOOL_NAME, CHART_TOOL_SCHEMA, ChartError, render_chart
+from tools.documents import DocumentRenderError, render as render_document
 from tools.image_gen import ImageGenError, generate_image
 from tools.registry import TOOL_SCHEMAS, schemas_for
 from tools.registry import dispatch as dispatch_tool
+
+# Opt-in file request for commands that don't save one by default
+# (/summarize, /recap, /note) — "--file" alone defaults to PDF (94% of
+# organizations use PDF as their primary format for finished business
+# documents, verified against real usage data rather than assumed), or
+# an explicit format: "--file docx", "--file pptx". Deterministic
+# regex, not an AI call, matching how dispatcher/parser.py itself
+# handles command detection — no reason to spend a request just to
+# notice a flag.
+_FILE_REQUEST_RE = re.compile(r"--file(?:\s+(pdf|docx|pptx))?\b", re.IGNORECASE)
+
+
+def _extract_file_request(text: str) -> tuple[str, str | None]:
+    """Returns (text with the flag stripped out, requested format or None)."""
+    match = _FILE_REQUEST_RE.search(text)
+    if not match:
+        return text, None
+    fmt = (match.group(1) or "pdf").lower()
+    cleaned = (text[:match.start()] + text[match.end():]).strip()
+    return cleaned, fmt
+
+
+# /code saved with a hardcoded ".py" regardless of what language the
+# model actually generated — detected instead from the language tag on
+# the first fenced code block in the reply (```python, ```javascript,
+# etc.), which every provider reliably includes for generated code.
+# Falls back to EXTENSION_FOR_COMMAND's "py" default when nothing
+# matches, rather than guessing.
+_CODE_LANG_EXTENSIONS = {
+    "python": "py", "py": "py",
+    "javascript": "js", "js": "js",
+    "typescript": "ts", "ts": "ts",
+    "jsx": "jsx", "tsx": "tsx",
+    "go": "go", "golang": "go",
+    "rust": "rs", "rs": "rs",
+    "java": "java",
+    "c": "c",
+    "cpp": "cpp", "c++": "cpp",
+    "csharp": "cs", "c#": "cs", "cs": "cs",
+    "ruby": "rb", "rb": "rb",
+    "php": "php",
+    "swift": "swift",
+    "kotlin": "kt",
+    "html": "html",
+    "css": "css",
+    "sql": "sql",
+    "bash": "sh", "sh": "sh", "shell": "sh",
+    "json": "json",
+    "yaml": "yaml", "yml": "yaml",
+    "xml": "xml",
+}
+_CODE_FENCE_RE = re.compile(r"```(\w+)")
+
+
+def _detect_code_extension(text: str) -> str | None:
+    match = _CODE_FENCE_RE.search(text)
+    if not match:
+        return None
+    return _CODE_LANG_EXTENSIONS.get(match.group(1).lower())
+
+
+def _attach_requested_file(result: "StepResult", file_format: str | None) -> "StepResult":
+    """Renders result.text into the requested format and attaches it
+    alongside the plain-text reply — additive, not a replacement, same
+    reasoning as /research always keeping its plain .md save regardless
+    of what else gets attached."""
+    if not file_format or not result.text:
+        return result
+    try:
+        title = result.step.text[:80] or result.step.command
+        result.rendered_file_bytes = render_document(file_format, title, result.text)
+        result.rendered_file_name = f"{result.step.topic_slug or result.step.command}.{file_format}"
+    except DocumentRenderError as e:
+        result.save_error = f"Requested file format failed: {e}"
+    return result
 
 # LLM7's turbo (free) tier — the synthesis-phase model for /research
 # (see _run_research_step). Hardcoded rather than a task_routing entry
@@ -204,6 +281,17 @@ class StepResult:
     # for channels that can send the full report as a real file
     # alongside it (Telegram's caption + attached .md).
     snippet: str | None = None
+    # Set when the user opted into a rendered file (e.g. "--file pdf" on
+    # /summarize, /recap, /note) via _extract_file_request. Delivered
+    # the same way /research's attachment is — an additional file
+    # alongside the plain-text reply, not a replacement for it.
+    rendered_file_bytes: bytes | None = None
+    rendered_file_name: str | None = None
+    # Set only for /code — overrides EXTENSION_FOR_COMMAND's hardcoded
+    # ".py" default when the actual generated language can be detected
+    # from a fenced code block, so a JS or Go snippet doesn't get saved
+    # with a misleading .py extension.
+    file_extension_override: str | None = None
 
 
 def _parse_tool_args(raw_args) -> dict:
@@ -612,7 +700,10 @@ def _run_remind_step(step: Step, prior_context: str | None) -> StepResult:
 
 
 def _run_summarize_step(step: Step, prior_context: str | None) -> StepResult:
-    return _run_text_transform_step(step, prior_context, "summarize", SUMMARIZE_SYSTEM_PROMPT, ["fetch_page"])
+    text, file_format = _extract_file_request(step.text)
+    working_step = Step(command=step.command, text=text, topic_slug=step.topic_slug)
+    result = _run_text_transform_step(working_step, prior_context, "summarize", SUMMARIZE_SYSTEM_PROMPT, ["fetch_page"])
+    return _attach_requested_file(result, file_format)
 
 
 # The only command whose input is an image, not text — routed to a
@@ -724,11 +815,17 @@ def _run_tailor_step(step: Step, prior_context: str | None) -> StepResult:
 
 
 def _run_recap_step(step: Step, prior_context: str | None) -> StepResult:
-    return _run_text_transform_step(step, prior_context, "recap", RECAP_SYSTEM_PROMPT, ["send_to_telegram"])
+    text, file_format = _extract_file_request(step.text)
+    working_step = Step(command=step.command, text=text, topic_slug=step.topic_slug)
+    result = _run_text_transform_step(working_step, prior_context, "recap", RECAP_SYSTEM_PROMPT, ["send_to_telegram"])
+    return _attach_requested_file(result, file_format)
 
 
 def _run_note_step(step: Step, prior_context: str | None) -> StepResult:
-    return _run_text_transform_step(step, prior_context, "note", NOTE_SYSTEM_PROMPT, ["send_to_telegram"])
+    text, file_format = _extract_file_request(step.text)
+    working_step = Step(command=step.command, text=text, topic_slug=step.topic_slug)
+    result = _run_text_transform_step(working_step, prior_context, "note", NOTE_SYSTEM_PROMPT, ["send_to_telegram"])
+    return _attach_requested_file(result, file_format)
 
 
 def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
@@ -797,6 +894,9 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
                 degraded=(i > 0),  # true if this wasn't the primary
                 fallback_used=attempt if i > 0 else None,
                 usage_note=response.usage_note,
+                file_extension_override=(
+                    _detect_code_extension(response.text or "") if step.command == "code" else None
+                ),
             )
         except (ProviderError, ChartError) as e:
             last_error = str(e)
@@ -843,7 +943,7 @@ def run_chain(steps: list[Step]) -> list[StepResult]:
             except StorageError as e:
                 result.save_error = str(e)
         elif result.text:
-            ext = EXTENSION_FOR_COMMAND.get(step.command, "txt")
+            ext = result.file_extension_override or EXTENSION_FOR_COMMAND.get(step.command, "txt")
             filename = f"{step.command}.{ext}"
             try:
                 result.saved_path = save_result(
@@ -854,6 +954,21 @@ def run_chain(steps: list[Step]) -> list[StepResult]:
                 )
             except StorageError as e:
                 result.save_error = str(e)
+
+        # A requested file render (e.g. "--file pdf") is additive — saved
+        # alongside whatever the plain-text branch above already did, not
+        # instead of it, same reasoning as /research always keeping its
+        # plain .md regardless of what else gets attached.
+        if result.rendered_file_bytes and result.rendered_file_name:
+            try:
+                save_bytes(
+                    command=step.command,
+                    topic_slug=step.topic_slug,
+                    filename=result.rendered_file_name,
+                    content=result.rendered_file_bytes,
+                )
+            except StorageError as e:
+                result.save_error = (result.save_error or "") + f" Requested file not saved: {e}"
 
         prior_context = result.text
         results.append(result)
