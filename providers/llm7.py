@@ -79,11 +79,20 @@ class LLM7Provider(Provider):
         # provider needs it for their own billing, so it's returned
         # unconditionally, not gated behind any particular tier. Was
         # already arriving in `data` on every call, just never extracted.
+        # LLM7 has no documented prompt-caching support at all (checked
+        # docs.llm7.io/limits directly, 2026-08-27) — cached_tokens will
+        # almost certainly never appear here, but this extracts it
+        # defensively in case that changes rather than assuming it never
+        # will.
         usage = data.get("usage") or {}
-        usage_note = (
-            f"{usage.get('prompt_tokens', '?')} in / {usage.get('completion_tokens', '?')} out / {usage['total_tokens']} total tokens"
-            if usage.get("total_tokens") is not None else None
-        )
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        usage_note = None
+        if usage.get("total_tokens") is not None:
+            cached_part = f" ({cached} cached)" if cached else ""
+            usage_note = (
+                f"{usage.get('prompt_tokens', '?')} in{cached_part} / "
+                f"{usage.get('completion_tokens', '?')} out / {usage['total_tokens']} total tokens"
+            )
 
         return ChatResponse(
             text=choice.get("content"),

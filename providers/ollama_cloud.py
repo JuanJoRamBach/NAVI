@@ -85,11 +85,20 @@ class OllamaCloudProvider(Provider):
         # provider needs it for their own billing, so it's returned
         # unconditionally, not gated behind any particular tier. Was
         # already arriving in `data` on every call, just never extracted.
+        # Ollama Cloud's prompt-caching support is unconfirmed — an open
+        # GitHub feature request (ollama/ollama#15600, #16714) with real
+        # reports of cache_read_tokens showing 0 even on workloads that
+        # should hit cache. Extracted defensively anyway in case it
+        # starts working, not because it's expected to right now.
         usage = data.get("usage") or {}
-        usage_note = (
-            f"{usage.get('prompt_tokens', '?')} in / {usage.get('completion_tokens', '?')} out / {usage['total_tokens']} total tokens"
-            if usage.get("total_tokens") is not None else None
-        )
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        usage_note = None
+        if usage.get("total_tokens") is not None:
+            cached_part = f" ({cached} cached)" if cached else ""
+            usage_note = (
+                f"{usage.get('prompt_tokens', '?')} in{cached_part} / "
+                f"{usage.get('completion_tokens', '?')} out / {usage['total_tokens']} total tokens"
+            )
 
         return ChatResponse(
             text=choice.get("content"),

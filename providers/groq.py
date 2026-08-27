@@ -81,11 +81,19 @@ class GroqProvider(Provider):
         # provider needs it for their own billing, so it's returned
         # unconditionally, not gated behind any particular tier. Was
         # already arriving in `data` on every call, just never extracted.
+        # cached_tokens (when present) is Groq's automatic prompt-caching
+        # hit count — confirms whether the 50%-off static-prefix reuse
+        # (system prompt + tool schemas, sent unchanged on every call) is
+        # actually firing, rather than just assuming it is.
         usage = data.get("usage") or {}
-        usage_note = (
-            f"{usage.get('prompt_tokens', '?')} in / {usage.get('completion_tokens', '?')} out / {usage['total_tokens']} total tokens"
-            if usage.get("total_tokens") is not None else None
-        )
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        usage_note = None
+        if usage.get("total_tokens") is not None:
+            cached_part = f" ({cached} cached)" if cached else ""
+            usage_note = (
+                f"{usage.get('prompt_tokens', '?')} in{cached_part} / "
+                f"{usage.get('completion_tokens', '?')} out / {usage['total_tokens']} total tokens"
+            )
 
         return ChatResponse(
             text=choice.get("content"),
