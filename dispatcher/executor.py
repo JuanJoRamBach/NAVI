@@ -299,6 +299,20 @@ def _run_research_gather_phase(step: Step, prior_context: str | None) -> tuple[s
                 context={"command": "research", "topic_slug": step.topic_slug},
             )
             doc = _extract_tool_results(full_messages)
+            if doc.strip():
+                # Saved as its own artifact — separate from the final
+                # synthesized report — so the raw gathered material is
+                # inspectable afterward (what was actually scraped, whether
+                # it contains characters that might trip an upstream
+                # parser bug like ollama/ollama#17836) instead of only
+                # existing as an in-memory variable that vanishes the
+                # moment this function returns or the process crashes.
+                # Best-effort: a save failure here doesn't abort the
+                # command, same reasoning as the final result's save.
+                try:
+                    save_result(command="research", topic_slug=step.topic_slug, filename="gathered.md", content=doc)
+                except StorageError:
+                    pass
             return doc, response.text or "", (i > 0), (attempt if i > 0 else None), None
         except ProviderError as e:
             last_error = str(e)
