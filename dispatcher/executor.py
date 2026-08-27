@@ -85,14 +85,54 @@ _CODE_LANG_EXTENSIONS = {
     "yaml": "yaml", "yml": "yaml",
     "xml": "xml",
 }
-_CODE_FENCE_RE = re.compile(r"```(\w+)")
+_CODE_BLOCK_RE = re.compile(r"```(\w+)\n(.*?)```", re.DOTALL)
 
 
-def _detect_code_extension(text: str) -> str | None:
-    match = _CODE_FENCE_RE.search(text)
-    if not match:
-        return None
-    return _CODE_LANG_EXTENSIONS.get(match.group(1).lower())
+def _extract_code_blocks(text: str) -> list[tuple[str, str]]:
+    """Returns [(language, code), ...] for every fenced block in the
+    reply, in order — not just the first, so an html+css+js reply can be
+    bundled into one viewable page instead of only ever looking at the
+    first block."""
+    return [(lang.lower(), code.strip("\n")) for lang, code in _CODE_BLOCK_RE.findall(text)]
+
+
+def _build_code_artifact(text: str) -> tuple[str, str, bool]:
+    """Turns a /code reply into (file_content, extension, viewable) for
+    saving as a real downloadable file — deliberately NOT the raw chat
+    reply (prose explanation + markdown fences), just the actual
+    generated code, so the download button hands over real source, not
+    a markdown transcript.
+
+    If the reply contains an HTML block, bundles any sibling CSS/JS
+    blocks into one self-contained document (a bare CSS or JS block has
+    nothing to render against on its own — only an HTML document is
+    ever meaningfully "viewable") and marks it viewable. A
+    single-language reply (Python, Go, etc.) just concatenates whatever
+    code blocks exist — download-only, nothing to render in a browser.
+    Falls back to the raw reply text if no fenced block was found at
+    all, so nothing is silently dropped.
+    """
+    blocks = _extract_code_blocks(text)
+    if not blocks:
+        return text, "txt", False
+
+    html_blocks = [code for lang, code in blocks if lang == "html"]
+    if html_blocks:
+        html = html_blocks[0]
+        css_blocks = [code for lang, code in blocks if lang == "css"]
+        js_blocks = [code for lang, code in blocks if lang in ("javascript", "js")]
+        if css_blocks and "<style" not in html:
+            style_tag = "<style>\n" + "\n".join(css_blocks) + "\n</style>"
+            html = html.replace("</head>", f"{style_tag}\n</head>") if "</head>" in html else f"{style_tag}\n{html}"
+        if js_blocks and "<script" not in html:
+            script_tag = "<script>\n" + "\n".join(js_blocks) + "\n</script>"
+            html = html.replace("</body>", f"{script_tag}\n</body>") if "</body>" in html else f"{html}\n{script_tag}"
+        return html, "html", True
+
+    lang = blocks[0][0]
+    ext = _CODE_LANG_EXTENSIONS.get(lang, "txt")
+    combined = "\n\n".join(code for _, code in blocks)
+    return combined, ext, False
 
 
 def _attach_requested_file(result: "StepResult", file_format: str | None) -> "StepResult":
@@ -293,6 +333,16 @@ class StepResult:
     # from a fenced code block, so a JS or Go snippet doesn't get saved
     # with a misleading .py extension.
     file_extension_override: str | None = None
+    # Set only for /code — the extracted code itself (see
+    # _build_code_artifact), saved instead of `text` so the download
+    # file is real source, not the raw chat reply's prose + markdown
+    # fences.
+    file_content_override: str | None = None
+    # True when file_content_override is a self-contained HTML document
+    # — the PWA offers a "view" button (renders inline in a browser tab)
+    # alongside "download" only when this is set. Never true for
+    # non-HTML code, since there's nothing to render in a browser.
+    viewable: bool = False
 
 
 def _parse_tool_args(raw_args) -> dict:
@@ -889,15 +939,18 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
                 )
 
             response = provider.chat(model=model, messages=messages)
+            file_ext, file_content, viewable = None, None, False
+            if step.command == "code":
+                file_content, file_ext, viewable = _build_code_artifact(response.text or "")
             return StepResult(
                 step=step,
                 text=response.text or "",
                 degraded=(i > 0),  # true if this wasn't the primary
                 fallback_used=attempt if i > 0 else None,
                 usage_note=response.usage_note,
-                file_extension_override=(
-                    _detect_code_extension(response.text or "") if step.command == "code" else None
-                ),
+                file_extension_override=file_ext,
+                file_content_override=file_content,
+                viewable=viewable,
             )
         except (ProviderError, ChartError) as e:
             last_error = str(e)
@@ -951,7 +1004,11 @@ def run_chain(steps: list[Step]) -> list[StepResult]:
                     command=step.command,
                     topic_slug=step.topic_slug,
                     filename=filename,
-                    content=result.text,
+                    # /code saves the extracted code (file_content_override),
+                    # not the raw chat reply — the download should be real
+                    # source, not a markdown transcript. Every other command
+                    # still saves its plain text reply, unchanged.
+                    content=result.file_content_override or result.text,
                 )
             except StorageError as e:
                 result.save_error = str(e)

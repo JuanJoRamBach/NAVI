@@ -88,23 +88,32 @@ def _discord_adapter() -> DiscordAdapter | None:
     return DiscordAdapter(token) if token else None
 
 
-def _file_download_url(saved_path: str | None) -> str | None:
+def _file_download_url(saved_path: str | None, render: bool = False) -> str | None:
     """saved_path is a full 'filen:...' path as returned by save_result/
     save_bytes. Returns None (rather than a link that would just 403)
-    if NAVI_FILES_TOKEN isn't configured or the path is missing."""
+    if NAVI_FILES_TOKEN isn't configured or the path is missing.
+
+    render=True asks /files/ to serve the content inline (renders as a
+    real page in a browser tab) instead of forcing a download — only
+    meaningful for /code's bundled HTML output (see StepResult.viewable
+    in dispatcher/executor.py); every other saved artifact just wants
+    the plain download behavior."""
     if not NAVI_FILES_TOKEN or not saved_path or not saved_path.startswith("filen:"):
         return None
     relative = saved_path[len("filen:"):]
-    return f"{NAVI_BASE_URL}/files/{quote(relative)}?token={NAVI_FILES_TOKEN}"
+    url = f"{NAVI_BASE_URL}/files/{quote(relative)}?token={NAVI_FILES_TOKEN}"
+    return f"{url}&render=1" if render else url
 
 
 def _pwa_download_links(results: list) -> str:
     """The PWA has no file-attachment channel (unlike Telegram's real
-    sendDocument) — a saved artifact reaches it as a plain download URL
-    appended to the reply text instead, which the frontend detects and
-    renders as a clickable chip. Skips image results (graph-data/
-    create-image) since those aren't meant to be re-downloaded as a
-    separate file — they're the image."""
+    sendDocument) — a saved artifact reaches it as plain URLs appended
+    to the reply text instead, which the frontend detects and renders
+    as clickable chips. Skips image results (graph-data/create-image)
+    since those aren't meant to be re-downloaded as a separate file —
+    they're the image. A viewable /code result (bundled HTML) gets
+    BOTH a download line and a separate view line, same file, two
+    different Content-Disposition modes."""
     lines = []
     for r in results:
         if r.rendered_file_saved_path and r.rendered_file_name:
@@ -113,9 +122,13 @@ def _pwa_download_links(results: list) -> str:
                 lines.append(f"📎 {r.rendered_file_name}: {url}")
         elif r.saved_path and not r.image_bytes:
             filename = r.saved_path.rsplit("/", 1)[-1]
-            url = _file_download_url(r.saved_path)
-            if url:
-                lines.append(f"📎 {filename}: {url}")
+            download_url = _file_download_url(r.saved_path)
+            if download_url:
+                lines.append(f"📎 {filename}: {download_url}")
+            if r.viewable:
+                view_url = _file_download_url(r.saved_path, render=True)
+                if view_url:
+                    lines.append(f"🌐 {filename}: {view_url}")
     return ("\n\n" + "\n".join(lines)) if lines else ""
 
 
@@ -345,9 +358,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
         rendered document or /research report reaches the PWA, which has
         no real attachment channel the way Telegram's sendDocument does.
         Fails closed on a missing/wrong token rather than falling back to
-        open access, since this serves real document content."""
+        open access, since this serves real document content.
+
+        ?render=1 serves the content inline (renders as a real page in a
+        browser tab) instead of forcing a download — restricted to
+        .html specifically, not any file type, so this stays predictable:
+        it's for /code's bundled HTML preview, not a general "display
+        anything inline" switch. Rendering a static HTML document this
+        way is inherently as safe as visiting any website — nothing
+        executes server-side, the browser's normal page sandbox applies
+        — consistent with the original design rule that this was never
+        meant to run arbitrary code, only render browser-safe output."""
         parsed = urlparse(self.path)
-        token = (parse_qs(parsed.query).get("token") or [None])[0]
+        query = parse_qs(parsed.query)
+        token = (query.get("token") or [None])[0]
         if not NAVI_FILES_TOKEN or token != NAVI_FILES_TOKEN:
             self._respond(403, "forbidden")
             return
@@ -365,9 +389,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         filename = relative_path.rsplit("/", 1)[-1]
         content_type, _ = mimetypes.guess_type(filename)
+        wants_render = (query.get("render") or [None])[0] == "1"
+        inline = wants_render and filename.lower().endswith(".html")
+
         self.send_response(200)
         self.send_header("Content-Type", content_type or "application/octet-stream")
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        disposition = "inline" if inline else "attachment"
+        self.send_header("Content-Disposition", f'{disposition}; filename="{filename}"')
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Access-Control-Allow-Origin", PWA_ORIGIN)
         self.end_headers()
