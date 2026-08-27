@@ -7,14 +7,24 @@ setup we did earlier) to save finished results. Render's disk is scratch-only
 "saved" until it's actually landed here.
 
 Folder structure (decided earlier in the session):
-    filen:<command>/<date>/<topic-slug>/<filename>
+    filen:<command>/<date>/<topic-slug>/<HH-MM-SS>_<filename>
 
-e.g. filen:research/2026-08-16/larian-studios-hiring/report.md
+e.g. filen:research/2026-08-16/larian-studios-hiring/14-32-07_report.md
+
+The time prefix matters: topic_slug is deterministic (see
+dispatcher/slugify.py — same first-5-meaningful-words always produces the
+same slug), so two separate runs of the same command on the same day
+with similar-enough phrasing land in the exact same folder. Without a
+per-run-unique filename, the second run silently overwrites the first's
+saved artifact — a real bug hit in practice (a re-run's research.md and
+gathered.md clobbered the previous run's). Fixed centrally here rather
+than in each command, since every command that saves a result shares
+this same path-building logic and was equally exposed.
 """
 
 import subprocess
 import tempfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 RCLONE_REMOTE = "filen"
@@ -38,7 +48,8 @@ class StorageError(Exception):
 def _rclone_path(command: str, topic_slug: str, filename: str) -> str:
     folder = FOLDER_FOR_COMMAND.get(command, command)
     today = date.today().isoformat()
-    return f"{RCLONE_REMOTE}:{folder}/{today}/{topic_slug}/{filename}"
+    time_prefix = datetime.now().strftime("%H-%M-%S")
+    return f"{RCLONE_REMOTE}:{folder}/{today}/{topic_slug}/{time_prefix}_{filename}"
 
 
 def save_result(command: str, topic_slug: str, filename: str, content: str) -> str:
