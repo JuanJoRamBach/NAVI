@@ -19,10 +19,17 @@ from dataclasses import dataclass
 
 COMMANDS = ["research", "code", "graph-data", "create-image", "summarize", "recap", "note", "remind", "tailor", "design-read"]
 
-# Max edit distance to flag as a "near miss" worth confirming. 2 catches
-# single-letter typos and transpositions without being so loose it flags
-# unrelated words.
-NEAR_MISS_THRESHOLD = 2
+# Max edit distance to flag as a "near miss" worth confirming.
+# Slash-prefixed typos (e.g. "/cade") are a strong command-intent signal,
+# so 2 is safe there — catches single-letter typos and transpositions.
+# Bare words with no slash need a tighter bar: a short, generic command
+# like "code" is within distance 2 of plenty of ordinary English words
+# ("some" vs "code" is exactly 2), so at threshold 2 a normal sentence
+# containing one of them gets wrongly flagged as a typo mid-conversation.
+# Distance 1 is tight enough to stop matching incidental vocabulary while
+# still catching a genuinely dropped-slash typo.
+NEAR_MISS_THRESHOLD_SLASH = 2
+NEAR_MISS_THRESHOLD_BARE = 1
 
 
 @dataclass
@@ -65,15 +72,21 @@ def _levenshtein(a: str, b: str) -> int:
     return prev_row[-1]
 
 
-def _find_near_miss(word: str) -> str | None:
-    """Returns the closest command name if within threshold, else None."""
+def _find_near_miss(word: str, threshold: int) -> str | None:
+    """Returns the closest command name if within threshold, else None.
+    Requires a real edit distance (>0) — a bare word that's an EXACT match
+    to a command name (e.g. plain "note" or "code" appearing in an
+    ordinary sentence, no slash) isn't a typo of anything, it's just that
+    word being used normally. Slash-prefixed exact matches never reach
+    this function at all (parse_message's regex catches those first), so
+    this only ever excludes the bare-word case."""
     word = word.lower().lstrip("/")
-    best, best_dist = None, NEAR_MISS_THRESHOLD + 1
+    best, best_dist = None, threshold + 1
     for cmd in COMMANDS:
         dist = _levenshtein(word, cmd)
         if dist < best_dist:
             best, best_dist = cmd, dist
-    return best if best_dist <= NEAR_MISS_THRESHOLD else None
+    return best if 0 < best_dist <= threshold else None
 
 
 def parse_message(text: str) -> ParseResult:
@@ -105,7 +118,8 @@ def parse_message(text: str) -> ParseResult:
     for word in re.findall(r"/?\w[\w-]*", text):
         if len(word.lstrip("/")) < 4:
             continue  # skip short words, too noisy for edit-distance matching
-        suggestion = _find_near_miss(word)
+        threshold = NEAR_MISS_THRESHOLD_SLASH if word.startswith("/") else NEAR_MISS_THRESHOLD_BARE
+        suggestion = _find_near_miss(word, threshold)
         if suggestion:
             return ParseResult(
                 kind="near_miss",
