@@ -45,13 +45,13 @@ from push.sender import PushError, add_subscription, send_push, subscription_cou
 from storage.filen import StorageError, download_for_reply
 
 PORT = int(os.environ.get("PORT", "10000"))
-NAVI_BASE_URL = "https://getnavi.online"
+NAVI_BASE_URL = "https://api.getnavi.online"
 
-# The PWA (navi-ui, on GitHub Pages) calls /push/* from a different
-# origin than this server — browsers block that without an explicit
-# CORS allow. Scoped to the one real frontend origin rather than "*",
-# since this endpoint accepts push subscription data.
-PWA_ORIGIN = "https://juanjorambach.github.io"
+# The PWA (navi-ui, on GitHub Pages, custom domain getnavi.online) calls
+# /push/* from a different origin than this server — browsers block that
+# without an explicit CORS allow. Scoped to the one real frontend origin
+# rather than "*", since this endpoint accepts push subscription data.
+PWA_ORIGIN = "https://getnavi.online"
 
 # Gates GET /files/<path> — unlike Telegram (which gets real file
 # attachments via sendDocument) the PWA has no attachment channel of its
