@@ -45,16 +45,24 @@ def get_provider(name: str) -> Provider:
 
 def get_dispatcher(context: str = "chat") -> tuple[Provider, str]:
     """
-    Returns (provider_instance, model_name) for a dispatcher role.
+    Returns (provider_instance, model_name) for a dispatcher role's
+    primary — same-model fallback (if configured) is via get_dispatcher_role.
 
-    context="chat" (default): live, interactive messages — pinned to the
-        officially-supported model, no fallback to the deprecated one.
+    context="chat" (default): live, interactive messages.
     context="autonomous": the two GitHub Actions jobs (daily digest, daily
         opportunity scan) — uses a separate quota bucket on purpose, see
         config/store.py DEFAULTS for the reasoning.
     """
+    role = get_dispatcher_role(context)
+    return get_provider(role["provider"]), role["model"]
+
+
+def get_dispatcher_role(context: str = "chat") -> dict:
+    """Returns the raw role dict ({provider, model, fallback}) for a
+    dispatcher role — callers that need to retry across the fallback
+    chain (see dispatcher/chat.py) use this instead of get_dispatcher."""
     role_name = f"dispatcher_{context}"
     role = config.get_role(role_name)
     if not role:
         raise ProviderNotConfigured(f"Role '{role_name}' not configured.")
-    return get_provider(role["provider"]), role["model"]
+    return role

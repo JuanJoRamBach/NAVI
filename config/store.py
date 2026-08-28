@@ -58,14 +58,23 @@ DEFAULTS = {
         # clearly ahead of gpt-oss-20b/120b on paper (52 vs 24 Artificial
         # Analysis Intelligence Index, 1M context vs 130k), but real
         # traffic that same day hit rate-limit + 503 "model temporarily
-        # busy" three times in a row. dispatcher_chat has no fallback on
-        # purpose (see above) specifically so a bad model choice here is
-        # felt immediately rather than silently degrading — reverted to
-        # gpt-oss-120b (proven-reliable Groq, and a real upgrade over the
-        # original 20b) rather than leave chat flaky. LLM7/DeepSeek stays
-        # registered as a provider — worth revisiting for a role with
-        # fallback room (task_routing), just not this one.
-        "dispatcher_chat": {"provider": "groq", "model": "openai/gpt-oss-120b"},
+        # busy" three times in a row. Reverted to gpt-oss-120b (proven-
+        # reliable Groq, and a real upgrade over the original 20b) rather
+        # than leave chat flaky on a *different* model.
+        #
+        # 2026-08-28: hit a real "Groq rate limited" hard failure live —
+        # Groq's own status page showed no outage, so this was ordinary
+        # free-tier rate-limiting (30 RPM / 1,000 RPD on gpt-oss-120b),
+        # not a broken model choice. Added a same-model fallback to
+        # LLM7's "gpt-oss" (same family, 131k context, tools+reasoning,
+        # 100% recent availability, free-tier covered) — this is
+        # deliberately NOT the earlier "different model, might silently
+        # degrade" risk, just a second door to the same room when Groq's
+        # free tier is briefly saturated.
+        "dispatcher_chat": {
+            "provider": "groq", "model": "openai/gpt-oss-120b",
+            "fallback": [{"provider": "llm7", "model": "gpt-oss"}],
+        },
         "dispatcher_autonomous": {"provider": "groq", "model": "openai/gpt-oss-120b"},
     },
     "task_routing": {
@@ -218,8 +227,10 @@ class ConfigStore:
     def get_role(self, role: str) -> dict | None:
         return self._data.get("roles", {}).get(role)
 
-    def set_role(self, role: str, provider: str, model: str):
-        self._data.setdefault("roles", {})[role] = {"provider": provider, "model": model}
+    def set_role(self, role: str, provider: str, model: str, fallback: list[dict] | None = None):
+        self._data.setdefault("roles", {})[role] = {
+            "provider": provider, "model": model, "fallback": fallback or [],
+        }
         self._save()
 
     # ---- Task routing (per-command primary/fallback) ----
@@ -284,6 +295,31 @@ def _migrate_dispatcher_chat_off_llm7():
 
 
 _migrate_dispatcher_chat_off_llm7()
+
+
+def _migrate_dispatcher_chat_add_fallback():
+    """
+    One-time addition (2026-08-29) for instances whose dispatcher_chat
+    role was already persisted (via Filen backup) before the "fallback"
+    key existed on this role at all — editing DEFAULTS alone only affects
+    a brand-new store. Adds LLM7's "gpt-oss" as a same-model-family
+    fallback after a real "Groq rate limited" hard failure in production
+    (ordinary free-tier rate-limiting per Groq's own status page, not an
+    outage — see the dispatcher_chat comment above). Guarded so a manual
+    reassignment later isn't fought by this.
+    """
+    if config.get("migrated_dispatcher_chat_add_fallback"):
+        return
+    role = config.get_role("dispatcher_chat") or {}
+    if not role.get("fallback"):
+        config.set_role(
+            "dispatcher_chat", role.get("provider", "groq"), role.get("model", "openai/gpt-oss-120b"),
+            fallback=[{"provider": "llm7", "model": "gpt-oss"}],
+        )
+    config.set("migrated_dispatcher_chat_add_fallback", True)
+
+
+_migrate_dispatcher_chat_add_fallback()
 
 
 def _migrate_add_summarize_routing():

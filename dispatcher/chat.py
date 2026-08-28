@@ -12,7 +12,7 @@ MAX_TOOL_ITERATIONS).
 from dispatcher.executor import CITATION_STYLE_PROMPT, run_tool_loop
 from dispatcher.mode_briefs import get_mode_brief
 from providers.base import ChatMessage, ProviderError
-from providers.registry import ProviderNotConfigured, get_dispatcher
+from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
 from tools.registry import schemas_for
 
 
@@ -20,7 +20,7 @@ def run_mode_chat(mode: str, text: str) -> str:
     brief = get_mode_brief(mode)
 
     try:
-        provider, model = get_dispatcher(context="chat")
+        role = get_dispatcher_role(context="chat")
     except ProviderNotConfigured as e:
         return f"⚠️ Can't reply right now — dispatcher_chat isn't configured: {e}"
 
@@ -30,18 +30,34 @@ def run_mode_chat(mode: str, text: str) -> str:
         messages.append(ChatMessage(role="system", content=CITATION_STYLE_PROMPT))
     messages.append(ChatMessage(role="user", content=text))
 
-    try:
-        response = provider.chat(model=model, messages=messages, tools=tools)
-        if tools and response.tool_calls:
-            response, _messages = run_tool_loop(
-                provider, model, messages, response,
-                context={"command": f"chat-{mode}", "topic_slug": "chat"},
-                tools=tools,
-            )
-    except ProviderError as e:
-        return f"⚠️ dispatcher_chat failed and has no fallback by design: {e}"
+    # Same-model-family fallback chain (added 2026-08-29 after a real
+    # "Groq rate limited" hard failure) — try the primary, then each
+    # configured fallback in order, same pattern as /research's gathering
+    # phase (executor.py). Any one succeeding returns immediately.
+    attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
+    last_error = None
+    for i, attempt in enumerate(attempts):
+        try:
+            provider = get_provider(attempt["provider"])
+        except Exception as e:
+            last_error = str(e)
+            continue
+        try:
+            response = provider.chat(model=attempt["model"], messages=messages, tools=tools)
+            if tools and response.tool_calls:
+                response, _messages = run_tool_loop(
+                    provider, attempt["model"], messages, response,
+                    context={"command": f"chat-{mode}", "topic_slug": "chat"},
+                    tools=tools,
+                )
+            reply = response.text or "(empty reply)"
+            if i > 0:
+                reply += f"\n\n⚡ (Groq was busy, answered via {attempt['provider']}/{attempt['model']} instead)"
+            elif response.usage_note:
+                reply += f"\n\n⚡ {response.usage_note}"
+            return reply
+        except ProviderError as e:
+            last_error = str(e)
+            continue
 
-    reply = response.text or "(empty reply)"
-    if response.usage_note:
-        reply += f"\n\n⚡ {response.usage_note}"
-    return reply
+    return f"⚠️ dispatcher_chat failed on every configured provider: {last_error}"
