@@ -95,9 +95,9 @@ def _file_download_url(saved_path: str | None, render: bool = False) -> str | No
 
     render=True asks /files/ to serve the content inline (renders as a
     real page in a browser tab) instead of forcing a download — only
-    meaningful for /code's bundled HTML output (see StepResult.viewable
-    in dispatcher/executor.py); every other saved artifact just wants
-    the plain download behavior."""
+    meaningful for /code's HTML output (see CodeFile.viewable in
+    dispatcher/executor.py); every other saved artifact just wants the
+    plain download behavior."""
     if not NAVI_FILES_TOKEN or not saved_path or not saved_path.startswith("filen:"):
         return None
     relative = saved_path[len("filen:"):]
@@ -116,7 +116,19 @@ def _pwa_download_links(results: list) -> str:
     different Content-Disposition modes."""
     lines = []
     for r in results:
-        if r.rendered_file_saved_path and r.rendered_file_name:
+        if r.code_saved:
+            # /code — one chip per saved file (bundled HTML is still just
+            # one entry here; separate-files mode is several).
+            viewable_by_name = {cf.filename: cf.viewable for cf in r.code_files}
+            for filename, saved_path in r.code_saved:
+                download_url = _file_download_url(saved_path)
+                if download_url:
+                    lines.append(f"📎 {filename}: {download_url}")
+                if viewable_by_name.get(filename):
+                    view_url = _file_download_url(saved_path, render=True)
+                    if view_url:
+                        lines.append(f"🌐 {filename}: {view_url}")
+        elif r.rendered_file_saved_path and r.rendered_file_name:
             url = _file_download_url(r.rendered_file_saved_path)
             if url:
                 lines.append(f"📎 {r.rendered_file_name}: {url}")
@@ -125,10 +137,6 @@ def _pwa_download_links(results: list) -> str:
             download_url = _file_download_url(r.saved_path)
             if download_url:
                 lines.append(f"📎 {filename}: {download_url}")
-            if r.viewable:
-                view_url = _file_download_url(r.saved_path, render=True)
-                if view_url:
-                    lines.append(f"🌐 {filename}: {view_url}")
     return ("\n\n" + "\n".join(lines)) if lines else ""
 
 
