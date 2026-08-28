@@ -45,7 +45,7 @@ from push.sender import PushError, add_subscription, send_push, subscription_cou
 from storage.filen import StorageError, download_for_reply
 
 PORT = int(os.environ.get("PORT", "10000"))
-NAVI_BASE_URL = "https://navi-fih8.onrender.com"
+NAVI_BASE_URL = "https://getnavi.online"
 
 # The PWA (navi-ui, on GitHub Pages) calls /push/* from a different
 # origin than this server — browsers block that without an explicit
