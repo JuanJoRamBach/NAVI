@@ -533,16 +533,16 @@ def _run_research_synthesis(step: Step, gathered_doc: str, gather_fallback: dict
     if synth_provider:
         for attempt_num in range(1, SYNTHESIS_MAX_ATTEMPTS + 1):
             try:
-                set_status(f"Researching — synthesizing with DeepSeek (attempt {attempt_num}/{SYNTHESIS_MAX_ATTEMPTS})…")
+                set_status(f"Researching — synthesizing with {SYNTHESIS_MODEL} (attempt {attempt_num}/{SYNTHESIS_MAX_ATTEMPTS})…")
                 return _run_synthesis_call(synth_provider, SYNTHESIS_MODEL), False
             except ProviderError:
                 if attempt_num < SYNTHESIS_MAX_ATTEMPTS:
-                    set_status(f"Researching — DeepSeek busy, retrying in {SYNTHESIS_RETRY_DELAY_S}s ({attempt_num}/{SYNTHESIS_MAX_ATTEMPTS})…")
+                    set_status(f"Researching — {SYNTHESIS_MODEL} busy, retrying in {SYNTHESIS_RETRY_DELAY_S}s ({attempt_num}/{SYNTHESIS_MAX_ATTEMPTS})…")
                     time.sleep(SYNTHESIS_RETRY_DELAY_S)
 
-    # DeepSeek never came through — fall back to the gathering model
+    # Synthesis model never came through — fall back to the gathering model
     # itself doing the synthesis instead of losing the result outright.
-    set_status("Researching — DeepSeek unavailable, finishing with the gathering model…")
+    set_status(f"Researching — {SYNTHESIS_MODEL} unavailable, finishing with the gathering model…")
     fallback_attempt = gather_fallback or routing["primary"]
     try:
         provider = get_provider(fallback_attempt["provider"])
