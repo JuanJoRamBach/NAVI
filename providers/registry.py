@@ -10,6 +10,7 @@ transport class, add one line here. Nothing else in the codebase changes.
 from config.store import config
 from providers.base import Provider
 from providers.cloudflare import CloudflareProvider
+from providers.gmi import GMIProvider
 from providers.groq import GroqProvider
 from providers.llm7 import LLM7Provider
 from providers.mistral import MistralProvider
@@ -23,6 +24,7 @@ _TRANSPORTS: dict[str, type[Provider]] = {
     "cloudflare": CloudflareProvider,
     "llm7": LLM7Provider,
     "mistral": MistralProvider,
+    "gmi": GMIProvider,
     # "nvidia_nim": NvidiaNimProvider,  # add when built
 }
 

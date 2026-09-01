@@ -29,3 +29,8 @@ topic_classifier_state.json
 aa_models.json
 or_models.json
 llm7_models.json
+
+# jobs/model_ranking.py's own generated output — a live snapshot
+# regenerated on every run, not app data, goes stale immediately.
+model_ranking_snapshot.json
+aa_benchmarks_cache.json
