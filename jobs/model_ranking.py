@@ -468,11 +468,25 @@ def build_ranking_snapshot() -> dict:
 
     rankings = {task: rank_for_task(task, catalog, aa_index) for task in TASK_REQUIREMENTS}
 
+    # NOTE: catalog holds every model each fetcher returned, not just free
+    # ones — fetch_groq/openrouter/llm7_models only ever append free-
+    # eligible entries in the first place, but fetch_mistral/gmi/
+    # cloudflare_models deliberately return every model (paid included)
+    # with a "free" flag attached, since ranking needs to see the whole
+    # catalog to dedupe/join against AA benchmarks correctly. So
+    # provider_counts below is split into total-fetched vs. free-eligible
+    # per provider — conflating the two here caused a real bug (2026-09-01,
+    # caught by JuanJo): GMI reported "79 free models" when only 2 (the
+    # MiniMax M3/M2.7 promo) actually had free: true — the 79 was every
+    # model GMI's catalog has, not the free subset.
     return {
         "fetched_at": time.time(),
         "catalog": catalog,
         "provider_counts": {
-            p: len([m for m in catalog if m["provider"] == p])
+            p: {
+                "total": len([m for m in catalog if m["provider"] == p]),
+                "free": len([m for m in catalog if m["provider"] == p and m.get("free")]),
+            }
             for p in ("groq", "openrouter", "llm7", "mistral", "gmi", "cloudflare")
         },
         "rankings": rankings,
@@ -483,7 +497,8 @@ def main() -> None:
     snapshot = build_ranking_snapshot()
     MODEL_RANKING_PATH.write_text(json.dumps(snapshot, indent=2))
 
-    print(f"Fetched {len(snapshot['catalog'])} free models across providers: {snapshot['provider_counts']}")
+    total_free = sum(c["free"] for c in snapshot["provider_counts"].values())
+    print(f"Fetched {total_free} free models across providers: {snapshot['provider_counts']}")
     for task, result in snapshot["rankings"].items():
         if result["primary"]:
             p = result["primary"]
