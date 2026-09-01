@@ -44,12 +44,14 @@ import asyncio
 import mimetypes
 import os
 import threading
+import time
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
+from dispatcher.agent_work import WorkflowError, start_run, start_workflow_run
 from dispatcher.chat import run_mode_chat
 from dispatcher.devslate_chat import run_devslate_turn
 from dispatcher.executor import format_summary, run_chain
@@ -66,6 +68,11 @@ from push.sender import PushError, add_subscription, send_push, subscription_cou
 from storage.filen import StorageError, download_for_reply
 from storage.conversations import (
     create_conversation, get_conversation, get_messages, get_task_state,
+)
+from storage.agent_work import (
+    create_workflow as create_workflow_definition,
+    due_workflows, get_run, get_run_steps, get_workflow, list_runs, list_workflows,
+    update_workflow_trigger,
 )
 from tools.devslate_tools import new_tool_call_id
 
@@ -523,6 +530,92 @@ async def devslate_get_messages(conversation_id: str) -> dict:
     messages = await get_messages(conversation_id)
     task_state = await get_task_state(conversation_id)
     return {"messages": messages, "task_state": task_state}
+
+
+# ---- Agent Work: workflow definitions + runs ----
+# Native (not third-party-embedded) multi-step agent execution — see
+# storage/agent_work.py and dispatcher/agent_work.py for the data model
+# and executor. Mirrors the Dev Slate conversations routes above (create/
+# get/list) plus /reminders/check's externally-pinged scheduling pattern,
+# since no in-process scheduler exists anywhere in this codebase.
+
+@app.post("/agent/workflows")
+async def agent_create_workflow(request: Request) -> JSONResponse:
+    payload = await request.json()
+    name = payload.get("name")
+    graph = payload.get("graph")
+    if not name or not graph:
+        return JSONResponse({"error": "missing 'name' or 'graph'"}, status_code=400)
+    trigger = payload.get("trigger") or {"type": "manual"}
+    workflow_id = await create_workflow_definition(name, payload.get("description"), graph, trigger)
+    return JSONResponse(await get_workflow(workflow_id))
+
+
+@app.get("/agent/workflows")
+async def agent_list_workflows() -> list[dict]:
+    return await list_workflows()
+
+
+@app.get("/agent/workflows/due")
+async def agent_due_workflows() -> dict:
+    """Hit periodically by an external cron ping, same shape as
+    /reminders/check. Starts a run for every scheduled workflow whose
+    trigger.next_run_at has passed, then rolls next_run_at forward by
+    interval_seconds so it doesn't refire on the next check.
+
+    Registered BEFORE /agent/workflows/{workflow_id} below on purpose —
+    FastAPI matches routes in registration order, so a static path like
+    this one must come before a dynamic path that would otherwise treat
+    "due" as a workflow_id and swallow every request here (caught before
+    ever deploying this: a quick route-table dump during dev testing
+    showed the dynamic route matching first)."""
+    started = 0
+    for workflow in await due_workflows():
+        await start_run(workflow["graph"], workflow_id=workflow["id"], trigger_source="scheduled")
+        trigger = workflow["trigger"]
+        interval = trigger.get("interval_seconds")
+        if interval:
+            trigger["next_run_at"] = time.time() + interval
+            await update_workflow_trigger(workflow["id"], trigger)
+        started += 1
+    return {"started": started}
+
+
+@app.get("/agent/workflows/{workflow_id}")
+async def agent_get_workflow(workflow_id: str) -> dict:
+    workflow = await get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(status_code=404, detail="not found")
+    return workflow
+
+
+@app.post("/agent/workflows/{workflow_id}/run")
+async def agent_run_workflow(workflow_id: str) -> JSONResponse:
+    """Manual trigger — returns the new run's id immediately, execution
+    continues on a background thread (see dispatcher/agent_work.py)."""
+    try:
+        run_id = await start_workflow_run(workflow_id, trigger_source="manual")
+    except WorkflowError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    return JSONResponse({"run_id": run_id})
+
+
+@app.get("/agent/runs")
+async def agent_list_runs(workflow_id: str | None = None, status: str | None = None) -> list[dict]:
+    return await list_runs(workflow_id=workflow_id, status=status)
+
+
+@app.get("/agent/runs/{run_id}")
+async def agent_get_run(run_id: str) -> dict:
+    run = await get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="not found")
+    return run
+
+
+@app.get("/agent/runs/{run_id}/steps")
+async def agent_get_run_steps(run_id: str) -> list[dict]:
+    return await get_run_steps(run_id)
 
 
 # ---- Dev Slate: the live chat WebSocket ----

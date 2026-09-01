@@ -68,6 +68,7 @@ _ROLE_NAME_FOR_CONTEXT = {
     "chat": "normal_chat",
     "autonomous": "dispatcher_autonomous",
     "devslate": "dev_slate_chat",
+    "agent_work": "agent_work",
 }
 
 

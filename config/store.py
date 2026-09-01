@@ -98,6 +98,14 @@ DEFAULTS = {
             "provider": "cloudflare", "model": "@cf/qwen/qwen2.5-coder-32b-instruct",
             "fallback": [{"provider": "mistral", "model": "codestral-latest"}],
         },
+        # agent_work: backs each node of an Agent Work workflow run
+        # (dispatcher/agent_work.py) — runs unattended, no user available
+        # for a "Groq's busy, try again?" moment, so same reliability
+        # reasoning as normal_chat: same primary + fallback pair.
+        "agent_work": {
+            "provider": "groq", "model": "openai/gpt-oss-120b",
+            "fallback": [{"provider": "llm7", "model": "gpt-oss"}],
+        },
     },
     "task_routing": {
         # Placeholder routing per command until the live daily-ranked model
@@ -465,4 +473,18 @@ def _migrate_add_dev_slate_chat_role():
 _migrate_add_dev_slate_chat_role()
 
 
-_migrate_add_design_read_routing()
+def _migrate_add_agent_work_role():
+    """One-time addition (2026-09-01) for instances whose config.json
+    already existed before agent_work was added to DEFAULTS — same
+    reasoning as _migrate_add_dev_slate_chat_role above."""
+    if config.get("migrated_add_agent_work_role"):
+        return
+    if not config.get_role("agent_work"):
+        config.set_role(
+            "agent_work", "groq", "openai/gpt-oss-120b",
+            fallback=[{"provider": "llm7", "model": "gpt-oss"}],
+        )
+    config.set("migrated_add_agent_work_role", True)
+
+
+_migrate_add_agent_work_role()

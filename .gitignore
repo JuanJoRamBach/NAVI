@@ -14,6 +14,10 @@ config/agent_config.json
 # config/agent_config.json above, not something to ship in the repo.
 conversations.db
 
+# storage/agent_work.py's SQLite store (Agent Work workflow/run/step
+# history) — same reasoning as conversations.db above.
+agent_work.db
+
 # Local-only running notes across Claude Code sessions — scratch
 # continuity, not project documentation, not meant to be committed.
 # Auto-loaded via CLAUDE.md's @IDEAS.md import.

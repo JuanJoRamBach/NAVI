@@ -12,10 +12,19 @@ the actual Python call and returns a plain string to feed back to the
 model as the tool result.
 """
 
+import json
+
 from tools.fetch import FetchError, fetch_page
 from tools.notes import NoteError, save_note
 from tools.search import SearchError, web_search
 from tools.telegram_send import TelegramSendError, send_to_telegram
+from tools.workflows import (
+    WorkflowToolError,
+    create_workflow,
+    get_run_status,
+    list_workflow_runs,
+    run_workflow,
+)
 
 TOOL_SCHEMAS = [
     {
@@ -88,6 +97,78 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_workflow",
+            "description": "Define a new Agent Work workflow — a graph of steps, each its "
+                            "own prompt to a model, that can be run manually or on a schedule. "
+                            "graph is {\"nodes\": [{\"id\", \"prompt\", \"tools\"?}], \"edges\": "
+                            "[{\"from\", \"to\"}]} — a single-node graph with no edges is a "
+                            "one-step workflow.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short workflow name."},
+                    "description": {"type": "string", "description": "What this workflow does."},
+                    "graph": {
+                        "type": "object",
+                        "description": "{\"nodes\": [...], \"edges\": [...]} — see tool description.",
+                    },
+                    "trigger": {
+                        "type": "object",
+                        "description": "{\"type\": \"manual\"} (default) or {\"type\": \"scheduled\", "
+                                        "\"interval_seconds\", \"next_run_at\"} (epoch seconds).",
+                    },
+                },
+                "required": ["name", "graph"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_workflow",
+            "description": "Manually starts a run of a saved Agent Work workflow. Returns "
+                            "immediately with the new run's id — execution continues in the "
+                            "background; use get_run_status to check on it later.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workflow_id": {"type": "string", "description": "The workflow's id, from create_workflow."},
+                },
+                "required": ["workflow_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_run_status",
+            "description": "Checks the status and step-by-step log of an Agent Work run.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string", "description": "The run's id, from run_workflow."},
+                },
+                "required": ["run_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_workflow_runs",
+            "description": "Lists recent Agent Work runs, optionally filtered by workflow or status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workflow_id": {"type": "string", "description": "Only runs of this workflow."},
+                    "status": {"type": "string", "description": "queued | running | completed | failed"},
+                },
+            },
+        },
+    },
 ]
 
 
@@ -137,9 +218,25 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
         if name == "send_to_telegram":
             return send_to_telegram(arguments["text"])
 
+        if name == "create_workflow":
+            workflow_id = create_workflow(
+                arguments["name"], arguments.get("description"), arguments["graph"], arguments.get("trigger"),
+            )
+            return f"Created workflow {workflow_id}."
+
+        if name == "run_workflow":
+            run_id = run_workflow(arguments["workflow_id"])
+            return f"Started run {run_id}."
+
+        if name == "get_run_status":
+            return json.dumps(get_run_status(arguments["run_id"]))
+
+        if name == "list_workflow_runs":
+            return json.dumps(list_workflow_runs(arguments.get("workflow_id"), arguments.get("status")))
+
         raise ToolExecutionError(f"Unknown tool: {name}")
 
-    except (SearchError, FetchError, NoteError, TelegramSendError) as e:
+    except (SearchError, FetchError, NoteError, TelegramSendError, WorkflowToolError) as e:
         # A failed tool call isn't fatal to the step — it's reported back
         # to the model as a tool result, same as a successful one, so the
         # model can decide how to proceed (retry, try another source, note
