@@ -8,3 +8,24 @@ env/
 *.egg-info/
 .pytest_cache/
 config/agent_config.json
+
+# Scratch diagnostic payloads (curl -d @file.json tests) — throwaway, not
+# part of the app, shouldn't be committed.
+*_test_payload.json
+
+# Claude Code's own local working context — machine-local tooling state,
+# not part of the shipped app. Was already ignored incidentally via some
+# global gitconfig; declared explicitly here so it stays ignored for
+# anyone else who clones this repo too, not just this machine.
+.claude/
+
+# jobs/classify_topic.py's local session state — scratch, not app data.
+topic_classifier_state.json
+
+# One-off downloaded catalog snapshots from live investigation this
+# session (Artificial Analysis, OpenRouter, LLM7 model lists) — point-in-
+# time reference dumps, not app data, go stale immediately, shouldn't be
+# committed.
+aa_models.json
+or_models.json
+llm7_models.json

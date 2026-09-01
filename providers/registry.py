@@ -12,6 +12,7 @@ from providers.base import Provider
 from providers.cloudflare import CloudflareProvider
 from providers.groq import GroqProvider
 from providers.llm7 import LLM7Provider
+from providers.mistral import MistralProvider
 from providers.ollama_cloud import OllamaCloudProvider
 from providers.openrouter import OpenRouterProvider
 
@@ -21,6 +22,7 @@ _TRANSPORTS: dict[str, type[Provider]] = {
     "ollama_cloud": OllamaCloudProvider,
     "cloudflare": CloudflareProvider,
     "llm7": LLM7Provider,
+    "mistral": MistralProvider,
     # "nvidia_nim": NvidiaNimProvider,  # add when built
 }
 
@@ -57,11 +59,20 @@ def get_dispatcher(context: str = "chat") -> tuple[Provider, str]:
     return get_provider(role["provider"]), role["model"]
 
 
+_ROLE_NAME_FOR_CONTEXT = {
+    # "chat" maps to "normal_chat" (renamed 2026-09-01 from
+    # "dispatcher_chat" — see config/store.py's migration), not the
+    # f"dispatcher_{context}" formula every other context still follows.
+    "chat": "normal_chat",
+    "autonomous": "dispatcher_autonomous",
+}
+
+
 def get_dispatcher_role(context: str = "chat") -> dict:
     """Returns the raw role dict ({provider, model, fallback}) for a
     dispatcher role — callers that need to retry across the fallback
     chain (see dispatcher/chat.py) use this instead of get_dispatcher."""
-    role_name = f"dispatcher_{context}"
+    role_name = _ROLE_NAME_FOR_CONTEXT.get(context, f"dispatcher_{context}")
     role = config.get_role(role_name)
     if not role:
         raise ProviderNotConfigured(f"Role '{role_name}' not configured.")

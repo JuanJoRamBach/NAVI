@@ -34,7 +34,7 @@ def _serialize_message(m: ChatMessage) -> dict:
 class OllamaCloudProvider(Provider):
     name = "ollama_cloud"
 
-    def chat(
+    def _do_chat(
         self,
         model: str,
         messages: list[ChatMessage],

@@ -5,6 +5,19 @@ OpenRouter transport. This is the "executor" in the dispatcher/executor
 split — the dispatcher (Groq) decides what needs doing, this actually does
 the heavy-lifting task work, using whichever model the daily-ranked list
 picked for that task type.
+
+Prompt caching (2026-09-01 research pass, cross-provider): automatic
+(implicit) for most routed models — OpenAI-style, DeepSeek, Gemini 2.5-class
+— but Anthropic and Alibaba/Qwen specifically require an explicit
+cache_control marker per message, which NAVI doesn't send (not relevant to
+the nvidia/nemotron models actually routed here today, but would matter if
+routing ever picks an Anthropic/Qwen model on OpenRouter). OpenRouter also
+does provider-sticky routing to keep cache hits warm across requests —
+10-minute idle expiry, tracked by conversation by default (hashes the first
+system + first user message), or explicitly via a session_id field if
+NAVI ever wants tighter control than the default hashing gives. See
+providers/groq.py for how caching differs there (fully automatic, no
+exceptions) — behavior is NOT uniform across NAVI's providers.
 """
 
 import requests
@@ -28,7 +41,7 @@ def _serialize_message(m: ChatMessage) -> dict:
 class OpenRouterProvider(Provider):
     name = "openrouter"
 
-    def chat(
+    def _do_chat(
         self,
         model: str,
         messages: list[ChatMessage],

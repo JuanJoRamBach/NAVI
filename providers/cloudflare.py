@@ -7,6 +7,16 @@ Cloudflare Workers AI transport, via the plain REST API (no SDK — same
 the real account before wiring in (real call cost 2.7 Neurons out of the
 10,000/day free allowance).
 
+Prompt caching (2026-09-01 research pass, cross-provider): automatic
+baseline — Cloudflare's own docs say prefix caching is "enabled by default
+for select models," no code change required to get some benefit. Hit rate
+improves further by sending an x-session-affinity header with a stable
+per-session identifier, routing repeat requests to the same model instance
+— not wired here yet, worth adding if this transport sees enough repeat-
+prefix traffic to matter. See providers/groq.py (fully automatic, no lever
+needed) and providers/openrouter.py (mostly automatic, a few exceptions)
+for how this differs elsewhere — behavior is NOT uniform across providers.
+
 Unlike every other provider, the endpoint URL itself needs a Cloudflare
 account ID, not just the API token. Account ID isn't a secret the way an
 API key is, so rather than extend config/store.py's schema for one
@@ -45,7 +55,7 @@ def _serialize_message(m: ChatMessage) -> dict:
 class CloudflareProvider(Provider):
     name = "cloudflare"
 
-    def chat(
+    def _do_chat(
         self,
         model: str,
         messages: list[ChatMessage],

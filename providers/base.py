@@ -10,6 +10,31 @@ provider never touches calling code.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+# Request counts, keyed by (provider_name, model) — always tracked at this
+# granularity regardless of whether a provider's real rate limit is
+# per-model (Groq) or shared across all models (OpenRouter, Cloudflare,
+# LLM7, Mistral); rolling per-model counts up into a provider-wide total
+# is a read-time concern, not a storage-time one. Module-level, not on
+# Provider instances — get_provider() in registry.py hands back a fresh
+# instance on every call (not a singleton), so instance state would reset
+# to zero every time and never accumulate anything. Counts the ATTEMPT
+# (incremented before the transport call, regardless of outcome) since
+# rate limits are generally enforced server-side the moment a request
+# arrives, before the response is known — undercounting a failed-but-
+# received request would be the wrong direction to err in here.
+# Process-lifetime only for now (resets on restart) — persisting this
+# across restarts and reconciling it against each provider's own admin/
+# usage-style endpoint is the not-yet-built piece from the model-ranking
+# design conversation, not something to half-build speculatively here.
+_REQUEST_COUNTS: dict[tuple[str, str], int] = {}
+
+
+def get_request_counts() -> dict[tuple[str, str], int]:
+    """Read-only snapshot of (provider, model) -> request count so far
+    this process. Whatever eventually persists/reports/reconciles this
+    reads it from here rather than reaching into the private dict."""
+    return dict(_REQUEST_COUNTS)
+
 
 @dataclass
 class ChatMessage:
@@ -62,7 +87,6 @@ class Provider(ABC):
     def __init__(self, api_key: str):
         self.api_key = api_key
 
-    @abstractmethod
     def chat(
         self,
         model: str,
@@ -76,5 +100,30 @@ class Provider(ABC):
         tool_choice lets a caller force a specific tool (e.g. /graph-data
         forcing render_chart) instead of leaving it to "auto", which is
         the default when tools are provided but tool_choice isn't set.
+
+        Concrete (not abstract) on purpose — this is the one place every
+        provider's call gets counted (see _REQUEST_COUNTS above), so it
+        can't be reimplemented per-transport without either duplicating
+        the counting line five times or someone eventually forgetting to.
+        Every existing caller keeps calling .chat() exactly as before;
+        this signature and behavior are unchanged, only the transport-
+        specific work moved to _do_chat().
         """
+        key = (self.name, model)
+        _REQUEST_COUNTS[key] = _REQUEST_COUNTS.get(key, 0) + 1
+        return self._do_chat(model, messages, tools=tools, tool_choice=tool_choice)
+
+    @abstractmethod
+    def _do_chat(
+        self,
+        model: str,
+        messages: list[ChatMessage],
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
+    ) -> ChatResponse:
+        """Provider-specific transport — build the request, call the API,
+        parse the response. Same contract chat() used to document
+        directly; implement this exactly as chat() was implemented before
+        this split. Never call this directly — call .chat() so the
+        request gets counted."""
         raise NotImplementedError

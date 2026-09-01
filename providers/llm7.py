@@ -2,9 +2,27 @@
 providers/llm7.py
 
 LLM7 transport (api.llm7.io) — OpenAI-compatible endpoint. Free "turbo"
-tier gives ~1M tokens/day; DeepSeek-V4-Flash-0731 is the strongest model on
-that tier (400k context, tool-calling, reasoning) and independently showed
-up as free on Hugging Face's warm-models list too.
+tier gives ~1M tokens/day with a key (2026-09-01: confirmed the real 5
+turbo-tier models live via GET /v1/models, which works fully keyless —
+codestral-latest, gemma4:31b, gpt-oss, minimax-m2.7, mistral-Nemo-
+Instruct-2407. Correcting an earlier wrong claim in this docstring:
+DeepSeek-V4-Flash-0731 is NOT on the free turbo tier — it's confirmed
+`pro` (paid) in the live catalog. Don't trust that claim if it resurfaces
+elsewhere; this is the corrected version.
+
+Also confirmed 2026-09-01: anonymous (keyless) requests get their OWN
+separate 500K-tokens/24h pool, tracked by IP not account — genuinely
+additive on top of a keyed account's 1M/24h, not double-counted from the
+same budget. Worth deliberately splitting traffic between keyed and
+keyless calls rather than always using the key.
+
+Prompt caching (2026-09-01 research pass, cross-provider): UNKNOWN — no
+published caching documentation found for this provider. Don't assume
+either way; if it matters, test empirically (send two requests sharing a
+prefix, check whether `usage` reports a cached-token discount) rather than
+guessing. Every other NAVI provider's caching behavior is documented in its
+own transport file (providers/groq.py, openrouter.py, cloudflare.py) —
+this is the one gap.
 """
 
 import requests
@@ -28,7 +46,7 @@ def _serialize_message(m: ChatMessage) -> dict:
 class LLM7Provider(Provider):
     name = "llm7"
 
-    def chat(
+    def _do_chat(
         self,
         model: str,
         messages: list[ChatMessage],

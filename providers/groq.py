@@ -7,6 +7,17 @@ using the model pinned in config/store.py DEFAULTS (currently
 llama-3.1-8b-instant — see the comment there for why, despite it being
 officially deprecated). Consistency matters more than raw capability for
 this role.
+
+Prompt caching (2026-09-01 research pass, cross-provider): fully automatic
+here — Groq's own docs: "works automatically on all your API requests with
+no code changes required and no additional fees." 50% off cached portions,
+cache expires after 2 hours idle. Nothing to wire on NAVI's side to benefit
+from it; `usage_note` below already surfaces cached_tokens when a hit
+occurs. Compare providers/openrouter.py (mostly automatic, a few model
+families need an explicit marker) and providers/cloudflare.py (automatic
+baseline, optional header to improve hit rate) — caching behavior is NOT
+uniform across NAVI's providers, check the specific transport before
+assuming.
 """
 
 import requests
@@ -30,7 +41,7 @@ def _serialize_message(m: ChatMessage) -> dict:
 class GroqProvider(Provider):
     name = "groq"
 
-    def chat(
+    def _do_chat(
         self,
         model: str,
         messages: list[ChatMessage],
