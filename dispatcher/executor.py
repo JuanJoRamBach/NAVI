@@ -277,13 +277,16 @@ CITATION_STYLE_PROMPT = (
 def run_tool_loop(
     provider: Provider, model: str, messages: list[ChatMessage], response: ChatResponse, context: dict,
     tools: list[dict] | None = None,
-) -> tuple[ChatResponse, list[ChatMessage]]:
+) -> tuple[ChatResponse, list[ChatMessage], int]:
     """Executes any tool_calls in `response`, feeds results back to the
     model, and repeats until the model stops asking for tools or the
     iteration ceiling is hit. Returns (final ChatResponse, full message
-    transcript) — the transcript lets a caller extract raw tool results
-    (see _extract_tool_results) without needing the model's own final
-    prose synthesis.
+    transcript, iteration count) — the transcript lets a caller extract
+    raw tool results (see _extract_tool_results) without needing the
+    model's own final prose synthesis. The iteration count feeds
+    StepResult.attempt_count (2026-09-01) — "took too long" for a plan
+    step means too many LLM round-trips, not wall-clock seconds, so this
+    can't stay a discarded local variable anymore.
 
     `tools` should be whatever scoped list the caller's *first* call to
     the model already used — every follow-up call inside this loop reuses
@@ -318,7 +321,7 @@ def run_tool_loop(
         response = provider.chat(model=model, messages=messages, tools=tools)
         iterations += 1
 
-    return response, messages
+    return response, messages, iterations
 
 
 def _extract_tool_results(messages: list[ChatMessage]) -> str:
@@ -341,6 +344,15 @@ class StepResult:
     degraded: bool = False
     fallback_used: dict | None = None
     error: str | None = None
+    # Total LLM round-trips this step needed (fallback attempts + tool-
+    # loop iterations combined) — "took too long" for a plan step means
+    # too many tries, not wall-clock time (JuanJo's correction, 2026-09-01).
+    # Defaults to 1 (a single clean call) for every construction site not
+    # yet updated to pass a real count — only the /research gather+
+    # synthesis path is wired so far; the other command types still
+    # default here until they get the same treatment, deliberately not
+    # done speculatively ahead of need.
+    attempt_count: int = 1
     contaminated_by: list[str] = field(default_factory=list)  # commands whose degradation fed this step
     saved_path: str | None = None
     save_error: str | None = None
@@ -445,20 +457,22 @@ def _make_snippet(text: str, max_chars: int = 600) -> str:
     return cut.rstrip() + "…"
 
 
-def _run_research_gather_phase(step: Step, prior_context: str | None) -> tuple[str, str, bool, dict | None, str | None]:
+def _run_research_gather_phase(step: Step, prior_context: str | None) -> tuple[str, str, bool, dict | None, str | None, int]:
     """
     Phase 1 — runs the tool-calling loop (web_search/fetch_page/save_note,
     scoped via GATHERING.md — not the full unscoped TOOL_SCHEMAS, which
     included send_to_telegram for no reason relevant to gathering) using
     /research's configured primary/fallback chain. Returns
     (gathered_document, gathering_model's own draft answer, degraded,
-    fallback_used, error). `gathered_document` is the raw tool-result
-    transcript, not the model's prose — that's what phase 2
-    (_run_research_synthesis) actually works from.
+    fallback_used, error, attempt_count). `gathered_document` is the raw
+    tool-result transcript, not the model's prose — that's what phase 2
+    (_run_research_synthesis) actually works from. attempt_count is
+    failed-provider-attempts-before-success + 1 + tool-loop iterations
+    within the successful attempt (or every attempt tried, if all failed).
     """
     routing = config.get_task_routing("research")
     if not routing:
-        return "", "", False, None, "No routing configured for /research"
+        return "", "", False, None, "No routing configured for /research", 0
 
     gathering_brief = get_phase_brief("GATHERING.md")
     gathering_tools = schemas_for(gathering_brief.tools)
@@ -487,7 +501,7 @@ def _run_research_gather_phase(step: Step, prior_context: str | None) -> tuple[s
         try:
             set_status(f"Researching — gathering sources ({attempt['provider']}/{model})…")
             response = provider.chat(model=model, messages=messages, tools=gathering_tools)
-            response, full_messages = run_tool_loop(
+            response, full_messages, iterations = run_tool_loop(
                 provider, model, messages, response,
                 context={"command": "research", "topic_slug": step.topic_slug},
                 tools=gathering_tools,
@@ -507,20 +521,20 @@ def _run_research_gather_phase(step: Step, prior_context: str | None) -> tuple[s
                     save_result(command="research", topic_slug=step.topic_slug, filename="gathered.md", content=doc)
                 except StorageError:
                     pass
-            return doc, response.text or "", (i > 0), (attempt if i > 0 else None), None
+            return doc, response.text or "", (i > 0), (attempt if i > 0 else None), None, i + 1 + iterations
         except ProviderError as e:
             last_error = str(e)
             continue
 
-    return "", "", False, None, last_error or "All research providers failed during gathering"
+    return "", "", False, None, last_error or "All research providers failed during gathering", len(attempts)
 
 
-def _run_research_synthesis(step: Step, gathered_doc: str, gather_fallback: dict | None, routing: dict) -> tuple[str, bool]:
+def _run_research_synthesis(step: Step, gathered_doc: str, gather_fallback: dict | None, routing: dict) -> tuple[str, bool, int]:
     """
     Phase 2 — synthesis over the gathered material, via DeepSeek/LLM7 for
     its large context, retried on transient failure (30s x 6 = 3min)
     before falling back to the same model that did the gathering.
-    Returns (final_text, degraded).
+    Returns (final_text, degraded, attempt_count).
 
     Uses ANALYSIS.md (its own dedicated brief — NOT RESEARCHER.md's, see
     ollama/ollama#17836 in the project notes for why that mattered: a
@@ -545,14 +559,14 @@ def _run_research_synthesis(step: Step, gathered_doc: str, gather_fallback: dict
         ChatMessage(role="user", content=f"Research question: {step.text}\n\nGathered material:\n{doc}"),
     ]
 
-    def _run_synthesis_call(provider: Provider, model: str) -> str:
+    def _run_synthesis_call(provider: Provider, model: str) -> tuple[str, int]:
         response = provider.chat(model=model, messages=synth_messages, tools=analysis_tools)
-        response, _ = run_tool_loop(
+        response, _messages, iterations = run_tool_loop(
             provider, model, synth_messages, response,
             context={"command": "research", "topic_slug": step.topic_slug},
             tools=analysis_tools,
         )
-        return response.text or ""
+        return response.text or "", iterations
 
     try:
         synth_provider = get_provider(SYNTHESIS_PROVIDER)
@@ -563,7 +577,8 @@ def _run_research_synthesis(step: Step, gathered_doc: str, gather_fallback: dict
         for attempt_num in range(1, SYNTHESIS_MAX_ATTEMPTS + 1):
             try:
                 set_status(f"Researching — synthesizing with {SYNTHESIS_MODEL} (attempt {attempt_num}/{SYNTHESIS_MAX_ATTEMPTS})…")
-                return _run_synthesis_call(synth_provider, SYNTHESIS_MODEL), False
+                text, iterations = _run_synthesis_call(synth_provider, SYNTHESIS_MODEL)
+                return text, False, attempt_num + iterations
             except ProviderError:
                 if attempt_num < SYNTHESIS_MAX_ATTEMPTS:
                     set_status(f"Researching — {SYNTHESIS_MODEL} busy, retrying in {SYNTHESIS_RETRY_DELAY_S}s ({attempt_num}/{SYNTHESIS_MAX_ATTEMPTS})…")
@@ -575,9 +590,10 @@ def _run_research_synthesis(step: Step, gathered_doc: str, gather_fallback: dict
     fallback_attempt = gather_fallback or routing["primary"]
     try:
         provider = get_provider(fallback_attempt["provider"])
-        return _run_synthesis_call(provider, fallback_attempt["model"]), True
+        text, iterations = _run_synthesis_call(provider, fallback_attempt["model"])
+        return text, True, SYNTHESIS_MAX_ATTEMPTS + 1 + iterations
     except ProviderError:
-        return "", True
+        return "", True, SYNTHESIS_MAX_ATTEMPTS + 1
 
 
 def _run_research_step(step: Step, prior_context: str | None) -> StepResult:
@@ -585,22 +601,23 @@ def _run_research_step(step: Step, prior_context: str | None) -> StepResult:
     if not routing:
         return StepResult(step=step, text="", error="No routing configured for /research")
 
-    gathered_doc, draft_text, gather_degraded, gather_fallback, gather_error = _run_research_gather_phase(step, prior_context)
+    gathered_doc, draft_text, gather_degraded, gather_fallback, gather_error, gather_attempts = _run_research_gather_phase(step, prior_context)
     if gather_error:
         set_status(None)
-        return StepResult(step=step, text="", error=gather_error)
+        return StepResult(step=step, text="", error=gather_error, attempt_count=gather_attempts)
 
     if not gathered_doc.strip():
         # No tool calls happened — model answered from reasoning alone,
         # nothing gathered to synthesize from.
         set_status(None)
-        return StepResult(step=step, text=draft_text, degraded=gather_degraded, fallback_used=gather_fallback)
+        return StepResult(step=step, text=draft_text, degraded=gather_degraded, fallback_used=gather_fallback, attempt_count=gather_attempts)
 
-    final_text, synth_degraded = _run_research_synthesis(step, gathered_doc, gather_fallback, routing)
+    final_text, synth_degraded, synth_attempts = _run_research_synthesis(step, gathered_doc, gather_fallback, routing)
     set_status(None)
+    total_attempts = gather_attempts + synth_attempts
 
     if not final_text:
-        return StepResult(step=step, text="", error="Research gathering succeeded but synthesis failed on every attempt")
+        return StepResult(step=step, text="", error="Research gathering succeeded but synthesis failed on every attempt", attempt_count=total_attempts)
 
     return StepResult(
         step=step,
@@ -608,6 +625,7 @@ def _run_research_step(step: Step, prior_context: str | None) -> StepResult:
         snippet=_make_snippet(final_text),
         degraded=gather_degraded or synth_degraded,
         fallback_used=gather_fallback,
+        attempt_count=total_attempts,
     )
 
 
@@ -669,7 +687,7 @@ def _run_text_transform_step(
         try:
             scoped_tools = schemas_for(tool_names)
             response = provider.chat(model=model, messages=messages, tools=scoped_tools)
-            response, _ = run_tool_loop(
+            response, _messages, iterations = run_tool_loop(
                 provider, model, messages, response,
                 context={"command": command, "topic_slug": step.topic_slug},
                 tools=scoped_tools,
@@ -680,6 +698,7 @@ def _run_text_transform_step(
                 degraded=(i > 0),
                 fallback_used=attempt if i > 0 else None,
                 usage_note=response.usage_note,
+                attempt_count=i + 1 + iterations,
             )
         except ProviderError as e:
             last_error = str(e)
