@@ -321,6 +321,7 @@ def config_routing() -> dict:
             "normal_chat": config.get_role("normal_chat"),
             "dispatcher_autonomous": config.get_role("dispatcher_autonomous"),
             "dev_slate_chat": config.get_role("dev_slate_chat"),
+            "agent_work": config.get_role("agent_work"),
         },
         "task_routing": {cmd: config.get_task_routing(cmd) for cmd in COMMANDS},
         "enabled_providers": config.enabled_providers(),

@@ -21,10 +21,18 @@ from tools.registry import schemas_for
 def run_mode_chat(mode: str, text: str) -> str:
     brief = get_mode_brief(mode)
 
+    # Every existing mode (normal/research/brainstorm) shares normal_chat's
+    # role — only Agent Work gets its own (agent_work role, same reasoning
+    # as Dev Slate having dev_slate_chat: it needs real tool-calling
+    # reliability, not whatever's cheapest for everyday chat). Context
+    # string intentionally differs from `mode` itself for every other mode
+    # (stays "chat") so this doesn't silently change normal_chat/research/
+    # brainstorm's existing behavior.
+    role_context = "agent_work" if mode == "agent_work" else "chat"
     try:
-        role = get_dispatcher_role(context="chat")
+        role = get_dispatcher_role(context=role_context)
     except ProviderNotConfigured as e:
-        return f"⚠️ Can't reply right now — normal_chat isn't configured: {e}"
+        return f"⚠️ Can't reply right now — {role_context} isn't configured: {e}"
 
     tools = schemas_for(brief.tools) if brief.tools else None
     messages = [ChatMessage(role="system", content=brief.system_prompt)]

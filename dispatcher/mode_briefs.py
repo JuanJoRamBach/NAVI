@@ -30,6 +30,7 @@ MODE_FILES = {
     "research": "RESEARCHER.md",
     "brainstorm": "BRAINSTORM.md",
     "devslate": "DEV_SLATE_CHAT.md",
+    "agent_work": "AGENT_WORK_CHAT.md",
 }
 
 _TOOLS_LINE = re.compile(r"^tools:\s*\[(.*?)\]\s*$", re.MULTILINE)
