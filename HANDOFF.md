@@ -1,0 +1,76 @@
+# Handoff — NAVI backend, 2026-09-01
+
+Written to close out this session. Read this instead of re-deriving context from scratch. Repo: `JuanJoRamBach/NAVI`, working dir `C:\Users\juanj\Proyectos IA\NAVI`, branch `main` (all work this session landed directly on `main` — no feature branch).
+
+## What shipped this session (committed + pushed, verified on live AWS Lightsail)
+
+### 1. Real per-provider request counting
+- `providers/base.py`: `Provider.chat()` changed from `@abstractmethod` to a concrete method that increments a module-level `_REQUEST_COUNTS[(provider, model)]` counter *before* delegating to a new abstract `_do_chat()`. Every transport (`groq.py`, `openrouter.py`, `cloudflare.py`, `llm7.py`, `mistral.py`, `ollama_cloud.py`) had its old `chat()` renamed to `_do_chat()`, bodies unchanged.
+- `get_request_counts()` exposes the tally. Process-lifetime only, not persisted — a known, deliberately-flagged gap, not silently claimed as solved.
+- Why: NAVI had no way to know how close a provider/model was to its own rate limit until it got rejected. This is step one toward that; nothing consumes the counts yet.
+
+### 2. Mistral and GMI Cloud added as full chat providers
+- `providers/mistral.py` (new): OpenAI-compatible, `/v1/chat/completions`. Free "Experiment" tier confirmed (~1B tokens/month, non-commercial).
+- `providers/gmi.py` (new): OpenAI-compatible, `api.gmi-serving.com/v1`. Added specifically for MiniMax M3's free promo (GMI's own tweet: MiniMax M3 + M2.7, unlimited, free 8/24–9/6/2026) — the model slug is never hardcoded anywhere in the transport, only discovered live via the ranking job (see below).
+- Both registered in `providers/registry.py`'s `_TRANSPORTS`, both seeded from env vars (`MISTRAL_API_KEY`, `GMI_API_KEY`) in `server.py`'s `_seed_keys_from_env()`.
+
+### 3. `dispatcher_chat` role renamed to `normal_chat`
+- Across `config/store.py` (DEFAULTS + a new one-time migration function, following the exact pattern of 3 existing migrations), `dispatcher/chat.py`, `dispatcher/parser.py`, `server.py`, `providers/registry.py` (`get_dispatcher_role`'s `_ROLE_NAME_FOR_CONTEXT` map), and `navi-pwa/src/App.tsx` (5 references).
+- Why: "dispatcher" in the name was confusing once NAVI had multiple named chat modes (Normal/Research/Brainstorm/Plan) — this role specifically backs Normal Chat.
+- The migration copies a live server's already-persisted `dispatcher_chat` role over to `normal_chat` on first boot after the update, rather than silently losing it. Verified with a real runtime test (migration ran, fallback chain intact).
+
+### 4. `StepResult.attempt_count` — real friction signal for Plan Chat
+- **The actual correction that drove this**: I first designed a `duration_seconds` field to flag "this step took too long." JuanJo corrected it directly: *"took too long" refers to "too many tries and chats with the LLM"* — an attempt/retry count, not wall-clock time (elapsed time can just reflect network/queue latency, not real difficulty).
+- `dispatcher/executor.py`: `run_tool_loop()`'s return signature changed from a 2-tuple `(response, messages)` to a 3-tuple `(response, messages, iterations)` — the iteration count was already being computed internally, just silently discarded before. `StepResult.attempt_count: int = 1` added, fully wired through `/research`'s two-phase pipeline (`_run_research_gather_phase` now returns a 6-tuple ending in attempt count; `_run_research_synthesis` returns a 3-tuple; `_run_research_step` combines both into `total_attempts`). Also wired into the shared `_run_text_transform_step` (backs `/summarize`, `/recap`, `/note`).
+- **This introduced and then fixed a real regression**: changing `run_tool_loop`'s signature broke two other call sites in the same file still doing 2-value unpacking — caught and fixed in the same session, verified via `ast.parse` + a real `import dispatcher.executor` before moving on.
+- **Deliberately NOT wired**: the other ~20 `StepResult(...)` construction sites (`/remind`, `/design-read`, `/cv`, image generation) still default to `attempt_count=1`. Explicit scoping decision, not an oversight — extend the same pattern to those when there's a real need, not speculatively.
+
+### 5. Daily model fetch + rank job — `jobs/model_ranking.py` (new, ~500 lines)
+Step 1 of the "daily self-healing routing" design (fully specced in memory `navi-model-ranking-design.md` before this session, not built until now). Fetches every provider's live model catalog, joins against Artificial Analysis benchmark data, ranks candidates per NAVI task. **Does not** write into `config/store.py`'s live `task_routing` — same boundary `daily_model_digest.py` already drew; it produces a JSON snapshot (`model_ranking_snapshot.json`, gitignored) for a human to act on, not an auto-apply.
+
+**Per-provider fetchers, each verified against a real live response** (this mattered — every one of these had a real, non-obvious bug caught only by actually running it against live data, not by trusting docs or memory):
+- `fetch_groq_models` — live-verified. Filters out Whisper/Orpheus (via `output_modalities != ["text"]`) and prompt-guard/safeguard/allam by name pattern. 6 relevant chat models currently.
+- `fetch_openrouter_models` — live-verified, unauthenticated. ~21 genuinely free models.
+- `fetch_llm7_models` — live-verified, keyless. Only `tier == "turbo"` entries carry a free daily allotment. 5 models.
+- `fetch_mistral_models` — live-verified against JuanJo's real key. **Real bug found and fixed twice**: (a) every model AND every alias is listed as a separate duplicate row with identical capabilities — deduped by `billing_model_name`; (b) a billing group can have *multiple* `-latest`-suffixed aliases (Codestral's group has `codestral-latest`, `mistral-code-latest`, AND `mistral-code-fim-latest`) — the dedup was keeping whichever came last in the API response, and the free-tier heuristic checked against that arbitrary surviving alias instead of the stable `billing_model_name`, silently missing Codestral/Mistral Small from the free set. Fixed: free-check now reads `billing_model_name`; alias tie-break now prefers the *shortest* `-latest` alias. No pricing field exists anywhere in Mistral's `/v1/models` response — free-vs-paid is a name-prefix heuristic (`ministral-`/`mistral-small`/`codestral`), not a confirmed API signal.
+- `fetch_cloudflare_models` — live-verified against JuanJo's real key. **Real bug found**: the endpoint's top-level `id` field is Cloudflare's internal catalog UUID, NOT the callable model slug — the real slug is the `name` field. Also genuinely paginated (65 of 299 total on page 1 without pagination) — now pages through fully. Free-vs-paid reads the real `require_workers_paid` property (confirmed live) instead of the hand-maintained exclusion list I originally guessed. 31 text-generation models, 24 free.
+- `fetch_gmi_models` — live-verified against JuanJo's real key. **Real bug found (caught directly by JuanJo)**: promotional free models (MiniMax M3 *and* M2.7, not just M3) appear TWICE — once at paid pricing, once as a duplicate row with identical `id` but `is_free: true` and zeroed pricing. Deduped by `id`, free if *any* duplicate carries `is_free`. 79 total models, exactly 2 free — confirmed by JuanJo independently via a literal grep of `"is_free": true` against the raw response (2 matches, matching the fetcher's output exactly).
+- `fetch_aa_benchmarks` — Artificial Analysis's bulk model+benchmark endpoint (`GET /api/v2/data/llms/models`, `x-api-key` header), weekly-cached (`aa_benchmarks_cache.json`, gitignored). Live-confirmed on AWS: 896 models cached. **This is a benchmark-data API, not a chat provider** — clarified mid-session after a real miscommunication where I momentarily suggested it as something to route chat through; it never was.
+
+**Ranking logic** (`rank_for_task`, `_score_candidate`, `_tier_fit`):
+- Hard filters: `free`, required `tools`, required `vision`, `min_context`.
+- **Real bug found and fixed (JuanJo: "it repeats the same model all the time... it's not assigning properly")**: size-tier preference (small vs. large model per task) was a *hard filter* that treated an unparseable size as `0`, which fails BOTH the small (`<=30B`) and large (`>30B`) checks — silently excluding every branded model without a digit+"b" pattern in its name (MiniMax-M3, GLM-5.3, GPT-5.6-Luna, Claude Opus 5 — i.e. most of GMI's newer catalog) from every task's candidate pool, permanently. This is why ranking kept collapsing onto whichever Groq model happened to have a parseable size. Fixed: `_tier_fit()` is now a *soft scoring dimension* (1 = fits or unknown size, 0 = confirmed wrong tier) instead of an exclusionary filter.
+- Also added `TASK_QUALITY_DIMENSION` so `/code`'s quality tiebreak reads AA's `coding_index` specifically instead of the generic `intelligence_index` (MiniMax-M3 scores 45.4 intelligence / 58.6 coding vs. Groq gpt-oss-120b's 24.1 / 30.4 — same relative gap either way today, but future models may specialize differently per axis, and this makes /code and /research genuinely capable of diverging instead of always agreeing).
+- **Not yet re-verified on AWS after the tier-fit fix** — pushed (`a165c29`), JuanJo was about to re-run when the conversation moved to the navi-pwa handoff request. **Next action for whoever picks this up: pull + rerun on Lightsail and confirm MiniMax M3/Ministral now actually surface as real candidates, not just theoretically eligible.**
+
+### 6. `jobs/model_ranking.py`'s summary-line bug (also fixed)
+`provider_counts` originally counted *every* catalog entry per provider as if it were free — correct by coincidence for Groq/OpenRouter/LLM7 (whose fetchers only ever append free-eligible entries), but wrong for Mistral/GMI/Cloudflare (whose fetchers deliberately return every model, free and paid, with a `free` flag attached, since ranking needs the full catalog for AA-joining). This is what made GMI look like "79 free models" when only 2 actually were. Fixed: `provider_counts` is now `{provider: {"total": N, "free": M}}`.
+
+## Design decisions agreed, not yet built
+
+- **Plan Chat's two-section output format** (dispatcher-parseable section first, human-readable summary second — the summary must only restate what's in the first section, never add new content, specifically so the two encodings can't drift apart). `dispatcher/modes/PLAN_CHAT.md` exists but is the *earlier* single-section Plan-and-Solve/Least-to-Most draft, not yet rewritten to this design. Not registered in `dispatcher/mode_briefs.py`'s `MODE_FILES` dict.
+- **Plan Chat's model selection**: Ministral (any size, structured-output guaranteed per Mistral's own docs) for the final document-formatting call; Ollama Cloud and Groq's `gpt-oss-120b` both explicitly ruled out (Ollama: no structured-output support at all + "never primary" principle; Groq: 8K TPM hard ceiling too tight for a whole-conversation call). Which Ministral size (3B/8B/14B) is sufficient — proposed as an empirical fidelity test, never built or run. The conversational/steering half of Plan Chat (distinct from the formatting call) is unresolved — Mistral Medium 3.5 surfaced as a candidate, untested.
+- **The "Agent Work"/"Dev Slate" question from earlier in this session**: clarified as navi-pwa UI-only canvases with explicitly no backend yet ("Dev Slate's execution engine and storage aren't built" — comment in `navi-pwa/src/App.tsx`). There is currently no `/agent-work` or `/dev-slate` command on this backend, and nothing in `jobs/model_ranking.py`'s `TASK_REQUIREMENTS` should map to them until they get real backends. When that happens, that's the point to decide whether Ministral/MiniMax M3 earn those routing slots on merit through the ranking system, or get pinned deliberately (e.g. for a specific guarantee like structured output) — not decided yet either way.
+- **The self-improving-skill trigger** for Plan Chat (re-using existing `StepResult` friction fields — now including the new `attempt_count`) is only sketched as "gets called with the flagged friction data," not designed in detail.
+- **Full navi-pwa UI buildout for Plan Chat**: a "Plans" tab, `ChatMode` type addition for `"plan"`, a branch-creation accordion (Chat/Research/Brainstorm/Plan), multi-status deferred-job tracking (backend job registry replacing `dispatcher/research_status.py`'s single global slot, new server routes, PWA polling/status pills/expand-on-click, message queueing, disabled-send-while-streaming). None of this started.
+- **Topic-boundary classification** (repurposing `openai/gpt-oss-safeguard-20b`'s bring-your-own-policy mechanism, off-label from its safety training): validated empirically three separate ways (single-message, batch, named-registry — all real test runs, not simulated) via `dispatcher/topic_classifier.py` + `dispatcher/policies/*.md` + the `jobs/test_topic_*.py` scripts. Not yet wired into any live conversation-history-windowing feature — it's proven-viable tooling, not yet consumed by anything.
+
+## New files this session
+
+- `providers/mistral.py`, `providers/gmi.py` — chat transports.
+- `jobs/model_ranking.py` — the fetch+rank job described above.
+- `dispatcher/modes/PLAN_CHAT.md`, `dispatcher/policies/TOPIC_CONTINUITY.md`, `TOPIC_CONTINUITY_BATCH.md`, `TOPIC_REGISTRY_MATCH.md`, `dispatcher/topic_classifier.py`, `jobs/classify_topic.py`, `jobs/test_topic_classifier.py`, `jobs/test_topic_classifier_batch.py`, `jobs/test_topic_registry_match.py`, `jobs/test_openrouter.py` — Plan Chat draft + topic-classification research tooling.
+
+## Known gaps / things to watch
+
+- `jobs/model_ranking.py`'s tier-fit fix (item 5 above) needs one more real rerun on AWS to confirm it actually changes the picks, not just that it's logically correct.
+- `attempt_count` is only real for `/research` and the shared text-transform commands — everything else silently defaults to `1`.
+- Request counting (`get_request_counts()`) is process-lifetime only, not persisted, and nothing consumes it yet.
+- Mistral's free-vs-paid detection is a name heuristic, not a confirmed API signal — worth revisiting against `/v1/admin/usage` if it ever matters for real billing decisions.
+- `config/agent_config.json` is gitignored by design (per-instance secrets) — a fresh clone or a fresh AWS instance needs its provider keys seeded via `.env` + `_seed_keys_from_env()`, same as this session's own debugging showed (the ranking job needed `sudo -E` + sourcing `/opt/navi/.env` to see `CLOUDFLARE_ACCOUNT_ID`/`AANALYSIS_API_KEY`, since those two are read straight from `os.environ` rather than the config store).
+
+## Process notes for whoever picks this up
+
+- **Ask before code changes** — propose the edit, wait for go-ahead, even for small/safe ones (standing rule this session followed throughout).
+- **Verify against real data, not docs/memory** — every provider fetcher in `jobs/model_ranking.py` had a real bug that only surfaced once run against a live response; the design memory's confident claims about API shapes were sometimes wrong (Mistral aliasing, Cloudflare's id-vs-name) even when written as "confirmed real."
+- Cross-repo: navi-pwa's own handoff (`navi-pwa/handoff.md`) covers this session's frontend work (V3 UI token/color redesign) separately.
