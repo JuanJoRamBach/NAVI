@@ -226,6 +226,7 @@ def fetch_mistral_models(api_key: str | None) -> list[dict]:
         return []
 
     by_billing: dict[str, dict] = {}
+    best_alias_len: dict[str, int] = {}
     for m in data:
         caps = m.get("capabilities") or {}
         if not caps.get("completion_chat"):
@@ -237,11 +238,30 @@ def fetch_mistral_models(api_key: str | None) -> list[dict]:
             "context_length": m.get("max_context_length"),
             "tools": bool(caps.get("function_calling")),
             "vision": bool(caps.get("vision")),
-            "free": mid.lower().startswith(("ministral-", "mistral-small", "codestral")),
+            # Checked against `billing` (one stable value per group), not
+            # `mid` — a real bug (2026-09-01): a billing group can have
+            # MULTIPLE "-latest"-suffixed aliases (codestral's group has
+            # codestral-latest, mistral-code-latest, AND mistral-code-fim-
+            # latest), and picking whichever alias id happened to win the
+            # dedup below meant the free check sometimes ran against an
+            # alias like "mistral-code-fim-latest" that doesn't start
+            # with "codestral" — silently missing Codestral/Mistral Small
+            # entirely. billing_model_name is the one value guaranteed
+            # unique per group, so check that instead.
+            "free": billing.lower().startswith(("ministral-", "mistral-small", "codestral")),
             "param_b": extract_param_billions(mid),
         }
-        if billing not in by_billing or mid.endswith("-latest"):
+        # Among multiple "-latest" aliases in one group, prefer the
+        # shortest — the generic/primary name (codestral-latest) rather
+        # than a task-specific variant (mistral-code-fim-latest).
+        is_latest = mid.endswith("-latest")
+        if billing not in by_billing:
             by_billing[billing] = entry
+            if is_latest:
+                best_alias_len[billing] = len(mid)
+        elif is_latest and len(mid) < best_alias_len.get(billing, 10**9):
+            by_billing[billing] = entry
+            best_alias_len[billing] = len(mid)
     return list(by_billing.values())
 
 
