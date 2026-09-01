@@ -33,16 +33,41 @@ def _strip_tags(s: str) -> str:
     return html.unescape(_TAG_RE.sub("", s)).strip()
 
 
-def web_search(query: str, max_results: int = 5) -> list[dict]:
+def _days_to_df(days: int | None) -> str | None:
+    """Maps a freshness window to DuckDuckGo HTML's `df` param (d/w/m/y —
+    past day/week/month/year). None (the default) means unfiltered,
+    matching every existing caller's current behavior."""
+    if days is None:
+        return None
+    if days <= 1:
+        return "d"
+    if days <= 7:
+        return "w"
+    if days <= 31:
+        return "m"
+    return "y"
+
+
+def web_search(query: str, max_results: int = 5, days: int | None = None) -> list[dict]:
     """
     Returns up to max_results dicts: {"title": str, "url": str, "snippet": str}.
     Raises SearchError on request failure — callers decide whether that's
     fatal for the step or just means an empty result set gets reported.
+
+    `days`: restrict results to roughly the last N days (DuckDuckGo's own
+    date filter, applied server-side — more reliable than asking a model
+    to guess freshness from a snippet that usually has no clear date in
+    it). Default None = unfiltered, unchanged from before this existed.
     """
+    data = {"q": query}
+    df = _days_to_df(days)
+    if df:
+        data["df"] = df
+
     try:
         resp = requests.post(
             SEARCH_URL,
-            data={"q": query},
+            data=data,
             headers={"User-Agent": "Mozilla/5.0 (compatible; NAVI/1.0)"},
             timeout=20,
         )

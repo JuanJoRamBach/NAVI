@@ -7,28 +7,56 @@ for JuanJo, specifically at junior/entry level:
   1. Games / systems / economy design opportunities
   2. UX-in-tech / domotics / robotics opportunities
 
-Uses groq/compound (fallback: groq/compound-mini) rather than the shared
-dispatcher_autonomous role (gpt-oss-120b, still used by the model-digest
-job). Compound has native, automatic web search built into the model
-itself — Groq's own infrastructure does the searching server-side, no
-tools/config needed — which sidesteps tools/search.py's DuckDuckGo
-scraper entirely for this job. That scraper already broke once in
-production (DuckDuckGo blocking Render's outbound IP), so this job no
-longer depends on it. Primary/fallback is handled directly in this
-script rather than the shared dispatcher-role system, which doesn't
-support a fallback chain yet — scoped to just this one job rather than
-restructuring that shared piece.
+Redesigned 2026-09-01 to search first, ask the model second — this job's
+queries were always hardcoded in LANES, never something the model needed
+to decide, so routing search through an LLM tool-call loop (first via
+groq/compound's built-in search, then via explicit web_search tool
+calling) was solving a problem this job doesn't have. Two real problems
+that design created, both gone now:
+
+  1. groq/compound(-mini) returned 413 request_too_large on this job's
+     own lanes — a known Groq platform issue where compound systems
+     stitch fetched search results into the model's internal context
+     before replying, and that internal payload (not the small prompt
+     this job sends) is what tripped their size cap.
+  2. A tool-call loop resends the ENTIRE growing message history on every
+     iteration (see run_tool_loop in dispatcher/executor.py) — token cost
+     compounds roughly with the square of iteration count, all within the
+     same rate-limit minute. qwen3.6-27b's 8k-tokens/minute cap made that
+     a real risk, not a hypothetical one.
+
+Now: web_search() runs directly in Python for each lane's queries (real
+results, no model involvement in *finding* them), filtered to the last
+24 hours via web_search's `days` param — filtering at the source instead
+of asking the model to guess freshness from a snippet that usually has no
+clear date in it. The model gets ONE call per lane: real gathered
+material in, a filtered/formatted report out. No loop, no resent history,
+no compounding tokens.
+
+Still reintroduces tools/search.py's DuckDuckGo scraper, which the
+original compound-model design was chosen to avoid (it broke once in
+production — DuckDuckGo blocking Render's outbound IP). This job runs on
+GitHub Actions' shared runners, not Lightsail — a different but similarly
+commonly-blocked range — so a SearchError here is a real risk, handled
+per-query below rather than failing the whole lane.
+
+Primary/fallback is handled directly in this script rather than the
+shared dispatcher-role system, which doesn't support a fallback chain
+yet — scoped to just this one job rather than restructuring that shared
+piece.
 
 Hard rule carried over from the design conversation: this reports
 CONCRETE, VERIFIABLE signals only — job postings with links, open-source
 issues with links, CFPs with dates. It must NEVER produce an inferred
 "company X probably has problem Y" diagnosis — that framing was
-explicitly rejected as presumptuous and unverifiable. The prompt below
-enforces that rule directly; if the model can't find real signals, it
-says so instead of inventing plausible-sounding ones.
+explicitly rejected as presumptuous and unverifiable. Now structurally
+enforced, not just prompted: the model only ever sees real search results
+it's asked to filter/format, it has no path to inventing a signal that
+was never actually found.
 """
 
 import sys
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -37,12 +65,15 @@ from messaging.base import MessagingError  # noqa: E402
 from messaging.telegram import TelegramAdapter  # noqa: E402
 from providers.base import ChatMessage, ProviderError  # noqa: E402
 from providers.registry import ProviderNotConfigured, get_provider  # noqa: E402
+from tools.search import SearchError, web_search  # noqa: E402
 
-# Primary first, fallback only on failure — both are Groq's search-capable
-# "compound" models, just different sizes. See module docstring for why
-# this bypasses the shared dispatcher-role fallback (which doesn't exist
-# yet) rather than extending it for one job.
-COMPOUND_MODELS = ["groq/compound", "groq/compound-mini"]
+# Fallback stays a plain second model, not another size of the same
+# system — there's no "compound-mini" equivalent anymore since neither
+# model does its own searching.
+SCAN_MODELS = ["qwen/qwen3.6-27b", "openai/gpt-oss-120b"]
+
+# DuckDuckGo's own "past day" filter — see tools/search.py's `days` param.
+FRESHNESS_DAYS = 1
 
 LANES = [
     (
@@ -65,35 +96,63 @@ LANES = [
     ),
 ]
 
-PROMPT_TEMPLATE = """You are scanning the live web for concrete opportunities for a JUNIOR/\
-entry-level UX and game designer job-hunting across the EU and US. Lane: "{lane}".
+PROMPT_TEMPLATE = """You are filtering ALREADY-GATHERED search results down to concrete \
+opportunities for a JUNIOR/entry-level UX and game designer job-hunting across the EU and US. \
+Lane: "{lane}". Today's date: {today}.
 
-Actually search the web (you have that capability) using queries like these as a starting \
-point, and vary them as needed to find real, currently-open postings:
-{queries}
+Below is the real material found via search, filtered to roughly the last {days} day(s). You \
+are NOT searching yourself — only select and format from what's actually listed here.
+
+{material}
 
 STRICT RULES:
-1. Report ONLY verifiable, concrete signals you actually found via search — a job posting \
-with a real link, an open-source issue with a link, or a CFP/event with a date. Do NOT infer \
+1. Report ONLY signals that appear in the material above, with their real link. Do NOT infer \
 or diagnose a company's problems ("Company X seems to struggle with Y") — that kind of \
-unverifiable guess is explicitly forbidden.
+unverifiable guess is explicitly forbidden. Do NOT invent or assume anything not present above.
 2. Prioritize roles that are explicitly junior/entry-level/associate, or that don't require \
 years of professional experience. Skip senior/lead/staff-level postings entirely.
-3. If a result isn't a concrete, linkable signal, or isn't actually junior-appropriate, leave \
-it out entirely.
+3. If an item in the material isn't a concrete, linkable signal, or isn't actually \
+junior-appropriate, leave it out entirely.
 
-If there are no qualifying concrete signals at all, say exactly: "No concrete signals found \
-today for this lane." Do not pad with speculation to avoid saying that.
+If nothing in the material qualifies, say exactly: "No concrete signals found today for this \
+lane." Do not pad with speculation to avoid saying that.
 
 Format each qualifying signal as one line: "- [type] title — link"
 """
 
 
+def _gather_lane_material(queries: list[str]) -> str:
+    """Runs every query for a lane through web_search directly (no model
+    involved in finding results), filtered to FRESHNESS_DAYS. A query that
+    fails (e.g. SearchError from a blocked scrape) is noted inline rather
+    than failing the whole lane — the other queries' results still reach
+    the model."""
+    blocks = []
+    for q in queries:
+        try:
+            results = web_search(q, max_results=5, days=FRESHNESS_DAYS)
+        except SearchError as e:
+            blocks.append(f'Query "{q}": search failed ({e}) — no results available for this query.')
+            continue
+        if not results:
+            blocks.append(f'Query "{q}": no results.')
+            continue
+        lines = [f"- {r['title']} ({r['url']}): {r['snippet']}" for r in results]
+        blocks.append(f'Query "{q}":\n' + "\n".join(lines))
+    return "\n\n".join(blocks)
+
+
 def _scan_lane(lane_name: str, queries: list[str]) -> str:
-    prompt = PROMPT_TEMPLATE.format(lane=lane_name, queries="\n".join(f"- {q}" for q in queries))
+    material = _gather_lane_material(queries)
+    if not material.strip():
+        return "No concrete signals found today for this lane."
+
+    prompt = PROMPT_TEMPLATE.format(
+        lane=lane_name, today=date.today().isoformat(), days=FRESHNESS_DAYS, material=material,
+    )
 
     last_error = None
-    for model in COMPOUND_MODELS:
+    for model in SCAN_MODELS:
         try:
             provider = get_provider("groq")
             response = provider.chat(model=model, messages=[ChatMessage(role="user", content=prompt)])
@@ -104,7 +163,7 @@ def _scan_lane(lane_name: str, queries: list[str]) -> str:
             last_error = str(e)
             continue
 
-    return f"Scan failed for this lane on both compound models ({last_error}) — disclosed rather than silently skipped."
+    return f"Scan failed for this lane on all models ({last_error}) — disclosed rather than silently skipped."
 
 
 LANE_COOLDOWN_SECONDS = 120  # let one lane's RPM window clear before starting the next
@@ -113,7 +172,7 @@ LANE_COOLDOWN_SECONDS = 120  # let one lane's RPM window clear before starting t
 def build_report() -> str:
     import time
 
-    sections = [f"Opportunity scan — {__import__('datetime').date.today().isoformat()}"]
+    sections = [f"Opportunity scan — {date.today().isoformat()}"]
     for i, (lane_name, queries) in enumerate(LANES):
         if i > 0:
             time.sleep(LANE_COOLDOWN_SECONDS)

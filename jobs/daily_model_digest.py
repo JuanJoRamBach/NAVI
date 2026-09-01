@@ -4,8 +4,20 @@ jobs/daily_model_digest.py
 Runs from .github/workflows/daily_model_digest.yml on a schedule (and via
 workflow_dispatch for manual testing). Uses dispatcher_autonomous — the
 low-stakes Groq role, deliberately kept off the interactive chat quota —
-to read today's free-model list from ClawLabs' tracker and produce the
-digest message in the exact agreed format.
+to read today's free-model list and produce the digest message in the
+exact agreed format.
+
+Switched 2026-09-01 from ClawLabs' third-party GitHub tracker to
+OpenRouter's own live `GET /api/v1/models` endpoint (per OpenRouter's own
+quickstart docs — this is the documented way to list available slugs
+programmatically, no auth required). The tracker was a proxy for
+OpenRouter's actual catalog and could lag behind it — which is exactly
+what happened to `openai/gpt-oss-120b:free` going 404 while still routed
+in config/store.py's `brainstorm` entry: the tracker either never caught
+the removal or nobody re-ran the digest against it in time. Querying
+OpenRouter directly removes that lag entirely — the digest now reflects
+exactly what OpenRouter will actually accept, not a second-hand snapshot
+of it.
 
 This does NOT write the result back into config/store.py's task_routing.
 That "daily-refreshed live ranking" auto-wiring was explicitly marked
@@ -28,7 +40,7 @@ from messaging.telegram import TelegramAdapter  # noqa: E402
 from providers.base import ChatMessage, ProviderError  # noqa: E402
 from providers.registry import ProviderNotConfigured, get_dispatcher  # noqa: E402
 
-FREE_MODELS_SOURCE = "https://raw.githubusercontent.com/ClawLabsAI/free-ai-models/main/README.md"
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 CAPABILITIES = [
     ("research", "/research"),
@@ -38,14 +50,22 @@ CAPABILITIES = [
     ("brainstorm", "/brainstorm"),
 ]
 
-PROMPT_TEMPLATE = """You are given today's snapshot of a free-tier AI model tracker. \
+PROMPT_TEMPLATE = """You are given today's LIVE free-tier model list, pulled directly from \
+OpenRouter's own API (not a third-party tracker — this is exactly what OpenRouter will \
+actually accept right now). Each line is: model_id (context: N tokens, tools: yes/no).
+
 Based ONLY on what's in the snapshot below, pick the single best current free model \
 for each of these five capabilities, plus up to two fallback models each: \
 research, image-generation, graph-data (data analysis / structured output), code, \
 brainstorm (general creative/conversational reasoning).
 
+graph-data and brainstorm's "remind" sibling capability both require forced tool-calling \
+(tool_choice) in NAVI's own routing — for graph-data specifically, only pick models marked \
+"tools: yes". The other capabilities don't have that requirement.
+
 If a capability genuinely has no free option listed in the snapshot, say so plainly \
-instead of guessing or omitting it.
+instead of guessing or omitting it. Only use a model_id that appears verbatim in the \
+snapshot below — never a model you recall from training, even if it sounds plausible.
 
 Reply in EXACTLY this format, one line per capability, no extra commentary:
 research: MODEL_NAME; fallbacks: MODEL_NAME, MODEL_NAME
@@ -63,13 +83,31 @@ Snapshot:
 
 
 def _fetch_snapshot() -> str | None:
+    """Pulls OpenRouter's live model catalog and filters to genuinely free
+    entries (pricing.prompt == pricing.completion == "0") — the same field
+    OpenRouter's own pricing pages read from, so this can't drift out of
+    sync with what a real request will actually be charged (or rejected
+    for). Capped at 200 models in the snapshot to keep the prompt a
+    sane size; OpenRouter's free tier has never come close to that."""
     try:
-        resp = requests.get(FREE_MODELS_SOURCE, timeout=30)
+        resp = requests.get(OPENROUTER_MODELS_URL, timeout=30)
         if resp.status_code >= 400:
             return None
-        return resp.text[:12000]  # keep prompt size sane
-    except requests.RequestException:
+        models = (resp.json() or {}).get("data") or []
+    except (requests.RequestException, ValueError):
         return None
+
+    lines = []
+    for m in models:
+        pricing = m.get("pricing") or {}
+        if pricing.get("prompt") != "0" or pricing.get("completion") != "0":
+            continue  # not actually free — a "0.000000834"-style paid entry
+        tools = "yes" if "tools" in (m.get("supported_parameters") or []) else "no"
+        lines.append(f"{m.get('id')} (context: {m.get('context_length')} tokens, tools: {tools})")
+        if len(lines) >= 200:
+            break
+
+    return "\n".join(lines) if lines else None
 
 
 def build_digest() -> str:
@@ -77,8 +115,9 @@ def build_digest() -> str:
     if snapshot is None:
         return (
             "Today's AIs are:\n"
-            "Could not reach the free-model tracker (github.com/ClawLabsAI/free-ai-models) "
-            "today — no digest generated. This is disclosed rather than guessed at."
+            "Could not reach OpenRouter's live model list (openrouter.ai/api/v1/models) "
+            "today, or no free models were found in it — no digest generated. "
+            "This is disclosed rather than guessed at."
         )
 
     try:
