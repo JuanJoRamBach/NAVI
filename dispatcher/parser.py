@@ -10,7 +10,7 @@ the same output. Three possible results:
    or "reserch X" with the slash missing) -> flagged for user confirmation,
    since silently either running it as a command OR silently treating it as
    plain chat could both be wrong.
-3. No command, no near-miss -> plain chat. dispatcher_chat handles it
+3. No command, no near-miss -> plain chat. normal_chat handles it
    directly as a normal AI reply, not a routing decision.
 """
 

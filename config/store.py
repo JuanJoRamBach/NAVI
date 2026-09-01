@@ -71,7 +71,14 @@ DEFAULTS = {
         # deliberately NOT the earlier "different model, might silently
         # degrade" risk, just a second door to the same room when Groq's
         # free tier is briefly saturated.
-        "dispatcher_chat": {
+        # Renamed from "dispatcher_chat" to "normal_chat" (2026-09-01) —
+        # "dispatcher" in the name was confusing once NAVI had multiple
+        # named chat modes (Normal/Research/Brainstorm/Plan); this role
+        # specifically backs Normal Chat, which is what the name should
+        # say. dispatcher_autonomous keeps its name — it isn't a chat
+        # mode, it backs the two GitHub Actions jobs, "dispatcher" still
+        # fits there.
+        "normal_chat": {
             "provider": "groq", "model": "openai/gpt-oss-120b",
             "fallback": [{"provider": "llm7", "model": "gpt-oss"}],
         },
@@ -320,6 +327,33 @@ def _migrate_dispatcher_chat_add_fallback():
 
 
 _migrate_dispatcher_chat_add_fallback()
+
+
+def _migrate_dispatcher_chat_to_normal_chat():
+    """
+    One-time rename (2026-09-01) for instances that already had
+    dispatcher_chat persisted under its old name — editing DEFAULTS alone
+    only affects a brand-new store. Copies the fully-formed role
+    (including whatever provider/model/fallback it currently has — this
+    runs after the three migrations above, so it picks up the real
+    current state, not a stale default) to "normal_chat" and leaves the
+    old "dispatcher_chat" key in place rather than deleting it — harmless
+    dead data, and safer than risking a delete bug on a live server's
+    only copy of this config. Guarded so a manual reassignment to
+    "normal_chat" later isn't fought by this.
+    """
+    if config.get("migrated_dispatcher_chat_to_normal_chat"):
+        return
+    old_role = config.get_role("dispatcher_chat")
+    if old_role and not config.get_role("normal_chat"):
+        config.set_role(
+            "normal_chat", old_role.get("provider", "groq"), old_role.get("model", "openai/gpt-oss-120b"),
+            fallback=old_role.get("fallback"),
+        )
+    config.set("migrated_dispatcher_chat_to_normal_chat", True)
+
+
+_migrate_dispatcher_chat_to_normal_chat()
 
 
 def _migrate_add_summarize_routing():

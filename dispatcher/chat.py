@@ -2,7 +2,9 @@
 dispatcher/chat.py
 
 Free-form chat — a message that isn't a typed /command. Replaces the old
-fixed dispatcher_chat reply: loads the active mode's brief (system prompt
+fixed reply from the role now named normal_chat (renamed 2026-09-01 from
+dispatcher_chat — see config/store.py's migration): loads the active
+mode's brief (system prompt
 + allowed tools from dispatcher/modes/), then lets the model decide
 whether to use any of those tools, resolving calls via the same loop
 /research's command chain uses (run_tool_loop, capped at
@@ -22,7 +24,7 @@ def run_mode_chat(mode: str, text: str) -> str:
     try:
         role = get_dispatcher_role(context="chat")
     except ProviderNotConfigured as e:
-        return f"⚠️ Can't reply right now — dispatcher_chat isn't configured: {e}"
+        return f"⚠️ Can't reply right now — normal_chat isn't configured: {e}"
 
     tools = schemas_for(brief.tools) if brief.tools else None
     messages = [ChatMessage(role="system", content=brief.system_prompt)]
@@ -45,7 +47,10 @@ def run_mode_chat(mode: str, text: str) -> str:
         try:
             response = provider.chat(model=attempt["model"], messages=messages, tools=tools)
             if tools and response.tool_calls:
-                response, _messages = run_tool_loop(
+                # Free-form chat has no StepResult to attach an attempt
+                # count to (that's a /research-command-chain concept) —
+                # discard it here, not silently drop it by accident.
+                response, _messages, _iterations = run_tool_loop(
                     provider, attempt["model"], messages, response,
                     context={"command": f"chat-{mode}", "topic_slug": "chat"},
                     tools=tools,
@@ -60,4 +65,4 @@ def run_mode_chat(mode: str, text: str) -> str:
             last_error = str(e)
             continue
 
-    return f"⚠️ dispatcher_chat failed on every configured provider: {last_error}"
+    return f"⚠️ normal_chat failed on every configured provider: {last_error}"

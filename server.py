@@ -8,7 +8,7 @@ that:
 
   1. Receives Telegram webhook POSTs at /webhook/telegram.
   2. Feeds the message text through dispatcher/parser.py.
-  3. Plain chat -> answered directly by dispatcher_chat (Groq), no routing.
+  3. Plain chat -> answered directly by normal_chat (Groq), no routing.
      Commands -> dispatcher/executor.py runs the chain, real model calls,
      real Filen saves.
      Near-miss typo -> asks for confirmation before doing either.
@@ -322,7 +322,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             # provider + model names, so it's safe to expose publicly.
             self._respond_json(200, {
                 "roles": {
-                    "dispatcher_chat": config.get_role("dispatcher_chat"),
+                    "normal_chat": config.get_role("normal_chat"),
                     "dispatcher_autonomous": config.get_role("dispatcher_autonomous"),
                 },
                 "task_routing": {cmd: config.get_task_routing(cmd) for cmd in COMMANDS},
@@ -521,6 +521,8 @@ def _seed_keys_from_env() -> None:
         ("ollama_cloud", "OLLAMA_API_KEY"),
         ("cloudflare", "CLOUDFLARE_API_KEY"),
         ("llm7", "LLM7_API_KEY"),
+        ("mistral", "MISTRAL_API_KEY"),
+        ("gmi", "GMI_API_KEY"),
     ):
         if config.get_provider_key(provider_name):
             continue
