@@ -83,6 +83,21 @@ DEFAULTS = {
             "fallback": [{"provider": "llm7", "model": "gpt-oss"}],
         },
         "dispatcher_autonomous": {"provider": "groq", "model": "openai/gpt-oss-120b"},
+        # dev_slate_chat: backs Dev Slate's own chat (dispatcher/devslate_chat.py),
+        # a separate role from normal_chat since it needs a genuinely
+        # coding-capable model, not whatever's cheapest for everyday
+        # questions. Reuses the same model /code's task_routing already
+        # pins (Cloudflare's qwen2.5-coder), with Mistral's Codestral as
+        # fallback. Deliberately NO Groq anywhere in this role, primary
+        # or fallback: Groq's free tier caps at 8K tokens/minute, and
+        # Dev Slate's baseline turn (mode brief + task-state block + real
+        # conversation history) realistically exceeds that before any
+        # file content even enters the picture — the same reasoning that
+        # already ruled Groq out for Plan Chat's whole-conversation calls.
+        "dev_slate_chat": {
+            "provider": "cloudflare", "model": "@cf/qwen/qwen2.5-coder-32b-instruct",
+            "fallback": [{"provider": "mistral", "model": "codestral-latest"}],
+        },
     },
     "task_routing": {
         # Placeholder routing per command until the live daily-ranked model
@@ -427,6 +442,27 @@ def _migrate_add_design_read_routing():
     if not config.get_task_routing("design-read"):
         config.set_task_routing("design-read", {"provider": "llm7", "model": "gemini-3.1-flash-lite"}, [])
     config.set("migrated_add_design_read_routing", True)
+
+
+_migrate_add_design_read_routing()
+
+
+def _migrate_add_dev_slate_chat_role():
+    """One-time addition (2026-09-01) for instances whose config.json
+    already existed before dev_slate_chat was added to DEFAULTS — editing
+    DEFAULTS alone only materializes for a brand-new store, same reasoning
+    as every migration above."""
+    if config.get("migrated_add_dev_slate_chat_role"):
+        return
+    if not config.get_role("dev_slate_chat"):
+        config.set_role(
+            "dev_slate_chat", "cloudflare", "@cf/qwen/qwen2.5-coder-32b-instruct",
+            fallback=[{"provider": "mistral", "model": "codestral-latest"}],
+        )
+    config.set("migrated_add_dev_slate_chat_role", True)
+
+
+_migrate_add_dev_slate_chat_role()
 
 
 _migrate_add_design_read_routing()

@@ -9,6 +9,11 @@ env/
 .pytest_cache/
 config/agent_config.json
 
+# storage/conversations.py's SQLite store — per-instance runtime state
+# (chat/Dev Slate conversation history), same reasoning as
+# config/agent_config.json above, not something to ship in the repo.
+conversations.db
+
 # Scratch diagnostic payloads (curl -d @file.json tests) — throwaway, not
 # part of the app, shouldn't be committed.
 *_test_payload.json

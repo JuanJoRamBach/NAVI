@@ -67,6 +67,7 @@ _ROLE_NAME_FOR_CONTEXT = {
     # f"dispatcher_{context}" formula every other context still follows.
     "chat": "normal_chat",
     "autonomous": "dispatcher_autonomous",
+    "devslate": "dev_slate_chat",
 }
 
 

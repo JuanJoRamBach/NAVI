@@ -76,6 +76,13 @@ TASK_REQUIREMENTS = {
     "note": {"tools": False, "min_context": 4000, "tier": "small"},
     "tailor": {"tools": False, "min_context": 4000, "tier": "small"},
     "design-read": {"tools": False, "min_context": 4000, "tier": "small", "vision": True},
+    # Dev Slate's own conversational coding chat (dispatcher/devslate_chat.py,
+    # 2026-09-01) — separate entry from "code" (the single-shot /code
+    # command) since the two may want to diverge later; same requirements
+    # for now. min_context is higher than /code's: a Dev Slate turn
+    # carries a mode brief + task-state block + real conversation history,
+    # not one bare prompt.
+    "devslate": {"tools": False, "min_context": 16000, "tier": "large"},
 }
 
 SMALL_TIER_MAX_PARAMS_B = 30  # matches the 20b/27b models already used for "small" tasks
@@ -439,6 +446,7 @@ def fetch_aa_benchmarks(api_key: str | None, force: bool = False) -> dict:
 # back to intelligence_index for any task not listed here.
 TASK_QUALITY_DIMENSION = {
     "code": "coding_index",
+    "devslate": "coding_index",
 }
 
 
@@ -496,6 +504,39 @@ def rank_for_task(task: str, catalog: list[dict], aa_index: dict) -> dict:
         "fallback": [{"provider": m["provider"], "model": m["id"]} for m in ranked[1:3]],
         "candidate_count": len(candidates),
     }
+
+
+def list_candidates(task: str, catalog: list[dict], aa_index: dict) -> list[dict]:
+    """Like rank_for_task, but returns EVERY qualifying candidate, sorted
+    best-first, instead of just a primary + top-2 fallback — for a manual
+    model-switch picker (GET /config/models) rather than automatic
+    routing, where showing only 3 options would hide real alternatives
+    the user might specifically want (e.g. a known-slower but higher-
+    quality model)."""
+    reqs = TASK_REQUIREMENTS.get(task, {})
+    candidates = [
+        m for m in catalog
+        if m.get("free")
+        and (not reqs.get("tools") or m.get("tools"))
+        and (not reqs.get("vision") or m.get("vision"))
+        and (m.get("context_length") or 0) >= reqs.get("min_context", 0)
+    ]
+    tier = reqs.get("tier", "large")
+    quality_dim = TASK_QUALITY_DIMENSION.get(task, "intelligence_index")
+    return sorted(candidates, key=lambda m: _score_candidate(m, aa_index, tier, quality_dim), reverse=True)
+
+
+def load_snapshot() -> dict | None:
+    """Reads the cached ranking snapshot written by main() below — never
+    triggers a live fetch itself, since that's a daily-job concern (real
+    external API calls, rate limits) not something a GET request from the
+    frontend should trigger on every page load."""
+    if not MODEL_RANKING_PATH.exists():
+        return None
+    try:
+        return json.loads(MODEL_RANKING_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def build_ranking_snapshot() -> dict:
