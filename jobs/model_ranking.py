@@ -434,16 +434,46 @@ def fetch_aa_benchmarks(api_key: str | None, force: bool = False) -> dict:
 
 # ---- Ranking ----
 
-def _score_candidate(m: dict, aa_index: dict) -> tuple:
-    """Sort key, HIGHER is better. Order: quality (AA intelligence index,
-    0 if unmatched — an unranked model doesn't get penalized to the
-    bottom, just treated as a tie at the "no signal" level) then output
-    speed as a cheap reliability/latency tiebreak, both from the same AA
-    dataset so this is one lookup, not two."""
+# Which AA evaluation dimension the quality tiebreak should read per
+# task, instead of always using the generic intelligence_index. Falls
+# back to intelligence_index for any task not listed here.
+TASK_QUALITY_DIMENSION = {
+    "code": "coding_index",
+}
+
+
+def _tier_fit(m: dict, tier: str) -> int:
+    """1 if this candidate's size fits the task's tier preference, or if
+    its size is simply unknown (extract_param_billions can't find a
+    digit+"b" pattern in branded names like "MiniMax-M3", "GPT-5.6-Luna",
+    "Claude Opus 5" — increasingly common on GMI's catalog). 0 only when
+    the size IS known and genuinely conflicts with the preference.
+
+    This used to be a hard filter (candidates outside the tier were
+    dropped outright), which meant every unsized model — MiniMax M3
+    included — silently vanished from ranking regardless of how good it
+    actually was, since "unknown" failed both the small AND large tier
+    checks. Real bug, caught 2026-09-01 (JuanJo: "it repeats the same
+    model all the time... it's not assigning properly"). Now it's a
+    scoring dimension instead, so an unsized-but-excellent model can
+    still win on quality.
+    """
+    p = m.get("param_b")
+    if p is None:
+        return 1
+    fits_small = p <= SMALL_TIER_MAX_PARAMS_B
+    return 1 if (fits_small if tier == "small" else not fits_small) else 0
+
+
+def _score_candidate(m: dict, aa_index: dict, tier: str, quality_dim: str) -> tuple:
+    """Sort key, HIGHER is better. Order: tier fit, then task-specific
+    quality dimension (0 if unmatched — an unranked model doesn't get
+    penalized to the bottom, just treated as a tie at the "no signal"
+    level), then output speed as a cheap reliability/latency tiebreak."""
     bench = aa_index.get(normalize_name(m["id"])) or {}
-    quality = bench.get("intelligence_index") or 0
+    quality = bench.get(quality_dim) or 0
     speed = bench.get("output_tokens_per_second") or 0
-    return (quality, speed)
+    return (_tier_fit(m, tier), quality, speed)
 
 
 def rank_for_task(task: str, catalog: list[dict], aa_index: dict) -> dict:
@@ -459,13 +489,8 @@ def rank_for_task(task: str, catalog: list[dict], aa_index: dict) -> dict:
         return {"primary": None, "fallback": [], "candidate_count": 0}
 
     tier = reqs.get("tier", "large")
-    if tier == "small":
-        tiered = [m for m in candidates if (m.get("param_b") or 0) and m["param_b"] <= SMALL_TIER_MAX_PARAMS_B]
-    else:
-        tiered = [m for m in candidates if (m.get("param_b") or 0) > SMALL_TIER_MAX_PARAMS_B]
-    pool = tiered or candidates  # fall back to the full candidate set if the tier preference has no matches
-
-    ranked = sorted(pool, key=lambda m: _score_candidate(m, aa_index), reverse=True)
+    quality_dim = TASK_QUALITY_DIMENSION.get(task, "intelligence_index")
+    ranked = sorted(candidates, key=lambda m: _score_candidate(m, aa_index, tier, quality_dim), reverse=True)
     return {
         "primary": {"provider": ranked[0]["provider"], "model": ranked[0]["id"]},
         "fallback": [{"provider": m["provider"], "model": m["id"]} for m in ranked[1:3]],
