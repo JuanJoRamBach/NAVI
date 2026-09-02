@@ -33,11 +33,43 @@ class WorkflowToolError(Exception):
     pass
 
 
-def create_workflow(name: str, description: str | None, graph: dict, trigger: dict | None = None) -> str:
-    """Returns the new workflow's id. `graph` must be {"nodes": [...],
-    "edges": [...]} — see storage/agent_work.py's module docstring for the
-    node/edge shape. Defaults to a manual trigger if none given."""
-    return _run_async(_create_workflow(name, description, graph, trigger or {"type": "manual"}))
+def create_workflow(
+    name: str, description: str | None, steps: list[dict], trigger_description: str | None = None,
+) -> str:
+    """Returns the new workflow's id.
+
+    `steps` is an ORDERED list of {"prompt", "tools"?} — the model's only
+    job is deciding how many steps the task needs and what each one says;
+    node ids and the edge chain connecting them are generated here
+    (n1, n2, ...), mirroring exactly what the manual creation form
+    (AgentWorkNewWorkflowForm.tsx) already builds client-side. This keeps
+    graph construction — an implementation detail no one asked the model
+    to design — out of the model's hands entirely (2026-09-02, JuanJo:
+    "the LLM can give the amount of nodes needed... the dispatcher
+    creates that amount of nodes").
+
+    `trigger_description` is plain language ("every day at 9am UTC",
+    "once, in 20 minutes", "every hour, 5 times") or None for a
+    manual-only workflow. When given, it's resolved into a concrete
+    trigger via dispatcher.agent_work.resolve_schedule — a separate
+    forced-tool-call model turn, isolated from this one, that has no
+    other job but converting the description into real numbers using the
+    actual current time (mirrors executor.py's _run_remind_step)."""
+    nodes = [{"id": f"n{i + 1}", "prompt": step["prompt"], **({"tools": step["tools"]} if step.get("tools") else {})}
+              for i, step in enumerate(steps)]
+    edges = [{"from": f"n{i + 1}", "to": f"n{i + 2}"} for i in range(len(nodes) - 1)]
+    graph = {"nodes": nodes, "edges": edges}
+
+    if trigger_description:
+        from dispatcher.agent_work import WorkflowError, resolve_schedule
+        try:
+            trigger = resolve_schedule(trigger_description)
+        except WorkflowError as e:
+            raise WorkflowToolError(str(e))
+    else:
+        trigger = {"type": "manual"}
+
+    return _run_async(_create_workflow(name, description, graph, trigger))
 
 
 def run_workflow(workflow_id: str) -> str:

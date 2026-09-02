@@ -101,30 +101,41 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "create_workflow",
-            "description": "Define a new Agent Work workflow — a graph of steps, each its "
-                            "own prompt to a model, that can be run manually or on a schedule. "
-                            "graph is {\"nodes\": [{\"id\", \"prompt\", \"tools\"?}], \"edges\": "
-                            "[{\"from\", \"to\"}]} — a single-node graph with no edges is a "
-                            "one-step workflow.",
+            "description": "Define a new Agent Work workflow — an ORDERED list of steps, each "
+                            "its own model call, run manually or on a schedule. You decide how "
+                            "many steps the task needs and what each one's prompt says; the "
+                            "dispatcher wires them into a chain itself — don't invent node ids "
+                            "or edges. A single-item list is a one-step workflow.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Short workflow name."},
                     "description": {"type": "string", "description": "What this workflow does."},
-                    "graph": {
-                        "type": "object",
-                        "description": "{\"nodes\": [...], \"edges\": [...]} — see tool description.",
+                    "steps": {
+                        "type": "array",
+                        "description": "Ordered — step 1 runs first, then step 2, etc. Each "
+                                        "step's prompt must stand alone (no 'as discussed above' "
+                                        "or references to this conversation) since the step's "
+                                        "model call never sees this chat.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": {"type": "string", "description": "Complete, self-contained instruction for this step."},
+                                "tools": {"type": "array", "items": {"type": "string"}, "description": "Tool names this step may call, if any."},
+                            },
+                            "required": ["prompt"],
+                        },
                     },
-                    "trigger": {
-                        "type": "object",
-                        "description": "{\"type\": \"manual\"} (default) or {\"type\": \"scheduled\", "
-                                        "\"interval_seconds\", \"next_run_at\" (epoch seconds), "
-                                        "\"remaining_runs\"}. remaining_runs: how many more times to fire "
-                                        "— an integer, or null (or omit it) for no expiration set, meaning "
-                                        "it keeps firing until removed.",
+                    "trigger_description": {
+                        "type": "string",
+                        "description": "Plain language, e.g. 'once, in 20 minutes', 'every day "
+                                        "at 9am UTC', 'every hour, 5 times'. Omit entirely for a "
+                                        "manual-only workflow. Resolved into a concrete schedule "
+                                        "separately using the real current time — describe it in "
+                                        "the user's own terms, don't compute times yourself.",
                     },
                 },
-                "required": ["name", "graph"],
+                "required": ["name", "steps"],
             },
         },
     },
@@ -223,7 +234,7 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
 
         if name == "create_workflow":
             workflow_id = create_workflow(
-                arguments["name"], arguments.get("description"), arguments["graph"], arguments.get("trigger"),
+                arguments["name"], arguments.get("description"), arguments["steps"], arguments.get("trigger_description"),
             )
             return f"Created workflow {workflow_id}."
 

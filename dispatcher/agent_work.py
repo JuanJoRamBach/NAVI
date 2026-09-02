@@ -23,8 +23,9 @@ import asyncio
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
 
-from dispatcher.executor import CITATION_STYLE_PROMPT, run_tool_loop
+from dispatcher.executor import CITATION_STYLE_PROMPT, _parse_tool_args, run_tool_loop
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
 from storage.agent_work import (
@@ -157,6 +158,106 @@ async def start_workflow_run(workflow_id: str, trigger_source: str = "manual") -
     if not workflow:
         raise WorkflowError(f"no workflow with id {workflow_id}")
     return await start_run(workflow["graph"], workflow_id=workflow_id, trigger_source=trigger_source)
+
+
+RESOLVE_SCHEDULE_TOOL_NAME = "set_schedule"
+RESOLVE_SCHEDULE_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": RESOLVE_SCHEDULE_TOOL_NAME,
+        "description": "Report the resolved schedule for a workflow trigger, computed from the description and the current UTC time you were given.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "first_run_at_utc": {
+                    "type": "string",
+                    "description": "ISO 8601 UTC timestamp of the first run, e.g. 2026-09-02T14:30:00+00:00.",
+                },
+                "interval_seconds": {
+                    "type": "integer",
+                    "description": "Seconds between runs. Omit (or 0) for a one-off, non-repeating run.",
+                },
+                "remaining_runs": {
+                    "type": ["integer", "null"],
+                    "description": "How many times it should fire, counting the first run. null (or omit) means no expiration set — fires indefinitely. Only set a number if the request gave a real count.",
+                },
+            },
+            "required": ["first_run_at_utc"],
+        },
+    },
+}
+RESOLVE_SCHEDULE_TOOL_CHOICE = {"type": "function", "function": {"name": RESOLVE_SCHEDULE_TOOL_NAME}}
+
+
+def resolve_schedule(description: str) -> dict:
+    """Mirrors dispatcher/executor.py's _run_remind_step: gives the model
+    the current UTC time in a system prompt, then FORCES a tool call so it
+    can't skip resolution or answer in prose — the model's only job here
+    is turning a plain-language schedule description into concrete
+    numbers, isolated from the broader "build the workflow" task.
+
+    Raises WorkflowError if every configured provider fails, or if the
+    model's tool call can't be parsed — the caller (tools/workflows.py's
+    create_workflow) should surface that as a tool error back to the
+    chat rather than silently falling back to "manual"."""
+    try:
+        role = get_dispatcher_role(context="agent_work")
+    except ProviderNotConfigured as e:
+        raise WorkflowError(f"role 'agent_work' isn't configured: {e}")
+
+    now = datetime.now(timezone.utc)
+    messages = [
+        ChatMessage(
+            role="system",
+            content=(
+                f"Current UTC time: {now.isoformat()}\n"
+                "Resolve the schedule description into a concrete first run time "
+                "and (if it repeats) an interval, using the current UTC time above "
+                "as your only source of 'now' — never guess. Call set_schedule with "
+                "the result."
+            ),
+        ),
+        ChatMessage(role="user", content=description),
+    ]
+
+    attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
+    last_error = None
+    for attempt in attempts:
+        try:
+            provider = get_provider(attempt["provider"])
+        except Exception as e:
+            last_error = str(e)
+            continue
+        try:
+            response = provider.chat(
+                model=attempt["model"], messages=messages,
+                tools=[RESOLVE_SCHEDULE_TOOL_SCHEMA], tool_choice=RESOLVE_SCHEDULE_TOOL_CHOICE,
+            )
+        except ProviderError as e:
+            last_error = str(e)
+            continue
+
+        if not response.tool_calls:
+            last_error = "model didn't call set_schedule"
+            continue
+        try:
+            args = _parse_tool_args(response.tool_calls[0].arguments)
+            first_run = datetime.fromisoformat(args["first_run_at_utc"])
+            interval = int(args.get("interval_seconds") or 0)
+            remaining = args.get("remaining_runs")
+            trigger = {
+                "type": "scheduled",
+                "interval_seconds": interval,
+                "next_run_at": first_run.timestamp(),
+            }
+            if remaining is not None:
+                trigger["remaining_runs"] = int(remaining)
+            return trigger
+        except (KeyError, ValueError, TypeError) as e:
+            last_error = f"couldn't parse set_schedule call: {e}"
+            continue
+
+    raise WorkflowError(f"couldn't resolve schedule: {last_error}")
 
 
 async def check_due_workflows() -> int:
