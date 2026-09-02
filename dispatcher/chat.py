@@ -217,7 +217,10 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
             if i > 0:
                 reply += f"\n\n⚡ (primary was unavailable, answered via {attempt['provider']}/{attempt['model']} instead)"
             await append_message(conversation_id, "navi", reply, provider=attempt["provider"], model=attempt["model"])
-            return {"text": reply, "provider": attempt["provider"], "model": attempt["model"]}
+            return {
+                "text": reply, "provider": attempt["provider"], "model": attempt["model"],
+                "usage_note": response.usage_note,
+            }
         except ProviderError as e:
             last_error = str(e)
             continue

@@ -459,7 +459,10 @@ async def chat_send(request: Request) -> JSONResponse:
         if not conversation_id:
             conversation_id = await create_conversation(mode=mode)
         reply = await run_stored_mode_chat(mode, conversation_id, text, auto_accept=auto_accept)
-        return JSONResponse({"reply": reply["text"], "conversation_id": conversation_id})
+        return JSONResponse({
+            "reply": reply["text"], "conversation_id": conversation_id,
+            "usage_note": reply.get("usage_note"),
+        })
 
     reply_text, _attachments = _handle_parse_result(result, "pwa", mode, channel="pwa")
     return JSONResponse({"reply": reply_text})
