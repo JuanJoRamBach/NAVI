@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 
 from dispatcher.executor import CITATION_STYLE_PROMPT, run_tool_loop
 from dispatcher.mode_briefs import get_mode_brief
+from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
 from storage.conversations import append_message, get_messages
@@ -175,7 +176,20 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
     # returns (get_messages reads it back from storage) — not double
     # counted. "navi" -> "assistant" matches storage's own role
     # convention (see storage/conversations.py / devslate_chat.py).
+    #
+    # A past failure's own error text (always prefixed "⚠️" — see every
+    # error_text/return above) is skipped here, not replayed as if it were
+    # a real prior reply (2026-09-02, JuanJo: "are we giving the errors as
+    # context in the chat? that might be [messing] us too"). A retry in
+    # the same conversation would otherwise feed the model its own past
+    # failure's raw error text as supposed prior context on every
+    # subsequent attempt — noise at best, actively confusing at worst.
+    # Still shown to the user in the UI (this only filters what's SENT to
+    # the model, not what's persisted/displayed) — see get_messages calls
+    # elsewhere, unaffected by this.
     for m in history:
+        if m["role"] == "navi" and m["content"].startswith("⚠️"):
+            continue
         messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
     # UTC time grounding (JuanJo, 2026-09-01: "if it asks for something
     # close to 'do it in X time', must send the messages with a UTC
@@ -207,9 +221,10 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
             last_error = str(e)
             continue
         try:
+            sent_messages = messages
             response = await asyncio.to_thread(provider.chat, model=attempt["model"], messages=messages, tools=tools)
             if tools and response.tool_calls:
-                response, _messages, _iterations = await asyncio.to_thread(
+                response, sent_messages, _iterations = await asyncio.to_thread(
                     run_tool_loop, provider, attempt["model"], messages, response,
                     context={"command": f"chat-{mode}", "topic_slug": "chat"}, tools=tools,
                 )
@@ -224,6 +239,10 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
                 # "succeeding" with an unhelpful "(empty reply)" placeholder
                 # and nothing having happened.
                 last_error = f"{attempt['provider']}/{attempt['model']} returned neither text nor a tool call"
+                await asyncio.to_thread(
+                    save_failed_exchange, role_context, attempt["provider"], attempt["model"],
+                    sent_messages, last_error, response.raw,
+                )
                 continue
             reply = response.text or "(empty reply)"
             if i > 0:
@@ -235,6 +254,9 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
             }
         except ProviderError as e:
             last_error = str(e)
+            await asyncio.to_thread(
+                save_failed_exchange, role_context, attempt["provider"], attempt["model"], messages, last_error,
+            )
             continue
 
     error_text = f"⚠️ {role_context} failed on every configured provider: {last_error}"

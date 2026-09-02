@@ -26,6 +26,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 from dispatcher.executor import CITATION_STYLE_PROMPT, _parse_tool_args, run_tool_loop
+from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
 from storage.agent_work import (
@@ -94,15 +95,17 @@ def _run_node(node: dict, prior_context: str | None = None) -> str:
         raise WorkflowError(f"role '{role_context}' isn't configured: {e}")
 
     node_tools = schemas_for(node["tools"]) if node.get("tools") else None
-    messages = [ChatMessage(role="system", content=AGENT_WORK_SYSTEM_PROMPT)]
+    # One combined system message, not up to three — same Cloudflare
+    # "at most one system message" issue found in dispatcher/chat.py.
+    system_parts = [AGENT_WORK_SYSTEM_PROMPT]
     if node_tools:
-        messages.append(ChatMessage(role="system", content=CITATION_STYLE_PROMPT))
+        system_parts.append(CITATION_STYLE_PROMPT)
     if prior_context:
-        messages.append(ChatMessage(
-            role="system",
-            content=f"Output from the prior step(s) this one depends on:\n\n{prior_context}\n\nUse this as needed to complete your own task below.",
-        ))
-    messages.append(ChatMessage(role="user", content=node.get("prompt", "")))
+        system_parts.append(f"Output from the prior step(s) this one depends on:\n\n{prior_context}\n\nUse this as needed to complete your own task below.")
+    messages = [
+        ChatMessage(role="system", content="\n\n".join(system_parts)),
+        ChatMessage(role="user", content=node.get("prompt", "")),
+    ]
 
     attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
     last_error = None
@@ -113,9 +116,10 @@ def _run_node(node: dict, prior_context: str | None = None) -> str:
             last_error = str(e)
             continue
         try:
+            sent_messages = messages
             response = provider.chat(model=attempt["model"], messages=messages, tools=node_tools)
             if node_tools and response.tool_calls:
-                response, _messages, _iterations = run_tool_loop(
+                response, sent_messages, _iterations = run_tool_loop(
                     provider, attempt["model"], messages, response,
                     context={"command": "agent_work", "topic_slug": node.get("id", "step")},
                     tools=node_tools,
@@ -127,10 +131,12 @@ def _run_node(node: dict, prior_context: str | None = None) -> str:
                 # so try the next provider in the fallback chain rather
                 # than completing the step with a useless placeholder.
                 last_error = f"{attempt['provider']}/{attempt['model']} returned neither text nor a tool call"
+                save_failed_exchange("agent_work_step", attempt["provider"], attempt["model"], sent_messages, last_error, response.raw)
                 continue
             return response.text or "(empty reply)"
         except ProviderError as e:
             last_error = str(e)
+            save_failed_exchange("agent_work_step", attempt["provider"], attempt["model"], messages, last_error)
             continue
 
     raise WorkflowError(f"every configured provider failed: {last_error}")
@@ -290,10 +296,12 @@ def resolve_schedule(description: str) -> dict:
             )
         except ProviderError as e:
             last_error = str(e)
+            save_failed_exchange("resolve_schedule", attempt["provider"], attempt["model"], messages, last_error)
             continue
 
         if not response.tool_calls:
             last_error = "model didn't call set_schedule"
+            save_failed_exchange("resolve_schedule", attempt["provider"], attempt["model"], messages, last_error, response.raw)
             continue
         try:
             args = _parse_tool_args(response.tool_calls[0].arguments)
@@ -316,6 +324,7 @@ def resolve_schedule(description: str) -> dict:
             return trigger
         except (KeyError, ValueError, TypeError) as e:
             last_error = f"couldn't parse set_schedule call: {e}"
+            save_failed_exchange("resolve_schedule", attempt["provider"], attempt["model"], messages, last_error, response.raw)
             continue
 
     raise WorkflowError(f"couldn't resolve schedule: {last_error}")

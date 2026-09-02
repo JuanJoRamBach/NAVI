@@ -93,8 +93,12 @@ async def run_devslate_turn(conversation_id: str, user_text: str, relay: ToolRel
     messages = [ChatMessage(role="system", content=system_content)]
     # The just-appended user message is already the last row `history`
     # returns (get_messages reads it back from storage), so this isn't
-    # double-counted.
+    # double-counted. A past failure's own error text (always prefixed
+    # "⚠️") is skipped, not replayed as if it were a real prior reply —
+    # same reasoning as dispatcher/chat.py's run_stored_mode_chat.
     for m in history:
+        if m["role"] == "navi" and m["content"].startswith("⚠️"):
+            continue
         messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
 
     try:
