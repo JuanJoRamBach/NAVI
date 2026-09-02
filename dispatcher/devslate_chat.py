@@ -84,10 +84,13 @@ async def run_devslate_turn(conversation_id: str, user_text: str, relay: ToolRel
     task_state = await get_task_state(conversation_id)
     history = await get_messages(conversation_id, limit=RECENT_MESSAGE_WINDOW)
 
-    messages = [ChatMessage(role="system", content=brief.system_prompt)]
+    # One combined system message, not two — Cloudflare (dev_slate_chat's
+    # own default provider) rejects any system-role message that isn't
+    # both the first AND only one (2026-09-02, discovered via the same bug
+    # in dispatcher/chat.py's run_stored_mode_chat).
     state_block = format_task_state_for_prompt(task_state)
-    if state_block:
-        messages.append(ChatMessage(role="system", content=f"Current Slate task state:\n{state_block}"))
+    system_content = f"{brief.system_prompt}\n\nCurrent Slate task state:\n{state_block}" if state_block else brief.system_prompt
+    messages = [ChatMessage(role="system", content=system_content)]
     # The just-appended user message is already the last row `history`
     # returns (get_messages reads it back from storage), so this isn't
     # double-counted.

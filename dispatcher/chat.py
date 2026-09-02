@@ -50,11 +50,11 @@ def run_mode_chat(mode: str, text: str) -> str:
     except ProviderNotConfigured as e:
         return f"⚠️ Can't reply right now — {role_context} isn't configured: {e}"
 
+    # Combined into one system message, not two — see run_stored_mode_chat
+    # below for why (Cloudflare rejects more than one system-role entry).
     tools = schemas_for(brief.tools) if brief.tools else None
-    messages = [ChatMessage(role="system", content=brief.system_prompt)]
-    if tools:
-        messages.append(ChatMessage(role="system", content=CITATION_STYLE_PROMPT))
-    messages.append(ChatMessage(role="user", content=text))
+    system_content = f"{brief.system_prompt}\n\n{CITATION_STYLE_PROMPT}" if tools else brief.system_prompt
+    messages = [ChatMessage(role="system", content=system_content), ChatMessage(role="user", content=text)]
 
     # Same-model-family fallback chain (added 2026-08-29 after a real
     # "Groq rate limited" hard failure) — try the primary, then each
@@ -153,12 +153,24 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
     # insert anything that changes between calls (a live timestamp, a
     # per-turn-computed block) ahead of the growing-but-stable part, or
     # it breaks the prefix match for every provider's cache at once.
+    # 2026-09-02: these three were previously separate ChatMessage entries
+    # (all consecutively first, before any history) — correct per the
+    # usual "system messages must lead" convention, but the Cloudflare 400
+    # ("System message must be at the beginning") persisted even after the
+    # trailing UTC-time message was removed. agent_work is the one mode
+    # that reliably stacks all three at once (brief + citation format,
+    # since it has tools + the review instruction, since auto_accept
+    # defaults off) — strong circumstantial evidence Cloudflare's real
+    # rule is "at most one system message, and it must be message[0]," not
+    # just "system messages must be consecutively first." Combining into
+    # one message satisfies either reading and can't regress anything.
     tools = schemas_for(brief.tools) if brief.tools else None
-    messages = [ChatMessage(role="system", content=brief.system_prompt)]
+    system_parts = [brief.system_prompt]
     if tools:
-        messages.append(ChatMessage(role="system", content=CITATION_STYLE_PROMPT))
+        system_parts.append(CITATION_STYLE_PROMPT)
     if mode == "agent_work" and not auto_accept:
-        messages.append(ChatMessage(role="system", content=AGENT_WORK_REVIEW_INSTRUCTION))
+        system_parts.append(AGENT_WORK_REVIEW_INSTRUCTION)
+    messages = [ChatMessage(role="system", content="\n\n".join(system_parts))]
     # The just-appended user message is already the last row `history`
     # returns (get_messages reads it back from storage) — not double
     # counted. "navi" -> "assistant" matches storage's own role
