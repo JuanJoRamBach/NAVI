@@ -105,8 +105,25 @@ class CloudflareProvider(Provider):
 
         result = data.get("result", {})
 
+        # Two response shapes exist depending on the model (2026-09-02,
+        # found via a real Filen-logged "empty response" failure — see
+        # dispatcher/provider_debug.py). Older/simpler Workers AI models
+        # return {"result": {"response": "...", "tool_calls": [...]}}, but
+        # several newer chat-completions-compatible models (gemma-4-26b,
+        # gpt-oss, qwen3.8-27b) return an OpenAI-style {"result": {
+        # "choices": [{"message": {"content": ..., "tool_calls": [...]}}]}}
+        # envelope instead. Every "the model returned nothing" incident
+        # today across three different models was actually this: a real,
+        # complete answer sitting in choices[0].message.content, silently
+        # read as empty because only the first shape was ever checked.
+        choices_message = (result.get("choices") or [{}])[0].get("message", {})
+        text = result.get("response")
+        if text is None:
+            text = choices_message.get("content")
+
+        raw_tool_calls = result.get("tool_calls") or choices_message.get("tool_calls") or []
         tool_calls = []
-        for tc in result.get("tool_calls") or []:
+        for tc in raw_tool_calls:
             tool_calls.append(ToolCall(
                 id=tc.get("id", ""),
                 name=tc.get("name") or tc.get("function", {}).get("name", ""),
@@ -117,7 +134,7 @@ class CloudflareProvider(Provider):
         usage_note = f"{neurons:.2f} Neurons" if neurons is not None else None
 
         return ChatResponse(
-            text=result.get("response"),
+            text=text,
             tool_calls=tool_calls,
             model_used=model,
             raw=data,
