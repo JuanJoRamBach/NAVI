@@ -12,10 +12,17 @@ should run it via asyncio.to_thread, matching how provider.chat() calls
 are already dispatched elsewhere.
 
 Best-effort by design: a debug-save failure must never break the actual
-chat flow it's trying to explain — swallowed, not raised.
+chat flow it's trying to explain — caught, not raised. But NOT silently —
+a bare `except: pass` here would defeat the entire point of this module
+(2026-09-02: exactly that happened on the first version, and the actual
+rclone/Filen failure reason was lost). Printed instead, so it lands in
+whatever captures stdout (journalctl on the Lightsail service) — visible
+without being fatal.
 """
 
 import json
+import sys
+import traceback
 from datetime import datetime, timezone
 
 from providers.base import ChatMessage
@@ -46,6 +53,8 @@ def save_failed_exchange(
         }
         content = json.dumps(payload, indent=2, default=str)
         filename = f"{provider}_{model.replace('/', '_').replace('@', '')}.json"
-        save_result(FOLDER, context, filename, content)
+        remote_path = save_result(FOLDER, context, filename, content)
+        print(f"[provider_debug] saved failed exchange to {remote_path}", file=sys.stderr)
     except Exception:
-        pass
+        print("[provider_debug] FAILED to save debug exchange:", file=sys.stderr)
+        traceback.print_exc()
