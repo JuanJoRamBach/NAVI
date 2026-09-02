@@ -107,6 +107,23 @@ def _run_node(node: dict, prior_context: str | None = None) -> str:
         ChatMessage(role="user", content=node.get("prompt", "")),
     ]
 
+    # Force tool use on the first call when the step has any (2026-09-02:
+    # a step whose only tool was send_to_telegram "completed" by just
+    # DESCRIBING a message instead of actually calling the tool — "auto"
+    # tool_choice made that a legal response, and _run_node had no way to
+    # tell narration apart from a real action). If a step was given
+    # tools, using them IS its job — a single tool gets forced by name;
+    # more than one forces "required" (call something, model's choice
+    # which). run_tool_loop's own follow-up calls after that stay "auto"
+    # (unforced), same as before — the wrap-up turn after a tool result
+    # legitimately just needs to summarize in text, not call anything else.
+    tool_choice = None
+    if node_tools:
+        tool_choice = (
+            {"type": "function", "function": {"name": node_tools[0]["function"]["name"]}}
+            if len(node_tools) == 1 else "required"
+        )
+
     attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
     last_error = None
     for attempt in attempts:
@@ -117,7 +134,7 @@ def _run_node(node: dict, prior_context: str | None = None) -> str:
             continue
         try:
             sent_messages = messages
-            response = provider.chat(model=attempt["model"], messages=messages, tools=node_tools)
+            response = provider.chat(model=attempt["model"], messages=messages, tools=node_tools, tool_choice=tool_choice)
             if node_tools and response.tool_calls:
                 response, sent_messages, _iterations = run_tool_loop(
                     provider, attempt["model"], messages, response,
