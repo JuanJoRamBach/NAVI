@@ -162,7 +162,26 @@ async def start_workflow_run(workflow_id: str, trigger_source: str = "manual") -
 async def check_due_workflows() -> int:
     """Starts a run for every scheduled workflow whose trigger.next_run_at
     has passed, then rolls next_run_at forward by interval_seconds so it
-    doesn't refire on the next check. Returns how many runs it started.
+    doesn't refire on the next check — UNLESS trigger.remaining_runs has
+    just been exhausted (see below), in which case next_run_at is cleared
+    instead, so due_workflows()'s own existing "next_run_at is set and
+    past" check naturally stops picking this workflow up again. No new
+    "is this exhausted" branch needed anywhere else — reusing the check
+    that already exists for every other reason a trigger might have no
+    next_run_at. Returns how many runs it started.
+
+    trigger.remaining_runs (2026-09-01, JuanJo: "a counter that tells how
+    many times it must be repeated... if that counter is null, it means
+    it's scheduled until removed") — real prior art for this exact shape:
+    Quartz Scheduler's SimpleTrigger.repeatCount (a positive integer to
+    fire N more times, a sentinel for unlimited). null here (not a magic
+    number — real, sourced REST convention for "no expiration set", e.g.
+    GitLab's own token-expiration API) means unlimited, matching what
+    every trigger already did before this field existed. Absent key
+    reads identically to explicit null via dict.get(), but explicit null
+    is preferred when WRITING one (create_workflow, the manual form) —
+    self-documents "deliberately unlimited" rather than leaving it
+    ambiguous whether the field was just never considered.
 
     Extracted out of server.py's GET /agent/workflows/due (2026-09-01) so
     both that route (kept as a manual poke/health-check) and the
@@ -173,8 +192,14 @@ async def check_due_workflows() -> int:
         await start_run(workflow["graph"], workflow_id=workflow["id"], trigger_source="scheduled")
         trigger = workflow["trigger"]
         interval = trigger.get("interval_seconds")
-        if interval:
+        remaining = trigger.get("remaining_runs")
+        if remaining is not None:
+            remaining -= 1
+            trigger["remaining_runs"] = remaining
+        if interval and (remaining is None or remaining > 0):
             trigger["next_run_at"] = time.time() + interval
-            await update_workflow_trigger(workflow["id"], trigger)
+        else:
+            trigger["next_run_at"] = None
+        await update_workflow_trigger(workflow["id"], trigger)
         started += 1
     return started

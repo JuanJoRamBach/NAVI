@@ -118,7 +118,10 @@ TOOL_SCHEMAS = [
                     "trigger": {
                         "type": "object",
                         "description": "{\"type\": \"manual\"} (default) or {\"type\": \"scheduled\", "
-                                        "\"interval_seconds\", \"next_run_at\"} (epoch seconds).",
+                                        "\"interval_seconds\", \"next_run_at\" (epoch seconds), "
+                                        "\"remaining_runs\"}. remaining_runs: how many more times to fire "
+                                        "— an integer, or null (or omit it) for no expiration set, meaning "
+                                        "it keeps firing until removed.",
                     },
                 },
                 "required": ["name", "graph"],
