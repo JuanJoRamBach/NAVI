@@ -100,13 +100,42 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user_choice",
+            "description": "Presents the user with a small set of concrete options to "
+                            "pick from with one click, instead of asking a question in "
+                            "plain text and waiting for them to type a full reply. Use "
+                            "this for a genuine multi-way decision, not for every "
+                            "question. The user can still type something else instead "
+                            "of picking an option.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The complete message to show the user — this IS "
+                                        "what's displayed, write it whole and self-contained.",
+                    },
+                    "options": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "2 to 5 short, concrete option labels, each readable at a glance.",
+                    },
+                },
+                "required": ["question", "options"],
+            },
+        },
+    },
 ]
 
 # Tools that execute on THIS server, directly — everything else in
 # TOOL_SCHEMAS is relayed to the browser instead (see dispatch_devslate_tool
 # in dispatcher/devslate_chat.py, which handles the relay + await itself
 # since it needs the live WebSocket connection this module deliberately
-# doesn't import).
+# doesn't import). ask_user_choice is neither — it's intercepted in
+# run_devslate_turn before either path, same reasoning as
+# tools/registry.py's own copy of this tool.
 LOCAL_TOOL_NAMES = {"update_task_state"}
 
 

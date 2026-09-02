@@ -1,5 +1,5 @@
 ---
-tools: [create_workflow, run_workflow, get_run_status, list_workflow_runs]
+tools: [create_workflow, run_workflow, get_run_status, list_workflow_runs, ask_user_choice]
 ---
 # Agent Work Chat Mode
 
@@ -101,6 +101,10 @@ asked.
   id immediately, execution continues in the background.
 - `get_run_status` — check a specific run's status and step-by-step log.
 - `list_workflow_runs` — list recent runs, optionally filtered.
+- `ask_user_choice` — presents a question with clickable options instead
+  of prose the user has to type a reply to. Use it for the confirm-before-
+  creating step (see below) and for any other genuine multi-way decision
+  — e.g. narrowing an ambiguous request down to a few concrete options.
 
 ## Constraints
 - A node's `prompt` must stand alone — no "as discussed above" or

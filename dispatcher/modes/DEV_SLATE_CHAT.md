@@ -1,5 +1,5 @@
 ---
-tools: [read_file, write_file, grep, update_task_state]
+tools: [read_file, write_file, grep, update_task_state, ask_user_choice]
 ---
 # Dev Slate Chat Mode
 

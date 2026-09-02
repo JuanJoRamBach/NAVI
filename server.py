@@ -461,7 +461,7 @@ async def chat_send(request: Request) -> JSONResponse:
         reply = await run_stored_mode_chat(mode, conversation_id, text, auto_accept=auto_accept)
         return JSONResponse({
             "reply": reply["text"], "conversation_id": conversation_id,
-            "usage_note": reply.get("usage_note"),
+            "usage_note": reply.get("usage_note"), "choices": reply.get("choices"),
         })
 
     reply_text, _attachments = _handle_parse_result(result, "pwa", mode, channel="pwa")
@@ -720,6 +720,7 @@ async def devslate_ws(websocket: WebSocket, conversation_id: str) -> None:
                 "text": result["text"],
                 "provider": result["provider"],
                 "model": result["model"],
+                "choices": result.get("choices"),
             })
 
     try:

@@ -123,6 +123,18 @@ async def run_devslate_turn(conversation_id: str, user_text: str, relay: ToolRel
                 provider.chat, model=attempt["model"], messages=messages, tools=TOOL_SCHEMAS,
             )
 
+            choice_call = next((tc for tc in response.tool_calls if tc.name == "ask_user_choice"), None)
+            if choice_call:
+                # Intercepted before the tool-execution loop below — no
+                # server action, no browser relay, calling it IS the model
+                # handing a question back to the user (same shape as
+                # dispatcher/chat.py's run_stored_mode_chat).
+                args = _parse_tool_args(choice_call.arguments)
+                question = args.get("question", "")
+                options = args.get("options") or []
+                await append_message(conversation_id, "navi", question, provider=attempt["provider"], model=attempt["model"])
+                return {"text": question, "provider": attempt["provider"], "model": attempt["model"], "choices": options}
+
             iterations = 0
             while response.tool_calls and iterations < MAX_TOOL_ITERATIONS:
                 raw_choice = ((response.raw or {}).get("choices") or [{}])[0].get("message", {})

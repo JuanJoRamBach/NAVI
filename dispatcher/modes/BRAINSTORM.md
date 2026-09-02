@@ -1,5 +1,5 @@
 ---
-tools: [send_to_telegram]
+tools: [send_to_telegram, ask_user_choice]
 ---
 # Brainstorm Mode
 

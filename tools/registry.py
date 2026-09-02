@@ -183,7 +183,44 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user_choice",
+            "description": "Presents the user with a small set of concrete options to "
+                            "pick from with one click, instead of asking a question in "
+                            "plain text and waiting for them to type a full reply. Use "
+                            "this for a genuine multi-way decision — narrowing scope, "
+                            "confirming before an action, choosing between real "
+                            "alternatives — not for every question. The user can still "
+                            "type something else instead of picking an option.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The complete message to show the user — this IS "
+                                        "what's displayed, write it whole and self-"
+                                        "contained (not just a short prompt).",
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "2 to 5 short, concrete option labels, each "
+                                        "readable at a glance.",
+                    },
+                },
+                "required": ["question", "options"],
+            },
+        },
+    },
 ]
+
+# ask_user_choice is deliberately NOT handled in dispatch() below — it's
+# intercepted earlier, in run_stored_mode_chat/run_devslate_turn, before a
+# call ever reaches the normal execute-and-continue tool loop. Calling it
+# is how the model hands the question back to the user, not something
+# that has a server-side action to run.
 
 
 def schemas_for(names: list[str]) -> list[dict]:

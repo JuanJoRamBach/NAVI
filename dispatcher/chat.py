@@ -24,7 +24,7 @@ actually breaks, not to pre-solve failures nobody's hit yet.
 import asyncio
 from datetime import datetime, timezone
 
-from dispatcher.executor import CITATION_STYLE_PROMPT, run_tool_loop
+from dispatcher.executor import CITATION_STYLE_PROMPT, _parse_tool_args, run_tool_loop
 from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ProviderError
@@ -107,10 +107,12 @@ def run_mode_chat(mode: str, text: str) -> str:
 # real gate (a model could still ignore the instruction), but the only
 # option available without adding a live connection just for this.
 AGENT_WORK_REVIEW_INSTRUCTION = (
-    "Before calling create_workflow or run_workflow, first describe in "
-    "plain text what you're about to create or run and ask the user to "
-    "confirm. Only call the tool after they've explicitly confirmed in "
-    "a later message — never on the same turn you proposed it."
+    "Before calling create_workflow or run_workflow, first describe what "
+    "you're about to create or run, then call ask_user_choice with that "
+    "description as the question and options like ['Yes, create it', "
+    "'No, let me revise it'] — don't just ask in plain text. Only call "
+    "create_workflow/run_workflow after they've picked (or typed) an "
+    "explicit yes in a later message — never on the same turn you proposed it."
 )
 
 
@@ -223,6 +225,24 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
         try:
             sent_messages = messages
             response = await asyncio.to_thread(provider.chat, model=attempt["model"], messages=messages, tools=tools)
+            choice_call = next((tc for tc in response.tool_calls if tc.name == "ask_user_choice"), None)
+            if choice_call:
+                # Intercepted BEFORE run_tool_loop, not executed through it
+                # — this tool has no server-side action; calling it IS the
+                # model handing a question back to the user. question is
+                # persisted/returned as the reply text (so it reads
+                # naturally without the tool call), options ride alongside
+                # for the frontend to render as clickable buttons. Doesn't
+                # survive a page refresh (only the question text is
+                # persisted) — same known limit as usage_note.
+                args = _parse_tool_args(choice_call.arguments)
+                question = args.get("question", "")
+                options = args.get("options") or []
+                await append_message(conversation_id, "navi", question, provider=attempt["provider"], model=attempt["model"])
+                return {
+                    "text": question, "provider": attempt["provider"], "model": attempt["model"],
+                    "usage_note": response.usage_note, "choices": options,
+                }
             if tools and response.tool_calls:
                 response, sent_messages, _iterations = await asyncio.to_thread(
                     run_tool_loop, provider, attempt["model"], messages, response,
