@@ -34,7 +34,9 @@ from storage.agent_work import (
     complete_step, create_step, create_run, due_workflows, get_workflow,
     set_step_input, update_run_status, update_workflow_trigger,
 )
+from tools.notes import NoteError, save_note
 from tools.registry import schemas_for
+from tools.telegram_send import TelegramSendError, send_to_telegram
 
 # --- Node functions (2026-09-02) ---
 # Each workflow step is executed by a plain function with FIXED logic —
@@ -46,28 +48,35 @@ from tools.registry import schemas_for
 # edges are nothing more than functions, they can contain an LLM or just
 # good ol' code." One function per node KIND (inferred from which single
 # tool the node declares, matching the established "one step, one tool"
-# convention every workflow already uses); each owns its own fixed
-# system prompt tailored to that exact action, rather than every step
-# sharing one generic prompt regardless of what it actually does. The
-# real bug this fixes: a generic prompt left a send_to_telegram step free
-# to "complete" by just DESCRIBING a message instead of sending it —
-# each dedicated node prompt below states its one job unambiguously, and
-# tool use is still force-chosen server-side on top of that (belt and
-# suspenders, not either/or).
+# convention every workflow already uses).
+#
+# Two real kinds of node, not one shape forced onto both (2026-09-02,
+# JuanJo: "send to telegram is a deterministic function. the content for
+# it is not... generating content or use a set text MUST be
+# differentiated... we only use an LLM when it's actually needed"):
+#   - DETERMINISTIC ACTION nodes (send_to_telegram, save_note) — the
+#     real action is plain Python, called directly, never gated on an
+#     LLM tool call succeeding. Their "content" is whatever's already
+#     available: prior_context if a preceding step produced it, else the
+#     node's own prompt text taken literally (someone — the chat model
+#     while building the workflow, or a person via the manual/visual
+#     builder — already wrote the actual text once, at CREATION time;
+#     there's nothing left to compose at RUN time). Zero LLM calls for a
+#     workflow like "send exactly this message" — the whole run is one
+#     deterministic API call.
+#   - LLM-DIRECTED nodes (web_search, fetch_page) — the model genuinely
+#     has a judgment call to make (what query, interpreting what came
+#     back), so tool-calling through run_tool_loop stays appropriate.
+# A "generate content" step, when a workflow genuinely needs run-time
+# composition from live data, is just the existing no-tools text node
+# (_run_text_node) feeding a deterministic action node via prior_context
+# — no new node kind needed, the pieces already compose.
 
 TEXT_NODE_SYSTEM_PROMPT = (
     "You are executing one step of an automated NAVI workflow, running "
     "unattended (no user available to answer follow-up questions). This "
     "is a pure text-generation step — there is nothing to call or send. "
     "Write the requested text directly and completely."
-)
-SEND_TELEGRAM_NODE_SYSTEM_PROMPT = (
-    "You are executing one step of an automated NAVI workflow: sending a "
-    "Telegram message, running unattended (no user available to ask). "
-    "Compose the message described in the prompt below, then call "
-    "send_to_telegram with it. This step's only purpose is to actually "
-    "send something — never just describe or draft the message instead "
-    "of sending it."
 )
 WEB_SEARCH_NODE_SYSTEM_PROMPT = (
     "You are executing one step of an automated NAVI workflow: "
@@ -82,13 +91,6 @@ FETCH_PAGE_NODE_SYSTEM_PROMPT = (
     "specific URL, running unattended. Call fetch_page with the URL "
     "described in the prompt below, then summarize what you actually "
     "found."
-)
-SAVE_NOTE_NODE_SYSTEM_PROMPT = (
-    "You are executing one step of an automated NAVI workflow: saving a "
-    "file, running unattended. Call save_note with the filename and "
-    "content described in the prompt below. This step's only purpose is "
-    "to actually save something — never just describe what would be "
-    "saved instead of calling the tool."
 )
 GENERIC_MULTI_TOOL_NODE_SYSTEM_PROMPT = (
     "You are executing one step of an automated NAVI workflow, running "
@@ -152,10 +154,13 @@ def _call_for_node(
 
 
 def _run_tool_forced_node(system_prompt: str, tool_name: str, prompt: str, prior_context: str | None, debug_context: str) -> str:
-    """Shared body for every single-tool node kind (send_to_telegram,
-    web_search, fetch_page, save_note) — the only thing that differs
-    between them is which tool and which fixed prompt, so this is the
-    one place that logic lives."""
+    """Shared body for the LLM-directed node kinds (web_search,
+    fetch_page) — the model genuinely has a judgment call to make here
+    (what to search, how to interpret a fetched page), unlike
+    send_to_telegram/save_note which are pure deterministic dispatch
+    (see _run_send_telegram_node's docstring). The only thing that
+    differs between web_search and fetch_page is which tool and which
+    fixed prompt, so this is the one place that logic lives."""
     tools = schemas_for([tool_name])
     messages = [
         ChatMessage(role="system", content=_node_system_prompt(system_prompt, prior_context)),
@@ -181,7 +186,21 @@ def _run_text_node(prompt: str, prior_context: str | None) -> str:
 
 
 def _run_send_telegram_node(prompt: str, prior_context: str | None) -> str:
-    return _run_tool_forced_node(SEND_TELEGRAM_NODE_SYSTEM_PROMPT, "send_to_telegram", prompt, prior_context, "agent_work_step:send_to_telegram")
+    """No LLM call, ever — send_to_telegram is a deterministic action
+    with one input (the message text), and that text already exists by
+    the time this runs: prior_context if a preceding step produced it
+    live, otherwise the node's own prompt taken as the literal message
+    (already-composed at workflow-creation time, not something to
+    re-generate now). Raises WorkflowError on a real send failure
+    (missing credentials, Telegram API error) — same disclosure
+    principle as every other node."""
+    text = prior_context or prompt
+    if not text:
+        raise WorkflowError("send_to_telegram step has no text to send (empty prompt, no prior step output)")
+    try:
+        return send_to_telegram(text)
+    except TelegramSendError as e:
+        raise WorkflowError(str(e))
 
 
 def _run_web_search_node(prompt: str, prior_context: str | None) -> str:
@@ -193,7 +212,19 @@ def _run_fetch_page_node(prompt: str, prior_context: str | None) -> str:
 
 
 def _run_save_note_node(prompt: str, prior_context: str | None) -> str:
-    return _run_tool_forced_node(SAVE_NOTE_NODE_SYSTEM_PROMPT, "save_note", prompt, prior_context, "agent_work_step:save_note")
+    """No LLM call, ever — same reasoning as _run_send_telegram_node.
+    save_note additionally needs a filename, which nothing has ever
+    asked a human or a chat model to specify (create_workflow's steps
+    schema has no field for it) — derived deterministically instead of
+    inventing an LLM call just to name a file."""
+    content = prior_context or prompt
+    if not content:
+        raise WorkflowError("save_note step has no content to save (empty prompt, no prior step output)")
+    filename = f"step-{int(time.time())}.md"
+    try:
+        return save_note(command="agent_work", topic_slug="workflow", filename=filename, content=content)
+    except NoteError as e:
+        raise WorkflowError(str(e))
 
 
 def _run_generic_multi_tool_node(tool_names: list[str], prompt: str, prior_context: str | None) -> str:
