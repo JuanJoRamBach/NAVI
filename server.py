@@ -115,7 +115,7 @@ app = FastAPI(title="NAVI")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[PWA_ORIGIN],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type"],
 )
 
