@@ -66,7 +66,17 @@ class CloudflareProvider(Provider):
         if not account_id:
             raise ProviderError("CLOUDFLARE_ACCOUNT_ID not set")
 
-        payload = {"messages": [_serialize_message(m) for m in messages]}
+        # Cloudflare's own default max_tokens is 256 (their changelog) — far
+        # too little for a "thinking mode" model (qwen3.8-27b, gpt-oss's
+        # harmony reasoning channel, etc.), which spends tokens on hidden
+        # reasoning BEFORE any visible answer or tool call. Real incident
+        # (2026-09-02): three unrelated reasoning-capable models all
+        # returned a "successful" response with both text and tool_calls
+        # completely empty — the model was cut off mid-thought before ever
+        # reaching visible output. 8192 gives real headroom; billing is by
+        # tokens actually generated, not this ceiling, so raising it costs
+        # nothing unless a call genuinely needs it.
+        payload = {"messages": [_serialize_message(m) for m in messages], "max_tokens": 8192}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice or "auto"
