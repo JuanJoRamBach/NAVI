@@ -24,10 +24,11 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+from typing import Callable
 
-from dispatcher.executor import CITATION_STYLE_PROMPT, _parse_tool_args, run_tool_loop
+from dispatcher.executor import _parse_tool_args, run_tool_loop
 from dispatcher.provider_debug import save_failed_exchange
-from providers.base import ChatMessage, ProviderError
+from providers.base import ChatMessage, ChatResponse, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
 from storage.agent_work import (
     complete_step, create_step, create_run, due_workflows, get_workflow,
@@ -35,16 +36,199 @@ from storage.agent_work import (
 )
 from tools.registry import schemas_for
 
-AGENT_WORK_SYSTEM_PROMPT = (
+# --- Node functions (2026-09-02) ---
+# Each workflow step is executed by a plain function with FIXED logic —
+# not a generic "give the LLM a prompt and hope it calls the right tool"
+# handler, and not a class hierarchy either. Real prior art checked
+# before choosing this shape: LangGraph (the leading code-first graph
+# framework — the category NAVI's Agent Work actually belongs to, not
+# n8n's visual/config-driven category) states it plainly — "nodes and
+# edges are nothing more than functions, they can contain an LLM or just
+# good ol' code." One function per node KIND (inferred from which single
+# tool the node declares, matching the established "one step, one tool"
+# convention every workflow already uses); each owns its own fixed
+# system prompt tailored to that exact action, rather than every step
+# sharing one generic prompt regardless of what it actually does. The
+# real bug this fixes: a generic prompt left a send_to_telegram step free
+# to "complete" by just DESCRIBING a message instead of sending it —
+# each dedicated node prompt below states its one job unambiguously, and
+# tool use is still force-chosen server-side on top of that (belt and
+# suspenders, not either/or).
+
+TEXT_NODE_SYSTEM_PROMPT = (
     "You are executing one step of an automated NAVI workflow, running "
-    "unattended (no user available to answer follow-up questions). Do the "
-    "step's task directly and report the concrete result — don't ask "
-    "clarifying questions."
+    "unattended (no user available to answer follow-up questions). This "
+    "is a pure text-generation step — there is nothing to call or send. "
+    "Write the requested text directly and completely."
+)
+SEND_TELEGRAM_NODE_SYSTEM_PROMPT = (
+    "You are executing one step of an automated NAVI workflow: sending a "
+    "Telegram message, running unattended (no user available to ask). "
+    "Compose the message described in the prompt below, then call "
+    "send_to_telegram with it. This step's only purpose is to actually "
+    "send something — never just describe or draft the message instead "
+    "of sending it."
+)
+WEB_SEARCH_NODE_SYSTEM_PROMPT = (
+    "You are executing one step of an automated NAVI workflow: "
+    "researching something via web search, running unattended. Call "
+    "web_search with a query that covers the prompt below, then "
+    "summarize what you actually found in your reply so a later step "
+    "can use it — never answer from your own general knowledge instead "
+    "of actually searching."
+)
+FETCH_PAGE_NODE_SYSTEM_PROMPT = (
+    "You are executing one step of an automated NAVI workflow: reading a "
+    "specific URL, running unattended. Call fetch_page with the URL "
+    "described in the prompt below, then summarize what you actually "
+    "found."
+)
+SAVE_NOTE_NODE_SYSTEM_PROMPT = (
+    "You are executing one step of an automated NAVI workflow: saving a "
+    "file, running unattended. Call save_note with the filename and "
+    "content described in the prompt below. This step's only purpose is "
+    "to actually save something — never just describe what would be "
+    "saved instead of calling the tool."
+)
+GENERIC_MULTI_TOOL_NODE_SYSTEM_PROMPT = (
+    "You are executing one step of an automated NAVI workflow, running "
+    "unattended (no user available to answer follow-up questions). Do "
+    "the step's task directly using whichever of your tools it actually "
+    "needs, and report the concrete result — don't just describe what "
+    "you would do instead of doing it."
 )
 
 
 class WorkflowError(Exception):
     pass
+
+
+def _node_system_prompt(prompt: str, prior_context: str | None) -> str:
+    if not prior_context:
+        return prompt
+    return f"{prompt}\n\nOutput from the prior step(s) this one depends on:\n\n{prior_context}\n\nUse this as needed to complete your own task below."
+
+
+def _call_for_node(
+    debug_context: str, messages: list[ChatMessage],
+    tools: list[dict] | None = None, tool_choice: str | dict | None = None,
+) -> tuple[ChatResponse, object, str]:
+    """The one provider/fallback attempt loop every node function shares
+    — try the 'agent_work' role's primary, then each configured
+    fallback. A response with neither text nor a tool call is treated as
+    a failure worth retrying (2026-09-02 incident: three different
+    Cloudflare models "completed" by returning nothing at all), not a
+    success with nothing to show for it. Every failed attempt is saved
+    to Filen via save_failed_exchange. Returns (response, provider
+    instance, model name) on success — the provider instance is handed
+    back so a caller that needs run_tool_loop doesn't have to re-resolve
+    it. Raises WorkflowError once every attempt is exhausted."""
+    try:
+        role = get_dispatcher_role(context="agent_work")
+    except ProviderNotConfigured as e:
+        raise WorkflowError(f"role 'agent_work' isn't configured: {e}")
+
+    attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
+    last_error = None
+    for attempt in attempts:
+        try:
+            provider = get_provider(attempt["provider"])
+        except Exception as e:
+            last_error = str(e)
+            continue
+        try:
+            response = provider.chat(model=attempt["model"], messages=messages, tools=tools, tool_choice=tool_choice)
+        except ProviderError as e:
+            last_error = str(e)
+            save_failed_exchange(debug_context, attempt["provider"], attempt["model"], messages, last_error)
+            continue
+        if not response.text and not response.tool_calls:
+            last_error = f"{attempt['provider']}/{attempt['model']} returned neither text nor a tool call"
+            save_failed_exchange(debug_context, attempt["provider"], attempt["model"], messages, last_error, response.raw)
+            continue
+        return response, provider, attempt["model"]
+
+    raise WorkflowError(f"every configured provider failed: {last_error}")
+
+
+def _run_tool_forced_node(system_prompt: str, tool_name: str, prompt: str, prior_context: str | None, debug_context: str) -> str:
+    """Shared body for every single-tool node kind (send_to_telegram,
+    web_search, fetch_page, save_note) — the only thing that differs
+    between them is which tool and which fixed prompt, so this is the
+    one place that logic lives."""
+    tools = schemas_for([tool_name])
+    messages = [
+        ChatMessage(role="system", content=_node_system_prompt(system_prompt, prior_context)),
+        ChatMessage(role="user", content=prompt),
+    ]
+    tool_choice = {"type": "function", "function": {"name": tool_name}}
+    response, provider, model = _call_for_node(debug_context, messages, tools=tools, tool_choice=tool_choice)
+    if response.tool_calls:
+        response, _messages, _iterations = run_tool_loop(
+            provider, model, messages, response,
+            context={"command": "agent_work", "topic_slug": tool_name}, tools=tools,
+        )
+    return response.text or "(empty reply)"
+
+
+def _run_text_node(prompt: str, prior_context: str | None) -> str:
+    messages = [
+        ChatMessage(role="system", content=_node_system_prompt(TEXT_NODE_SYSTEM_PROMPT, prior_context)),
+        ChatMessage(role="user", content=prompt),
+    ]
+    response, _provider, _model = _call_for_node("agent_work_step:text", messages)
+    return response.text or "(empty reply)"
+
+
+def _run_send_telegram_node(prompt: str, prior_context: str | None) -> str:
+    return _run_tool_forced_node(SEND_TELEGRAM_NODE_SYSTEM_PROMPT, "send_to_telegram", prompt, prior_context, "agent_work_step:send_to_telegram")
+
+
+def _run_web_search_node(prompt: str, prior_context: str | None) -> str:
+    return _run_tool_forced_node(WEB_SEARCH_NODE_SYSTEM_PROMPT, "web_search", prompt, prior_context, "agent_work_step:web_search")
+
+
+def _run_fetch_page_node(prompt: str, prior_context: str | None) -> str:
+    return _run_tool_forced_node(FETCH_PAGE_NODE_SYSTEM_PROMPT, "fetch_page", prompt, prior_context, "agent_work_step:fetch_page")
+
+
+def _run_save_note_node(prompt: str, prior_context: str | None) -> str:
+    return _run_tool_forced_node(SAVE_NOTE_NODE_SYSTEM_PROMPT, "save_note", prompt, prior_context, "agent_work_step:save_note")
+
+
+def _run_generic_multi_tool_node(tool_names: list[str], prompt: str, prior_context: str | None) -> str:
+    """Safety net for a node with more than one tool — not a named kind
+    of its own (nothing in the chat-facing tool catalog produces this
+    today, since AGENT_WORK_CHAT.md's steps are one-tool-each by
+    convention), but a node built some other way (the future manual/
+    visual graph editor, most likely) isn't restricted to that
+    convention, so this keeps a multi-tool node working rather than
+    crashing on an unrecognized shape."""
+    tools = schemas_for(tool_names)
+    messages = [
+        ChatMessage(role="system", content=_node_system_prompt(GENERIC_MULTI_TOOL_NODE_SYSTEM_PROMPT, prior_context)),
+        ChatMessage(role="user", content=prompt),
+    ]
+    response, provider, model = _call_for_node("agent_work_step:multi_tool", messages, tools=tools, tool_choice="required")
+    if response.tool_calls:
+        response, _messages, _iterations = run_tool_loop(
+            provider, model, messages, response,
+            context={"command": "agent_work", "topic_slug": "multi_tool"}, tools=tools,
+        )
+    return response.text or "(empty reply)"
+
+
+# Dispatch table — a node's single declared tool selects its handler.
+# Keyed by tool name, not by some separate "kind" field on the node
+# itself, since the tool IS what determines the fixed logic/prompt a
+# node needs; no reason to duplicate that as a second piece of data that
+# could drift out of sync with the tools list.
+SINGLE_TOOL_NODE_HANDLERS: dict[str, Callable[[str, str | None], str]] = {
+    "send_to_telegram": _run_send_telegram_node,
+    "web_search": _run_web_search_node,
+    "fetch_page": _run_fetch_page_node,
+    "save_note": _run_save_note_node,
+}
 
 
 def _topological_order(graph: dict) -> list[dict]:
@@ -77,86 +261,32 @@ def _topological_order(graph: dict) -> list[dict]:
 
 
 def _run_node(node: dict, prior_context: str | None = None) -> str:
-    """Synchronous — same primary+fallback attempt loop as
-    dispatcher/chat.py's run_mode_chat, reusing the 'agent_work' role
-    rather than picking a model itself. Raises WorkflowError with a
-    human-readable message on total failure (every provider exhausted).
+    """Router, not an executor — picks the node function whose fixed
+    logic matches this node's declared tool(s), and calls it. See the
+    "Node functions" section above for what each one actually does.
 
     prior_context (2026-09-02): the completed output of this node's direct
     predecessors in the graph, if any — same "prior_context: str | None"
     shape dispatcher/executor.py's _run_remind_step already takes. Without
     this, a step genuinely depending on a prior step's result (e.g.
     "research news" -> "send what you found") had no way to see it; each
-    node ran in total isolation from every other node."""
-    role_context = node.get("role") or "agent_work"
-    try:
-        role = get_dispatcher_role(context=role_context)
-    except ProviderNotConfigured as e:
-        raise WorkflowError(f"role '{role_context}' isn't configured: {e}")
+    node ran in total isolation from every other node.
 
-    node_tools = schemas_for(node["tools"]) if node.get("tools") else None
-    # One combined system message, not up to three — same Cloudflare
-    # "at most one system message" issue found in dispatcher/chat.py.
-    system_parts = [AGENT_WORK_SYSTEM_PROMPT]
-    if node_tools:
-        system_parts.append(CITATION_STYLE_PROMPT)
-    if prior_context:
-        system_parts.append(f"Output from the prior step(s) this one depends on:\n\n{prior_context}\n\nUse this as needed to complete your own task below.")
-    messages = [
-        ChatMessage(role="system", content="\n\n".join(system_parts)),
-        ChatMessage(role="user", content=node.get("prompt", "")),
-    ]
+    A node's optional "role" field (a per-node model-role override) is no
+    longer read here — every node function now always uses the
+    'agent_work' role. Not a real regression: no path that actually
+    creates a node (the chat tool, the manual form) has ever set this
+    field, so nothing exercised it before either. Worth restoring, keyed
+    per node function, if a future caller (the visual graph builder)
+    actually wants it."""
+    prompt = node.get("prompt", "")
+    tool_names = node.get("tools") or []
 
-    # Force tool use on the first call when the step has any (2026-09-02:
-    # a step whose only tool was send_to_telegram "completed" by just
-    # DESCRIBING a message instead of actually calling the tool — "auto"
-    # tool_choice made that a legal response, and _run_node had no way to
-    # tell narration apart from a real action). If a step was given
-    # tools, using them IS its job — a single tool gets forced by name;
-    # more than one forces "required" (call something, model's choice
-    # which). run_tool_loop's own follow-up calls after that stay "auto"
-    # (unforced), same as before — the wrap-up turn after a tool result
-    # legitimately just needs to summarize in text, not call anything else.
-    tool_choice = None
-    if node_tools:
-        tool_choice = (
-            {"type": "function", "function": {"name": node_tools[0]["function"]["name"]}}
-            if len(node_tools) == 1 else "required"
-        )
-
-    attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
-    last_error = None
-    for attempt in attempts:
-        try:
-            provider = get_provider(attempt["provider"])
-        except Exception as e:
-            last_error = str(e)
-            continue
-        try:
-            sent_messages = messages
-            response = provider.chat(model=attempt["model"], messages=messages, tools=node_tools, tool_choice=tool_choice)
-            if node_tools and response.tool_calls:
-                response, sent_messages, _iterations = run_tool_loop(
-                    provider, attempt["model"], messages, response,
-                    context={"command": "agent_work", "topic_slug": node.get("id", "step")},
-                    tools=node_tools,
-                )
-            if not response.text and not response.tool_calls:
-                # Same real-failure-not-a-valid-answer case as
-                # dispatcher/chat.py's run_stored_mode_chat — a step that
-                # returns neither text nor a tool call did nothing at all,
-                # so try the next provider in the fallback chain rather
-                # than completing the step with a useless placeholder.
-                last_error = f"{attempt['provider']}/{attempt['model']} returned neither text nor a tool call"
-                save_failed_exchange("agent_work_step", attempt["provider"], attempt["model"], sent_messages, last_error, response.raw)
-                continue
-            return response.text or "(empty reply)"
-        except ProviderError as e:
-            last_error = str(e)
-            save_failed_exchange("agent_work_step", attempt["provider"], attempt["model"], messages, last_error)
-            continue
-
-    raise WorkflowError(f"every configured provider failed: {last_error}")
+    if not tool_names:
+        return _run_text_node(prompt, prior_context)
+    if len(tool_names) == 1 and tool_names[0] in SINGLE_TOOL_NODE_HANDLERS:
+        return SINGLE_TOOL_NODE_HANDLERS[tool_names[0]](prompt, prior_context)
+    return _run_generic_multi_tool_node(tool_names, prompt, prior_context)
 
 
 async def _execute_run(run_id: str, graph: dict) -> None:
