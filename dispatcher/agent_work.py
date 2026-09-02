@@ -120,6 +120,14 @@ def _run_node(node: dict, prior_context: str | None = None) -> str:
                     context={"command": "agent_work", "topic_slug": node.get("id", "step")},
                     tools=node_tools,
                 )
+            if not response.text and not response.tool_calls:
+                # Same real-failure-not-a-valid-answer case as
+                # dispatcher/chat.py's run_stored_mode_chat — a step that
+                # returns neither text nor a tool call did nothing at all,
+                # so try the next provider in the fallback chain rather
+                # than completing the step with a useless placeholder.
+                last_error = f"{attempt['provider']}/{attempt['model']} returned neither text nor a tool call"
+                continue
             return response.text or "(empty reply)"
         except ProviderError as e:
             last_error = str(e)

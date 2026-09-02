@@ -192,6 +192,18 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
                     run_tool_loop, provider, attempt["model"], messages, response,
                     context={"command": f"chat-{mode}", "topic_slug": "chat"}, tools=tools,
                 )
+            if not response.text and not response.tool_calls:
+                # A real failure mode, not a valid (if terse) answer — a
+                # model that returns neither text nor a tool call did
+                # nothing at all (2026-09-02: gpt-oss-20b via Cloudflare,
+                # asked to create a workflow, returned a completely blank
+                # response — no create_workflow call, nothing). Treat it
+                # the same as a ProviderError so the next attempt in the
+                # fallback chain actually gets tried, instead of silently
+                # "succeeding" with an unhelpful "(empty reply)" placeholder
+                # and nothing having happened.
+                last_error = f"{attempt['provider']}/{attempt['model']} returned neither text nor a tool call"
+                continue
             reply = response.text or "(empty reply)"
             if i > 0:
                 reply += f"\n\n⚡ (primary was unavailable, answered via {attempt['provider']}/{attempt['model']} instead)"
