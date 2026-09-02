@@ -165,17 +165,26 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
     # convention (see storage/conversations.py / devslate_chat.py).
     for m in history:
         messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
-    # LAST, not first (JuanJo, 2026-09-01: "if it asks for something
+    # UTC time grounding (JuanJo, 2026-09-01: "if it asks for something
     # close to 'do it in X time', must send the messages with a UTC
     # signal") — the model has no inherent sense of "now," so a request
     # like "in 5 minutes" or "every hour starting now" is unresolvable
-    # without this. Deliberately placed after the whole (stable, growing)
-    # history block rather than as an early system message: this is the
-    # one value that changes on literally every call, so it has to sit
-    # at the very end to keep everything before it — the real cache-
-    # matching prefix — byte-identical turn to turn. Not persisted to
-    # storage; each future turn gets its own freshly-correct one.
-    messages.append(ChatMessage(role="system", content=f"Current UTC time: {datetime.now(timezone.utc).isoformat()}"))
+    # without this.
+    #
+    # 2026-09-02: originally a separate trailing system message, which
+    # broke outright on Cloudflare (400: "System message must be at the
+    # beginning") — Cloudflare's OpenAI-compatible endpoint rejects any
+    # system-role message that isn't the very first one, and every other
+    # system message here (brief/citation/review instruction) already IS
+    # first, consecutively. Rather than move the time signal to the front
+    # (which would poison the whole history block's cache-prefix stability
+    # with a value that changes every call), it's appended directly onto
+    # the final user message's own content instead — that message was
+    # already guaranteed unique this turn, so this costs nothing
+    # additional for prefix-based caching while keeping every system
+    # message genuinely first. The stored copy (already persisted above,
+    # via append_message) is untouched — only this outgoing copy changes.
+    messages[-1].content = f"{messages[-1].content}\n\n[Current UTC time: {datetime.now(timezone.utc).isoformat()}]"
 
     attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
     last_error = None
