@@ -83,6 +83,13 @@ TASK_REQUIREMENTS = {
     # carries a mode brief + task-state block + real conversation history,
     # not one bare prompt.
     "devslate": {"tools": False, "min_context": 16000, "tier": "large"},
+    # Agent Work's own chat (dispatcher/chat.py's run_stored_mode_chat,
+    # mode: "agent_work", 2026-09-01) — tools=True since its whole point
+    # is calling create_workflow/run_workflow/etc., not optional the way
+    # Dev Slate's own local-tool-relay makes tool support there. Same
+    # min_context reasoning as devslate: a real windowed conversation
+    # history, not one bare prompt.
+    "agent_work": {"tools": True, "min_context": 16000, "tier": "large"},
 }
 
 SMALL_TIER_MAX_PARAMS_B = 30  # matches the 20b/27b models already used for "small" tasks

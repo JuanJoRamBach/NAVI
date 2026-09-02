@@ -23,6 +23,11 @@ agent_work.db
 # Auto-loaded via CLAUDE.md's @IDEAS.md import.
 IDEAS.md
 
+# Same reasoning as IDEAS.md above — persistent design doc for chat/
+# topic/Agent-Work context handling specifically, auto-loaded via
+# CLAUDE.md's @how_to_handle_context.md import.
+how_to_handle_context.md
+
 # Scratch diagnostic payloads (curl -d @file.json tests) — throwaway, not
 # part of the app, shouldn't be committed.
 *_test_payload.json

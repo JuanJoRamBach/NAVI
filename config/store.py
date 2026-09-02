@@ -78,9 +78,22 @@ DEFAULTS = {
         # say. dispatcher_autonomous keeps its name — it isn't a chat
         # mode, it backs the two GitHub Actions jobs, "dispatcher" still
         # fits there.
+        # Groq/OpenRouter deliberately excluded, primary or fallback
+        # (2026-09-01) — same reasoning dev_slate_chat below already
+        # established: Groq's free tier caps at 8K tokens/minute, and
+        # now that run_stored_mode_chat (dispatcher/chat.py) replays a
+        # real 20-message window every turn instead of one bare message,
+        # that cap is genuinely reachable, not theoretical. LLM7
+        # (already proven as this role's prior fallback) promoted to
+        # primary; Mistral's free tier is far more generous on tokens/
+        # minute (~500K TPM) and mistral-small-latest is already a known
+        # free-tier general-purpose model in this repo (see
+        # jobs/model_ranking.py's free-tier prefix list) — not
+        # code-specific like Codestral, which is why dev_slate_chat's own
+        # fallback isn't reused here as-is.
         "normal_chat": {
-            "provider": "groq", "model": "openai/gpt-oss-120b",
-            "fallback": [{"provider": "llm7", "model": "gpt-oss"}],
+            "provider": "llm7", "model": "gpt-oss",
+            "fallback": [{"provider": "mistral", "model": "mistral-small-latest"}],
         },
         "dispatcher_autonomous": {"provider": "groq", "model": "openai/gpt-oss-120b"},
         # dev_slate_chat: backs Dev Slate's own chat (dispatcher/devslate_chat.py),
@@ -99,12 +112,13 @@ DEFAULTS = {
             "fallback": [{"provider": "mistral", "model": "codestral-latest"}],
         },
         # agent_work: backs each node of an Agent Work workflow run
-        # (dispatcher/agent_work.py) — runs unattended, no user available
-        # for a "Groq's busy, try again?" moment, so same reliability
-        # reasoning as normal_chat: same primary + fallback pair.
+        # (dispatcher/agent_work.py) AND Agent Work's own chat
+        # (run_stored_mode_chat) — runs unattended / replays a real
+        # windowed history same as normal_chat, so same Groq-exclusion
+        # reasoning applies, same primary + fallback pair.
         "agent_work": {
-            "provider": "groq", "model": "openai/gpt-oss-120b",
-            "fallback": [{"provider": "llm7", "model": "gpt-oss"}],
+            "provider": "llm7", "model": "gpt-oss",
+            "fallback": [{"provider": "mistral", "model": "mistral-small-latest"}],
         },
     },
     "task_routing": {
@@ -195,6 +209,14 @@ DEFAULTS = {
     "storage": {
         "filen_configured": False,
     },
+    # Standard 5-field Unix cron syntax — dispatcher/scheduler.py parses
+    # this (via croniter) to fire check_due_workflows() in-process, no
+    # external ping/crontab entry needed (2026-09-01, JuanJo's call:
+    # "a python function that saves the cron... and it's fire per the
+    # syntax" instead of an OS-level cron job on the Lightsail box).
+    # Real setting, not hardcoded, same reasoning as everything else in
+    # this store — changeable without a redeploy.
+    "agent_work_due_check_cron": "*/5 * * * *",
 }
 
 
@@ -488,3 +510,23 @@ def _migrate_add_agent_work_role():
 
 
 _migrate_add_agent_work_role()
+
+
+def _migrate_chat_roles_off_groq():
+    """One-time correction (2026-09-01): normal_chat and agent_work both
+    switched primary+fallback away from Groq/OpenRouter in DEFAULTS
+    above, but a role that already exists in a saved config.json isn't
+    touched by a DEFAULTS change — same reasoning as every other
+    migration here. Unlike those, this one force-overwrites an existing
+    value rather than only filling in a missing one, since the whole
+    point is correcting roles that already exist. Guarded by the usual
+    one-time flag so it doesn't stomp a deliberate manual pick made
+    after this migration already ran once."""
+    if config.get("migrated_chat_roles_off_groq"):
+        return
+    config.set_role("normal_chat", "llm7", "gpt-oss", fallback=[{"provider": "mistral", "model": "mistral-small-latest"}])
+    config.set_role("agent_work", "llm7", "gpt-oss", fallback=[{"provider": "mistral", "model": "mistral-small-latest"}])
+    config.set("migrated_chat_roles_off_groq", True)
+
+
+_migrate_chat_roles_off_groq()

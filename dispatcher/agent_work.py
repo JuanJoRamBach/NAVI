@@ -21,12 +21,16 @@ storage layer, since aiosqlite connections aren't loop-agnostic.
 
 import asyncio
 import threading
+import time
 from collections import deque
 
 from dispatcher.executor import CITATION_STYLE_PROMPT, run_tool_loop
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
-from storage.agent_work import complete_step, create_step, create_run, get_workflow, set_step_input, update_run_status
+from storage.agent_work import (
+    complete_step, create_step, create_run, due_workflows, get_workflow,
+    set_step_input, update_run_status, update_workflow_trigger,
+)
 from tools.registry import schemas_for
 
 AGENT_WORK_SYSTEM_PROMPT = (
@@ -153,3 +157,24 @@ async def start_workflow_run(workflow_id: str, trigger_source: str = "manual") -
     if not workflow:
         raise WorkflowError(f"no workflow with id {workflow_id}")
     return await start_run(workflow["graph"], workflow_id=workflow_id, trigger_source=trigger_source)
+
+
+async def check_due_workflows() -> int:
+    """Starts a run for every scheduled workflow whose trigger.next_run_at
+    has passed, then rolls next_run_at forward by interval_seconds so it
+    doesn't refire on the next check. Returns how many runs it started.
+
+    Extracted out of server.py's GET /agent/workflows/due (2026-09-01) so
+    both that route (kept as a manual poke/health-check) and the
+    in-process scheduler (dispatcher/scheduler.py) call the exact same
+    logic — one code path regardless of what triggers the check."""
+    started = 0
+    for workflow in await due_workflows():
+        await start_run(workflow["graph"], workflow_id=workflow["id"], trigger_source="scheduled")
+        trigger = workflow["trigger"]
+        interval = trigger.get("interval_seconds")
+        if interval:
+            trigger["next_run_at"] = time.time() + interval
+            await update_workflow_trigger(workflow["id"], trigger)
+        started += 1
+    return started

@@ -6,11 +6,20 @@ Filen-backed persistence (a plain "reminders" key via ConfigStore's
 generic get/set) rather than building a separate storage path — every
 write already gets backed up to Filen and restored on restart for free.
 
-Reminders are checked and delivered by the live Render server (see
-server.py's /reminders/check, hit periodically by a GitHub Actions cron —
-see .github/workflows/check_reminders.yml) rather than a standalone job
-script, so this module never needs its own Filen round-trip: it just
-reads/writes the config singleton that's already loaded in-process.
+Reminders are checked and delivered by the live server (see server.py's
+/reminders/check) rather than a standalone job script, so this module
+never needs its own Filen round-trip: it just reads/writes the config
+singleton that's already loaded in-process. /reminders/check itself is
+hit periodically by an external cron-job.org ping, not GitHub Actions —
+started on a GH Actions cron (this repo has no such workflow file
+anymore) but moved off it after real scheduling drift under load (a
+5-minute reminder once arrived 25 minutes late). Agent Work's own
+/agent/workflows/due (2026-09-01) skips this problem a different way —
+a standard Unix cron job on the Lightsail box itself, hitting its own
+localhost server directly, no external network hop or scheduler drift
+at all. Not set up in this repo (it's a crontab entry on the server,
+not a file here) — see the deploy notes wherever Lightsail's own setup
+is tracked.
 """
 
 import uuid

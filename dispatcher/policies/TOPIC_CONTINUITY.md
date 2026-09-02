@@ -25,6 +25,14 @@ ESTABLISHED topic from this conversation, or starts a genuinely new one.
 Decide which established topic (by its number) the new message belongs
 to, OR decide it is a new topic.
 
+**Default to matching an existing topic.** Every new topic you create
+permanently fragments this conversation's history — a message wrongly
+split into its own topic loses the context of whatever it actually
+continues. Only answer NEW when the message clearly, unambiguously does
+not belong to any established topic's subject matter. When it's a close
+call between "loosely related to an existing topic" and "new," prefer
+the existing topic.
+
 - A message belongs to an established topic if it's a natural
   continuation, follow-up question, clarification, or closely related
   point — even if it doesn't repeat the same words.

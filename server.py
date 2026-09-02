@@ -51,8 +51,9 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-from dispatcher.agent_work import WorkflowError, start_run, start_workflow_run
-from dispatcher.chat import run_mode_chat
+from dispatcher.agent_work import WorkflowError, check_due_workflows, start_workflow_run
+from dispatcher.scheduler import register_job, start_scheduler
+from dispatcher.chat import run_mode_chat, run_stored_mode_chat
 from dispatcher.devslate_chat import run_devslate_turn
 from dispatcher.executor import format_summary, run_chain
 from dispatcher.parser import COMMANDS, ParseResult, parse_message
@@ -71,8 +72,7 @@ from storage.conversations import (
 )
 from storage.agent_work import (
     create_workflow as create_workflow_definition,
-    due_workflows, get_run, get_run_steps, get_workflow, list_runs, list_workflows,
-    update_workflow_trigger,
+    get_run, get_run_steps, get_workflow, list_runs, list_workflows,
 )
 from tools.devslate_tools import new_tool_call_id
 
@@ -117,6 +117,16 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
+
+
+@app.on_event("startup")
+async def _start_background_scheduler() -> None:
+    """In-process cron (dispatcher/scheduler.py) — registered here so it
+    starts exactly once, when uvicorn actually boots the app, not at
+    import time (matters for tests/tooling that import server.py without
+    running it, e.g. this file's own TestClient-based checks)."""
+    register_job("check_due_agent_workflows", config.get("agent_work_due_check_cron", "*/5 * * * *"), check_due_workflows)
+    start_scheduler()
 
 
 def _telegram_adapter() -> TelegramAdapter | None:
@@ -415,15 +425,24 @@ async def webhook_discord() -> PlainTextResponse:
 
 @app.post("/chat/send")
 async def chat_send(request: Request) -> JSONResponse:
-    """The PWA's own chat surface for Normal/Research/Brainstorm — still
-    single-message, no server-side history, exactly as before this
-    migration. Dev Slate has its own real conversation memory (see
-    /ws/devslate/{id} below) rather than being folded into this route,
-    per JuanJo's own sequencing call (2026-09-01): Dev Slate first, this
-    endpoint's behavior retouched later, deliberately not bundled here."""
+    """The PWA's own chat surface for Normal/Research/Brainstorm/Agent
+    Work. Plain-chat turns (not a typed /command, not a near-miss
+    confirmation) now get real server-side memory — see
+    dispatcher/chat.py's run_stored_mode_chat and how_to_handle_context.md
+    (2026-09-01: first real multi-turn memory outside Dev Slate, the
+    deliberately dumbest version, to find out empirically where plain
+    context actually breaks before building anything fancier). Typed
+    /commands and near-miss confirmations are untouched — they already
+    have their own separate save/output mechanisms and aren't part of
+    what's being tested here."""
     payload = await request.json()
     text = (payload.get("text") or "").strip()
     mode = payload.get("mode") or "normal"
+    conversation_id = payload.get("conversation_id")
+    # Only meaningful for mode == "agent_work" (see
+    # dispatcher/chat.py's AGENT_WORK_REVIEW_INSTRUCTION) — defaults True
+    # so omitting it (every other mode's client) is a no-op.
+    auto_accept = payload.get("auto_accept", True)
     if not text:
         return JSONResponse({"error": "missing 'text'"}, status_code=400)
     result = parse_message(text)
@@ -434,6 +453,12 @@ async def chat_send(request: Request) -> JSONResponse:
             "reply": "Researching — I'll ping you when it's ready. Feel free to keep chatting.",
             "async": True,
         })
+
+    if result.kind == "plain_chat":
+        if not conversation_id:
+            conversation_id = await create_conversation(mode=mode)
+        reply = await run_stored_mode_chat(mode, conversation_id, text, auto_accept=auto_accept)
+        return JSONResponse({"reply": reply["text"], "conversation_id": conversation_id})
 
     reply_text, _attachments = _handle_parse_result(result, "pwa", mode, channel="pwa")
     return JSONResponse({"reply": reply_text})
@@ -468,7 +493,7 @@ def config_models(task: str = Query(...)) -> dict:
     the snapshot has never been generated on this instance yet, so the
     picker isn't empty on a fresh deploy."""
     snapshot = load_snapshot()
-    role_name = {"devslate": "dev_slate_chat"}.get(task)
+    role_name = {"devslate": "dev_slate_chat", "agent_work": "agent_work"}.get(task)
     current_role = config.get_role(role_name) if role_name else None
     current = {"provider": current_role["provider"], "model": current_role["model"]} if current_role else None
 
@@ -559,10 +584,11 @@ async def agent_list_workflows() -> list[dict]:
 
 @app.get("/agent/workflows/due")
 async def agent_due_workflows() -> dict:
-    """Hit periodically by an external cron ping, same shape as
-    /reminders/check. Starts a run for every scheduled workflow whose
-    trigger.next_run_at has passed, then rolls next_run_at forward by
-    interval_seconds so it doesn't refire on the next check.
+    """Manual poke / health-check — the real trigger is now
+    dispatcher/scheduler.py's in-process cron, which calls
+    check_due_workflows() directly on its own schedule. This route just
+    exposes the same check over HTTP, e.g. to poke it by hand or verify
+    it's wired up, without waiting for the next scheduled fire.
 
     Registered BEFORE /agent/workflows/{workflow_id} below on purpose —
     FastAPI matches routes in registration order, so a static path like
@@ -570,15 +596,7 @@ async def agent_due_workflows() -> dict:
     "due" as a workflow_id and swallow every request here (caught before
     ever deploying this: a quick route-table dump during dev testing
     showed the dynamic route matching first)."""
-    started = 0
-    for workflow in await due_workflows():
-        await start_run(workflow["graph"], workflow_id=workflow["id"], trigger_source="scheduled")
-        trigger = workflow["trigger"]
-        interval = trigger.get("interval_seconds")
-        if interval:
-            trigger["next_run_at"] = time.time() + interval
-            await update_workflow_trigger(workflow["id"], trigger)
-        started += 1
+    started = await check_due_workflows()
     return {"started": started}
 
 
