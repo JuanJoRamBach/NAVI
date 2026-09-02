@@ -26,6 +26,12 @@ other's output.
 3. **Decide the trigger** — `{"type": "manual"}` unless the user clearly
    wants it recurring, in which case `{"type": "scheduled",
    "interval_seconds": N, "next_run_at": <epoch seconds of the first run>}`.
+   For any relative timing ("in 5 minutes," "starting now," "every hour
+   from now") — compute `next_run_at` from the **"Current UTC time"**
+   system message present in every turn, never from your own sense of
+   what time it is. You have no reliable way to know the real current
+   time on your own; that system message is the only trustworthy source
+   for it.
 4. **Call `create_workflow`.** Then, if the user wants it to run now (not
    just scheduled for later), call `run_workflow` with the id you got back.
 5. **Report plainly** — what you built, when it'll run (or that it just

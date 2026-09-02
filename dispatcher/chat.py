@@ -22,6 +22,7 @@ actually breaks, not to pre-solve failures nobody's hit yet.
 """
 
 import asyncio
+from datetime import datetime, timezone
 
 from dispatcher.executor import CITATION_STYLE_PROMPT, run_tool_loop
 from dispatcher.mode_briefs import get_mode_brief
@@ -164,6 +165,17 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
     # convention (see storage/conversations.py / devslate_chat.py).
     for m in history:
         messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
+    # LAST, not first (JuanJo, 2026-09-01: "if it asks for something
+    # close to 'do it in X time', must send the messages with a UTC
+    # signal") — the model has no inherent sense of "now," so a request
+    # like "in 5 minutes" or "every hour starting now" is unresolvable
+    # without this. Deliberately placed after the whole (stable, growing)
+    # history block rather than as an early system message: this is the
+    # one value that changes on literally every call, so it has to sit
+    # at the very end to keep everything before it — the real cache-
+    # matching prefix — byte-identical turn to turn. Not persisted to
+    # storage; each future turn gets its own freshly-correct one.
+    messages.append(ChatMessage(role="system", content=f"Current UTC time: {datetime.now(timezone.utc).isoformat()}"))
 
     attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
     last_error = None
