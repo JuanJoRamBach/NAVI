@@ -135,6 +135,23 @@ async def list_workflows() -> list[dict]:
     return [_row_to_workflow(r) for r in rows]
 
 
+async def delete_workflow(workflow_id: str) -> bool:
+    """Deletes the workflow definition. Past agent_runs/agent_run_steps for
+    it are left alone — a real audit trail of what already happened, not
+    something an accidental double-click should be able to erase. Deleting
+    the definition is also the entire "cancel its schedule" mechanism —
+    there's no separate in-memory job to stop (dispatcher/scheduler.py's
+    only registered job is the periodic check_due_workflows() poll itself);
+    due_workflows() reads straight from this table, so a deleted workflow
+    simply stops being returned by it, on the very next poll.
+    Returns whether a row was actually deleted."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        cursor = await db.execute("DELETE FROM workflow_definitions WHERE id = ?", (workflow_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
 async def update_workflow_trigger(workflow_id: str, trigger: dict) -> None:
     """Advances (or otherwise rewrites) a workflow's trigger — used after a
     scheduled run fires, to roll next_run_at forward by interval_seconds."""

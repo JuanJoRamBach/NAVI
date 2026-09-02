@@ -72,6 +72,7 @@ from storage.conversations import (
 )
 from storage.agent_work import (
     create_workflow as create_workflow_definition,
+    delete_workflow as delete_workflow_definition,
     get_run, get_run_steps, get_workflow, list_runs, list_workflows,
 )
 from tools.devslate_tools import new_tool_call_id
@@ -606,6 +607,18 @@ async def agent_get_workflow(workflow_id: str) -> dict:
     if not workflow:
         raise HTTPException(status_code=404, detail="not found")
     return workflow
+
+
+@app.delete("/agent/workflows/{workflow_id}")
+async def agent_delete_workflow(workflow_id: str) -> JSONResponse:
+    """Deletes the workflow definition. This is also the entire "cancel its
+    schedule" operation — see delete_workflow's docstring in
+    storage/agent_work.py for why nothing else needs to be touched. Past
+    runs/steps for it are kept, not cascade-deleted (real audit trail)."""
+    deleted = await delete_workflow_definition(workflow_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="not found")
+    return JSONResponse({"deleted": True})
 
 
 @app.post("/agent/workflows/{workflow_id}/run")
