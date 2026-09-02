@@ -90,6 +90,15 @@ TASK_REQUIREMENTS = {
     # min_context reasoning as devslate: a real windowed conversation
     # history, not one bare prompt.
     "agent_work": {"tools": True, "min_context": 16000, "tier": "large"},
+    # Normal/Research/Brainstorm chat's shared role (dispatcher/chat.py's
+    # normal_chat role, context="chat") — all three modes route through
+    # the same role today (see dispatcher/chat.py's run_mode_chat), so
+    # one entry covers all three. tools=True (web_search/fetch_page/
+    # send_to_telegram per NORMAL_CHAT.md). min_context matches the same
+    # real-windowed-history reasoning as devslate/agent_work above, now
+    # that run_stored_mode_chat gives this role real multi-turn memory
+    # too (2026-09-01), not just a bare single message.
+    "normal_chat": {"tools": True, "min_context": 16000, "tier": "large"},
 }
 
 SMALL_TIER_MAX_PARAMS_B = 30  # matches the 20b/27b models already used for "small" tasks

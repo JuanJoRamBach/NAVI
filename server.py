@@ -493,7 +493,7 @@ def config_models(task: str = Query(...)) -> dict:
     the snapshot has never been generated on this instance yet, so the
     picker isn't empty on a fresh deploy."""
     snapshot = load_snapshot()
-    role_name = {"devslate": "dev_slate_chat", "agent_work": "agent_work"}.get(task)
+    role_name = {"devslate": "dev_slate_chat", "agent_work": "agent_work", "normal_chat": "normal_chat"}.get(task)
     current_role = config.get_role(role_name) if role_name else None
     current = {"provider": current_role["provider"], "model": current_role["model"]} if current_role else None
 
