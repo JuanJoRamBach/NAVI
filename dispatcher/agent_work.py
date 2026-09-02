@@ -75,11 +75,18 @@ def _topological_order(graph: dict) -> list[dict]:
     return order
 
 
-def _run_node(node: dict) -> str:
+def _run_node(node: dict, prior_context: str | None = None) -> str:
     """Synchronous — same primary+fallback attempt loop as
     dispatcher/chat.py's run_mode_chat, reusing the 'agent_work' role
     rather than picking a model itself. Raises WorkflowError with a
-    human-readable message on total failure (every provider exhausted)."""
+    human-readable message on total failure (every provider exhausted).
+
+    prior_context (2026-09-02): the completed output of this node's direct
+    predecessors in the graph, if any — same "prior_context: str | None"
+    shape dispatcher/executor.py's _run_remind_step already takes. Without
+    this, a step genuinely depending on a prior step's result (e.g.
+    "research news" -> "send what you found") had no way to see it; each
+    node ran in total isolation from every other node."""
     role_context = node.get("role") or "agent_work"
     try:
         role = get_dispatcher_role(context=role_context)
@@ -90,6 +97,11 @@ def _run_node(node: dict) -> str:
     messages = [ChatMessage(role="system", content=AGENT_WORK_SYSTEM_PROMPT)]
     if node_tools:
         messages.append(ChatMessage(role="system", content=CITATION_STYLE_PROMPT))
+    if prior_context:
+        messages.append(ChatMessage(
+            role="system",
+            content=f"Output from the prior step(s) this one depends on:\n\n{prior_context}\n\nUse this as needed to complete your own task below.",
+        ))
     messages.append(ChatMessage(role="user", content=node.get("prompt", "")))
 
     attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
@@ -123,16 +135,32 @@ async def _execute_run(run_id: str, graph: dict) -> None:
         await update_run_status(run_id, "failed", error=str(e))
         return
 
+    # Direct predecessors per node, straight from the edge list — the same
+    # graph.get("edges", []) _topological_order already walks, just indexed
+    # the other direction (by destination instead of source).
+    predecessors: dict[str, list[str]] = {n["id"]: [] for n in order}
+    for edge in graph.get("edges", []):
+        if edge["to"] in predecessors:
+            predecessors[edge["to"]].append(edge["from"])
+
+    outputs: dict[str, str] = {}
+
     await update_run_status(run_id, "running")
     for seq, node in enumerate(order):
+        prior = predecessors.get(node["id"], [])
+        prior_context = "\n\n".join(f"[{pid}]: {outputs[pid]}" for pid in prior if pid in outputs) or None
+
         step_id = await create_step(run_id, node["id"], seq)
         await set_step_input(step_id, {"prompt": node.get("prompt"), "role": node.get("role"), "tools": node.get("tools")})
         try:
-            output = await asyncio.to_thread(_run_node, node)
+            output = await asyncio.to_thread(_run_node, node, prior_context)
             await complete_step(step_id, "completed", output=output)
+            outputs[node["id"]] = output
         except WorkflowError as e:
             await complete_step(step_id, "failed", error=str(e))
-            await update_run_status(run_id, "failed", error=f"node '{node['id']}' failed: {e}")
+            remaining = len(order) - seq - 1
+            skip_note = f" — {remaining} downstream step(s) were not run." if remaining else ""
+            await update_run_status(run_id, "failed", error=f"node '{node['id']}' failed: {e}{skip_note}")
             return
 
     await update_run_status(run_id, "completed")
@@ -187,6 +215,25 @@ RESOLVE_SCHEDULE_TOOL_SCHEMA = {
     },
 }
 RESOLVE_SCHEDULE_TOOL_CHOICE = {"type": "function", "function": {"name": RESOLVE_SCHEDULE_TOOL_NAME}}
+
+# Real prior incident (2026-09-02): "send a message in 5 mins" got resolved
+# as interval_seconds=300, remaining_runs=null — the model read the delay
+# before the single run as a recurrence cadence and fired every 5 minutes
+# indefinitely until manually killed. Prompting alone already failed once
+# here, so this is a deterministic backstop, not just better wording: if
+# the ORIGINAL description (not the model's own paraphrase of it) doesn't
+# contain a real recurrence cue, a repeating trigger is impossible to
+# construct no matter what the model returns.
+_RECURRENCE_CUES = (
+    "every", "each ", "daily", "weekly", "hourly", "monthly", "repeat",
+    "recurring", "recur", "again and again", "keep doing", "indefinitely",
+    "until i say", "until you're told", "repeating:",
+)
+
+
+def _looks_recurring(description: str) -> bool:
+    d = description.lower()
+    return any(cue in d for cue in _RECURRENCE_CUES)
 
 
 def resolve_schedule(description: str) -> dict:
@@ -245,6 +292,12 @@ def resolve_schedule(description: str) -> dict:
             first_run = datetime.fromisoformat(args["first_run_at_utc"])
             interval = int(args.get("interval_seconds") or 0)
             remaining = args.get("remaining_runs")
+            if interval and not _looks_recurring(description):
+                # The model returned a repeat interval, but nothing in the
+                # actual request said this should recur — force it back to
+                # a one-off rather than trust a number that shouldn't exist.
+                interval = 0
+                remaining = None
             trigger = {
                 "type": "scheduled",
                 "interval_seconds": interval,
