@@ -25,7 +25,7 @@ import asyncio
 import re
 from datetime import datetime, timezone
 
-from dispatcher.executor import CITATION_STYLE_PROMPT, _parse_tool_args, run_tool_loop
+from dispatcher.executor import CITATION_STYLE_PROMPT, _extract_tool_results, _parse_tool_args, run_tool_loop
 from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ProviderError
@@ -329,7 +329,21 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
                     sent_messages, last_error, response.raw,
                 )
                 continue
-            reply = response.text or "(empty reply)"
+            if not response.text and sent_messages is not messages:
+                # Reached with tool_calls still non-empty (run_tool_loop hit
+                # MAX_TOOL_ITERATIONS while the model kept asking for more
+                # tool calls, e.g. repeat web_search attempts, instead of
+                # ever writing a summary) — neither guard above catches this
+                # specific shape, since both require tool_calls to be empty.
+                # Real gathered material (search snippets, page content)
+                # very likely exists in sent_messages regardless; throwing
+                # it away for a bare "(empty reply)" is the exact bug a real
+                # user hit in Normal Chat (2026-09-03): asked for 3 AI news
+                # stories summarized, got "(empty reply)" twice in a row —
+                # the raw results were sitting right there in the transcript.
+                reply = _extract_tool_results(sent_messages) or "(empty reply)"
+            else:
+                reply = response.text or "(empty reply)"
             if i > 0:
                 reply += f"\n\n⚡ (primary was unavailable, answered via {attempt['provider']}/{attempt['model']} instead)"
             print(f"[run_stored_mode_chat] attempt {i}: DECISION = success, returning (created_workflow_id={created_workflow_id})")

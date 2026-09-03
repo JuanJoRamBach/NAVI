@@ -26,7 +26,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Callable
 
-from dispatcher.executor import _parse_tool_args, run_tool_loop
+from dispatcher.executor import _extract_tool_results, _parse_tool_args, run_tool_loop
 from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ChatResponse, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
@@ -169,10 +169,23 @@ def _run_tool_forced_node(system_prompt: str, tool_name: str, prompt: str, prior
     tool_choice = {"type": "function", "function": {"name": tool_name}}
     response, provider, model = _call_for_node(debug_context, messages, tools=tools, tool_choice=tool_choice)
     if response.tool_calls:
-        response, _messages, _iterations = run_tool_loop(
+        response, sent_messages, _iterations = run_tool_loop(
             provider, model, messages, response,
             context={"command": "agent_work", "topic_slug": tool_name}, tools=tools,
         )
+        if not response.text:
+            # The tool call itself genuinely succeeded (real search
+            # results/page content exist in sent_messages) — the model
+            # just failed to write a summary of them, the same flaky-
+            # model "empty reply after a successful tool call" pattern
+            # seen throughout 2026-09-03. Falling back to "(empty reply)"
+            # here silently threw away real material and then got sent
+            # to Telegram verbatim by the next node. The raw tool output
+            # (same helper /research already uses to hand a synthesizer
+            # source material directly) is strictly better than nothing.
+            raw = _extract_tool_results(sent_messages)
+            if raw:
+                return raw
     return response.text or "(empty reply)"
 
 
