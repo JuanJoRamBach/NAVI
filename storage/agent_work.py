@@ -262,6 +262,44 @@ async def list_runs(workflow_id: str | None = None, status: str | None = None, l
     return [dict(r) for r in rows]
 
 
+async def delete_run(run_id: str) -> bool:
+    """Deletes one run and its steps (2026-09-04, JuanJo: "I don't
+    actually wanna know which runs were done so long ago"). No FK
+    cascade defined on agent_run_steps, so both deletes happen here
+    explicitly, in the same connection. Returns whether a run row was
+    actually deleted — deleting a run's steps when the run itself
+    doesn't exist would silently no-op and report success either way,
+    which is the wrong signal for the frontend's "not found" case."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        await db.execute("DELETE FROM agent_run_steps WHERE run_id = ?", (run_id,))
+        cursor = await db.execute("DELETE FROM agent_runs WHERE id = ?", (run_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def delete_all_runs(workflow_id: str | None = None) -> int:
+    """Bulk clear — every run (optionally scoped to one workflow) and
+    all of their steps. Returns how many runs were deleted. Deliberately
+    separate from delete_workflow, which already keeps a workflow's past
+    runs on purpose as an audit trail when the WORKFLOW itself is
+    deleted — this is a distinct, explicit "I don't need this history"
+    action on runs alone, workflow untouched."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        if workflow_id is not None:
+            await db.execute(
+                "DELETE FROM agent_run_steps WHERE run_id IN (SELECT id FROM agent_runs WHERE workflow_id = ?)",
+                (workflow_id,),
+            )
+            cursor = await db.execute("DELETE FROM agent_runs WHERE workflow_id = ?", (workflow_id,))
+        else:
+            await db.execute("DELETE FROM agent_run_steps")
+            cursor = await db.execute("DELETE FROM agent_runs")
+        await db.commit()
+        return cursor.rowcount
+
+
 # ---- agent_run_steps ----
 
 async def create_step(run_id: str, node_id: str, seq: int) -> str:

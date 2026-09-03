@@ -74,6 +74,7 @@ from storage.conversations import (
 )
 from storage.agent_work import (
     create_workflow as create_workflow_definition,
+    delete_all_runs, delete_run,
     delete_workflow as delete_workflow_definition,
     get_run, get_run_steps, get_workflow, list_runs, list_workflows,
 )
@@ -649,12 +650,31 @@ async def agent_list_runs(workflow_id: str | None = None, status: str | None = N
     return await list_runs(workflow_id=workflow_id, status=status)
 
 
+@app.delete("/agent/runs")
+async def agent_delete_all_runs(workflow_id: str | None = None) -> JSONResponse:
+    """Bulk "clear history" (2026-09-04, JuanJo: "I don't actually wanna
+    know which runs were done so long ago") — every run and its steps,
+    optionally scoped to one workflow via ?workflow_id=. The workflow
+    definitions themselves are completely untouched; this only clears
+    what already ran."""
+    deleted = await delete_all_runs(workflow_id=workflow_id)
+    return JSONResponse({"deleted": deleted})
+
+
 @app.get("/agent/runs/{run_id}")
 async def agent_get_run(run_id: str) -> dict:
     run = await get_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="not found")
     return run
+
+
+@app.delete("/agent/runs/{run_id}")
+async def agent_delete_run(run_id: str) -> JSONResponse:
+    deleted = await delete_run(run_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="not found")
+    return JSONResponse({"deleted": True})
 
 
 @app.get("/agent/runs/{run_id}/steps")
