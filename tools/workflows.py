@@ -35,6 +35,7 @@ class WorkflowToolError(Exception):
 
 def create_workflow(
     name: str, description: str | None, steps: list[dict], trigger_description: str | None = None,
+    creation_transcript: str | None = None,
 ) -> str:
     """Returns the new workflow's id.
 
@@ -69,7 +70,7 @@ def create_workflow(
     else:
         trigger = {"type": "manual"}
 
-    return _run_async(_create_workflow(name, description, graph, trigger))
+    return _run_async(_create_workflow(name, description, graph, trigger, creation_transcript))
 
 
 def run_workflow(workflow_id: str) -> str:

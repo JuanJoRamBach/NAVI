@@ -22,6 +22,7 @@ actually breaks, not to pre-solve failures nobody's hit yet.
 """
 
 import asyncio
+import re
 from datetime import datetime, timezone
 
 from dispatcher.executor import CITATION_STYLE_PROMPT, _parse_tool_args, run_tool_loop
@@ -33,6 +34,29 @@ from storage.conversations import append_message, get_messages
 from tools.registry import schemas_for
 
 RECENT_MESSAGE_WINDOW = 20
+
+_CREATE_WORKFLOW_ID_RE = re.compile(r"Created workflow ([0-9a-fA-F-]{36})\.")
+
+
+def _extract_created_workflow_id(sent_messages: list[ChatMessage]) -> str | None:
+    """Agent Work Chat's whole point is that the model, not the user,
+    builds the graph — but the frontend still needs to know WHICH
+    workflow just got created so it can load it onto the canvas as real
+    nodes (2026-09-03, JuanJo: a workflow the chat created should show up
+    as nodes, not just an entry in the Workflows list). tools/registry.py's
+    create_workflow branch returns a fixed "Created workflow <id>." string
+    as its tool-result content; that's the only place the id exists once
+    run_tool_loop has finished, so pulling it out of the transcript here
+    is simpler than widening dispatch()'s return contract for every tool.
+    Returns the LAST match if create_workflow was somehow called more
+    than once in a single turn."""
+    found = None
+    for m in sent_messages:
+        if m.role == "tool" and m.name == "create_workflow" and isinstance(m.content, str):
+            match = _CREATE_WORKFLOW_ID_RE.search(m.content)
+            if match:
+                found = match.group(1)
+    return found
 
 
 def run_mode_chat(mode: str, text: str) -> str:
@@ -244,10 +268,32 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
                     "usage_note": response.usage_note, "choices": options,
                 }
             if tools and response.tool_calls:
-                response, sent_messages, _iterations = await asyncio.to_thread(
+                response, sent_messages, iterations = await asyncio.to_thread(
                     run_tool_loop, provider, attempt["model"], messages, response,
                     context={"command": f"chat-{mode}", "topic_slug": "chat"}, tools=tools,
                 )
+                created_workflow_id = _extract_created_workflow_id(sent_messages)
+                if iterations > 0 and not response.text and not response.tool_calls:
+                    # run_tool_loop actually executed a real tool call here
+                    # (e.g. create_workflow persisted a row, send_to_telegram
+                    # sent a message) — falling through to `continue` below
+                    # would retry the NEXT fallback provider from scratch,
+                    # replaying the same request and re-running that same
+                    # side effect again. 2026-09-03, JuanJo: one "send me a
+                    # Telegram message" request produced 5 duplicate
+                    # workflows this way, one per fallback provider that
+                    # also came back with an empty wrap-up. Once execution
+                    # already happened, an empty wrap-up is a done-but-
+                    # unsummarized outcome, not a failure to retry.
+                    reply = "Done — the action completed, but I didn't get a summary back. Check Workflows / Run History for the result."
+                    await append_message(conversation_id, "navi", reply, provider=attempt["provider"], model=attempt["model"])
+                    return {
+                        "text": reply, "provider": attempt["provider"], "model": attempt["model"],
+                        "usage_note": response.usage_note,
+                        **({"created_workflow_id": created_workflow_id} if created_workflow_id else {}),
+                    }
+            else:
+                created_workflow_id = None
             if not response.text and not response.tool_calls:
                 # A real failure mode, not a valid (if terse) answer — a
                 # model that returns neither text nor a tool call did
@@ -271,6 +317,7 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
             return {
                 "text": reply, "provider": attempt["provider"], "model": attempt["model"],
                 "usage_note": response.usage_note,
+                **({"created_workflow_id": created_workflow_id} if created_workflow_id else {}),
             }
         except ProviderError as e:
             last_error = str(e)

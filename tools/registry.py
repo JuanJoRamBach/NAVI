@@ -243,6 +243,35 @@ def schemas_for(names: list[str]) -> list[dict]:
     return schemas
 
 
+def _build_creation_transcript(chat_messages: list | None) -> str | None:
+    """Renders the Agent Work Chat exchange that led to this create_workflow
+    call into plain "User: ..." / "NAVI: ..." lines — this becomes Agent
+    Vault's "Instructions" if the workflow is later starred (2026-09-03,
+    JuanJo: instructions should be "when the Agent is created using that
+    tab... fed to the Agent Work's chat LLM to create the workflow").
+    Only user/assistant text turns are kept — tool-result payloads
+    (search snippets, run-status JSON) are noise for a human reading this
+    back as "what did I ask for," not part of the actual conversation.
+    `chat_messages` is executor.run_tool_loop's own transcript, threaded
+    in via context; absent (e.g. a manually-built workflow never went
+    through this loop) or empty, this returns None."""
+    if not chat_messages:
+        return None
+    lines = []
+    for m in chat_messages:
+        role = getattr(m, "role", None)
+        content = getattr(m, "content", None)
+        if role not in ("user", "assistant") or not content:
+            continue
+        if isinstance(content, list):
+            content = " ".join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text")
+        content = content.strip()
+        if not content:
+            continue
+        lines.append(f"{'User' if role == 'user' else 'NAVI'}: {content}")
+    return "\n\n".join(lines) if lines else None
+
+
 class ToolExecutionError(Exception):
     pass
 
@@ -294,6 +323,7 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
         if name == "create_workflow":
             workflow_id = create_workflow(
                 arguments["name"], arguments.get("description"), arguments["steps"], arguments.get("trigger_description"),
+                creation_transcript=_build_creation_transcript(context.get("chat_messages")),
             )
             return f"Created workflow {workflow_id}."
 

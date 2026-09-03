@@ -313,7 +313,10 @@ def run_tool_loop(
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {}
-            result_text = dispatch_tool(tc.name, args, context)
+            # chat_messages lets create_workflow (tools/registry.py) capture
+            # the real conversation that led to it, for Agent Vault's
+            # "Instructions" — every other tool call ignores the key.
+            result_text = dispatch_tool(tc.name, args, {**context, "chat_messages": messages})
             messages = messages + [ChatMessage(
                 role="tool", content=result_text, tool_call_id=tc.id, name=tc.name,
             )]

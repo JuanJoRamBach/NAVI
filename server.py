@@ -76,7 +76,7 @@ from storage.agent_work import (
     delete_workflow as delete_workflow_definition,
     get_run, get_run_steps, get_workflow, list_runs, list_workflows,
 )
-from storage.agents import create_agent, delete_agent, get_agent, list_agents, update_agent
+from storage.agents import create_agent, delete_agent, get_agent, get_agent_by_workflow_id, list_agents, update_agent
 from tools.devslate_tools import new_tool_call_id
 
 PORT = int(os.environ.get("PORT", "10000"))
@@ -464,6 +464,12 @@ async def chat_send(request: Request) -> JSONResponse:
         return JSONResponse({
             "reply": reply["text"], "conversation_id": conversation_id,
             "usage_note": reply.get("usage_note"), "choices": reply.get("choices"),
+            # Set only when this turn's create_workflow call actually ran
+            # (dispatcher/chat.py's _extract_created_workflow_id) — lets
+            # AgentWorkChat.tsx load the real graph onto the canvas as
+            # nodes right after the chat builds it, instead of the
+            # workflow only ever showing up in the Workflows list.
+            "created_workflow_id": reply.get("created_workflow_id"),
         })
 
     reply_text, _attachments = _handle_parse_result(result, "pwa", mode, channel="pwa")
@@ -653,6 +659,35 @@ async def agent_get_run(run_id: str) -> dict:
 @app.get("/agent/runs/{run_id}/steps")
 async def agent_get_run_steps(run_id: str) -> list[dict]:
     return await get_run_steps(run_id)
+
+
+# ---- Star a workflow into the Agent Vault (2026-09-03) — a reference, not
+# a copy: the Vault entry's `workflow_id` points back here so running it
+# always executes the live graph, and its "Tools/Nodes" list is derived
+# from the graph client-side rather than duplicated into storage. ----
+
+@app.post("/agent/workflows/{workflow_id}/star")
+async def agent_star_workflow(workflow_id: str) -> dict:
+    existing = await get_agent_by_workflow_id(workflow_id)
+    if existing:
+        return existing
+    workflow = await get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(status_code=404, detail="not found")
+    instructions = workflow.get("creation_transcript") or workflow.get("description") or ""
+    agent_id = await create_agent(
+        workflow["name"], instructions, [], None, None, workflow_id=workflow_id,
+    )
+    return await get_agent(agent_id)
+
+
+@app.delete("/agent/workflows/{workflow_id}/star")
+async def agent_unstar_workflow(workflow_id: str) -> JSONResponse:
+    existing = await get_agent_by_workflow_id(workflow_id)
+    if not existing:
+        return JSONResponse({"deleted": False})
+    await delete_agent(existing["id"])
+    return JSONResponse({"deleted": True})
 
 
 # ---- MCP connections (see dispatcher/mcp_client.py for the actual

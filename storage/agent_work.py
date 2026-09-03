@@ -8,7 +8,7 @@ than sharing conversations.db, since this is a genuinely separate concern
 (workflow definitions and their runs, not chat history).
 
 Schema:
-    workflow_definitions(id, name, description, graph, trigger, created_at, updated_at)
+    workflow_definitions(id, name, description, graph, trigger, creation_transcript, created_at, updated_at)
     agent_runs(id, workflow_id, status, trigger_source, started_at, finished_at, error)
     agent_run_steps(id, run_id, node_id, seq, status, input, output, error, started_at, finished_at)
 
@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS workflow_definitions (
     description TEXT,
     graph TEXT NOT NULL,
     trigger_json TEXT NOT NULL,
+    creation_transcript TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -83,21 +84,36 @@ async def _ensure_schema(db: aiosqlite.Connection) -> None:
     if _initialized:
         return
     await db.executescript(_SCHEMA)
+    # Idempotent add-column migration — covers a workflow_definitions table
+    # that already existed on disk before creation_transcript was added
+    # (CREATE TABLE IF NOT EXISTS above only shapes a brand-new table).
+    async with db.execute("PRAGMA table_info(workflow_definitions)") as cursor:
+        cols = {row[1] for row in await cursor.fetchall()}
+    if "creation_transcript" not in cols:
+        await db.execute("ALTER TABLE workflow_definitions ADD COLUMN creation_transcript TEXT")
     await db.commit()
     _initialized = True
 
 
 # ---- workflow_definitions ----
 
-async def create_workflow(name: str, description: str | None, graph: dict, trigger: dict) -> str:
+async def create_workflow(
+    name: str, description: str | None, graph: dict, trigger: dict, creation_transcript: str | None = None,
+) -> str:
+    """`creation_transcript` is the Agent Work Chat exchange that produced
+    this workflow (user briefs + assistant replies, through the moment
+    this tool was called) — set only when a workflow is built via chat;
+    a manually-authored graph leaves it None. Agent Vault reads it as the
+    starting "Instructions" text when a workflow is starred (see
+    storage/agents.py)."""
     workflow_id = str(uuid.uuid4())
     now = time.time()
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_schema(db)
         await db.execute(
-            "INSERT INTO workflow_definitions (id, name, description, graph, trigger_json, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (workflow_id, name, description, json.dumps(graph), json.dumps(trigger), now, now),
+            "INSERT INTO workflow_definitions (id, name, description, graph, trigger_json, creation_transcript, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (workflow_id, name, description, json.dumps(graph), json.dumps(trigger), creation_transcript, now, now),
         )
         await db.commit()
     return workflow_id
@@ -115,7 +131,7 @@ async def get_workflow(workflow_id: str) -> dict | None:
         await _ensure_schema(db)
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT id, name, description, graph, trigger_json, created_at, updated_at "
+            "SELECT id, name, description, graph, trigger_json, creation_transcript, created_at, updated_at "
             "FROM workflow_definitions WHERE id = ?",
             (workflow_id,),
         ) as cursor:
@@ -128,7 +144,7 @@ async def list_workflows() -> list[dict]:
         await _ensure_schema(db)
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT id, name, description, graph, trigger_json, created_at, updated_at "
+            "SELECT id, name, description, graph, trigger_json, creation_transcript, created_at, updated_at "
             "FROM workflow_definitions ORDER BY created_at DESC"
         ) as cursor:
             rows = await cursor.fetchall()
