@@ -239,16 +239,24 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
     messages[-1].content = f"{messages[-1].content}\n\n[Current UTC time: {datetime.now(timezone.utc).isoformat()}]"
 
     attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
+    attempt_labels = [f"{a['provider']}/{a['model']}" for a in attempts]
+    print(f"[run_stored_mode_chat] mode={mode} conversation={conversation_id} attempts={attempt_labels}")
     last_error = None
     for i, attempt in enumerate(attempts):
+        print(f"[run_stored_mode_chat] attempt {i}: {attempt['provider']}/{attempt['model']}")
         try:
             provider = get_provider(attempt["provider"])
         except Exception as e:
             last_error = str(e)
+            print(f"[run_stored_mode_chat] attempt {i} get_provider failed: {e}")
             continue
         try:
             sent_messages = messages
             response = await asyncio.to_thread(provider.chat, model=attempt["model"], messages=messages, tools=tools)
+            print(
+                f"[run_stored_mode_chat] attempt {i} FIRST reply: "
+                f"text={response.text[:200]!r} tool_calls={[tc.name for tc in response.tool_calls]}"
+            )
             choice_call = next((tc for tc in response.tool_calls if tc.name == "ask_user_choice"), None)
             if choice_call:
                 # Intercepted BEFORE run_tool_loop, not executed through it
@@ -268,11 +276,17 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
                     "usage_note": response.usage_note, "choices": options,
                 }
             if tools and response.tool_calls:
+                print(f"[run_stored_mode_chat] attempt {i}: entering run_tool_loop")
                 response, sent_messages, iterations = await asyncio.to_thread(
                     run_tool_loop, provider, attempt["model"], messages, response,
                     context={"command": f"chat-{mode}", "topic_slug": "chat"}, tools=tools,
                 )
                 created_workflow_id = _extract_created_workflow_id(sent_messages)
+                print(
+                    f"[run_stored_mode_chat] attempt {i}: run_tool_loop returned iterations={iterations} "
+                    f"text={response.text[:200]!r} tool_calls={[tc.name for tc in response.tool_calls]} "
+                    f"created_workflow_id={created_workflow_id}"
+                )
                 if iterations > 0 and not response.text and not response.tool_calls:
                     # run_tool_loop actually executed a real tool call here
                     # (e.g. create_workflow persisted a row, send_to_telegram
@@ -286,6 +300,7 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
                     # already happened, an empty wrap-up is a done-but-
                     # unsummarized outcome, not a failure to retry.
                     reply = "Done — the action completed, but I didn't get a summary back. Check Workflows / Run History for the result."
+                    print(f"[run_stored_mode_chat] attempt {i}: DECISION = stop here (real tool call already ran, empty wrap-up) — NOT retrying fallback")
                     await append_message(conversation_id, "navi", reply, provider=attempt["provider"], model=attempt["model"])
                     return {
                         "text": reply, "provider": attempt["provider"], "model": attempt["model"],
@@ -305,6 +320,7 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
                 # "succeeding" with an unhelpful "(empty reply)" placeholder
                 # and nothing having happened.
                 last_error = f"{attempt['provider']}/{attempt['model']} returned neither text nor a tool call"
+                print(f"[run_stored_mode_chat] attempt {i}: DECISION = retry next fallback ({last_error})")
                 await asyncio.to_thread(
                     save_failed_exchange, role_context, attempt["provider"], attempt["model"],
                     sent_messages, last_error, response.raw,
@@ -313,6 +329,7 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
             reply = response.text or "(empty reply)"
             if i > 0:
                 reply += f"\n\n⚡ (primary was unavailable, answered via {attempt['provider']}/{attempt['model']} instead)"
+            print(f"[run_stored_mode_chat] attempt {i}: DECISION = success, returning (created_workflow_id={created_workflow_id})")
             await append_message(conversation_id, "navi", reply, provider=attempt["provider"], model=attempt["model"])
             return {
                 "text": reply, "provider": attempt["provider"], "model": attempt["model"],
@@ -321,6 +338,7 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
             }
         except ProviderError as e:
             last_error = str(e)
+            print(f"[run_stored_mode_chat] attempt {i}: DECISION = retry next fallback (ProviderError: {last_error})")
             await asyncio.to_thread(
                 save_failed_exchange, role_context, attempt["provider"], attempt["model"], messages, last_error,
             )

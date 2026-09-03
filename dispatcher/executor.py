@@ -298,6 +298,7 @@ def run_tool_loop(
     free-form mode-based chat, not just /research's command chain."""
     tools = tools if tools is not None else TOOL_SCHEMAS
     iterations = 0
+    print(f"[run_tool_loop] start model={model} initial_tool_calls={[tc.name for tc in response.tool_calls]}")
     while response.tool_calls and iterations < MAX_TOOL_ITERATIONS:
         raw_choice = ((response.raw or {}).get("choices") or [{}])[0].get("message", {})
         messages = messages + [ChatMessage(
@@ -313,17 +314,24 @@ def run_tool_loop(
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {}
+            print(f"[run_tool_loop] iteration={iterations} CALLING tool={tc.name} args={args}")
             # chat_messages lets create_workflow (tools/registry.py) capture
             # the real conversation that led to it, for Agent Vault's
             # "Instructions" — every other tool call ignores the key.
             result_text = dispatch_tool(tc.name, args, {**context, "chat_messages": messages})
+            print(f"[run_tool_loop] iteration={iterations} RESULT tool={tc.name} result={result_text[:300]!r}")
             messages = messages + [ChatMessage(
                 role="tool", content=result_text, tool_call_id=tc.id, name=tc.name,
             )]
 
         response = provider.chat(model=model, messages=messages, tools=tools)
         iterations += 1
+        print(
+            f"[run_tool_loop] iteration={iterations} model replied "
+            f"text={response.text[:200]!r} next_tool_calls={[tc.name for tc in response.tool_calls]}"
+        )
 
+    print(f"[run_tool_loop] done after {iterations} iteration(s), final text={response.text[:200]!r}")
     return response, messages, iterations
 
 
