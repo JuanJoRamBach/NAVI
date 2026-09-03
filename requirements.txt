@@ -9,3 +9,4 @@ fastapi
 uvicorn[standard]
 aiosqlite
 croniter
+mcp>=2,<3

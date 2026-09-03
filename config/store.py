@@ -209,6 +209,32 @@ DEFAULTS = {
     "storage": {
         "filen_configured": False,
     },
+    # MCP connections — server_name -> connection config + per-tool
+    # security baseline. Separate from "providers" above on purpose:
+    # provider keys authenticate NAVI's own LLM calls, mcp_connections
+    # authenticate NAVI's dispatcher to a real third-party system on the
+    # company's behalf (see dispatcher/mcp_client.py's own docstring for
+    # the full security model — rug-pull hash pinning, read/write
+    # classification, tool poisoning defense).
+    #
+    # server_name -> {
+    #   "transport": "stdio" | "http",
+    #   "command": str | None, "args": list[str] | None,  # stdio only
+    #   "url": str | None,                                 # http only
+    #   "auth_header": str | None,   # e.g. "Bearer <token>" — sent as-is
+    #   "connected": bool,
+    #   "tools": {
+    #     tool_name: {
+    #       "hash": str,             # sha256 of name+description+inputSchema at approval time
+    #       "description": str,      # sanitized, pinned at approval time — schema-building
+    #       "input_schema": dict,    # reads this instead of re-fetching live every call
+    #       "read_only": bool,       # NAVI's own effective classification, seeded from
+    #                                 # the server's readOnlyHint but not blindly trusted after
+    #       "approved_at": float,    # epoch seconds
+    #     }
+    #   }
+    # }
+    "mcp_connections": {},
     # Standard 5-field Unix cron syntax — dispatcher/scheduler.py parses
     # this (via croniter) to fire check_due_workflows() in-process, no
     # external ping/crontab entry needed (2026-09-01, JuanJo's call:
@@ -295,6 +321,66 @@ class ConfigStore:
             "primary": primary, "fallback": fallback,
         }
         self._save()
+
+    # ---- MCP connections (see DEFAULTS["mcp_connections"] for shape) ----
+
+    def set_mcp_connection(
+        self, name: str, transport: str, *,
+        command: str | None = None, args: list[str] | None = None, env: dict | None = None,
+        url: str | None = None, auth_header: str | None = None,
+    ):
+        """Registers or updates a connection's transport config. Does NOT
+        mark it connected or touch its tool baseline — that happens once
+        dispatcher/mcp_client.py actually completes a handshake and lists
+        tools, via set_mcp_tool_baseline below. `env` is extra environment
+        variables for a stdio server beyond what mcp_client.py already
+        forces (PYTHONUNBUFFERED) — most connections won't need this."""
+        existing = self._data.setdefault("mcp_connections", {}).get(name, {})
+        self._data["mcp_connections"][name] = {
+            **existing,
+            "transport": transport, "command": command, "args": args, "env": env,
+            "url": url, "auth_header": auth_header,
+            "connected": existing.get("connected", False),
+            "tools": existing.get("tools", {}),
+        }
+        self._save()
+
+    def get_mcp_connection(self, name: str) -> dict | None:
+        return self._data.get("mcp_connections", {}).get(name)
+
+    def list_mcp_connections(self) -> dict[str, dict]:
+        return self._data.get("mcp_connections", {})
+
+    def remove_mcp_connection(self, name: str):
+        self._data.get("mcp_connections", {}).pop(name, None)
+        self._save()
+
+    def set_mcp_connected(self, name: str, connected: bool):
+        conn = self._data.get("mcp_connections", {}).get(name)
+        if conn is None:
+            return
+        conn["connected"] = connected
+        self._save()
+
+    def set_mcp_tool_baseline(
+        self, server: str, tool_name: str, tool_hash: str, description: str, input_schema: dict, read_only: bool,
+    ):
+        """Pins a tool's approved definition — the rug-pull defense. Called
+        once per tool, right after its description has been sanitized and
+        hashed at connect/re-approval time (never from inside a live call).
+        Stores description/input_schema alongside the hash so schema-
+        building (tools/mcp_registry.py) reads the pinned snapshot instead
+        of a live server round-trip on every request."""
+        import time
+        conn = self._data.setdefault("mcp_connections", {}).setdefault(server, {"tools": {}})
+        conn.setdefault("tools", {})[tool_name] = {
+            "hash": tool_hash, "description": description, "input_schema": input_schema,
+            "read_only": read_only, "approved_at": time.time(),
+        }
+        self._save()
+
+    def get_mcp_tool_baseline(self, server: str, tool_name: str) -> dict | None:
+        return self._data.get("mcp_connections", {}).get(server, {}).get("tools", {}).get(tool_name)
 
     # ---- Generic get/set for anything else ----
 

@@ -25,6 +25,8 @@ from tools.workflows import (
     list_workflow_runs,
     run_workflow,
 )
+from tools.mcp_registry import is_mcp_tool, schemas_for_connected_servers
+from tools.mcp_registry import dispatch as dispatch_mcp_tool
 
 TOOL_SCHEMAS = [
     {
@@ -226,8 +228,19 @@ TOOL_SCHEMAS = [
 def schemas_for(names: list[str]) -> list[dict]:
     """Filters TOOL_SCHEMAS down to the subset a mode's brief allows —
     used so a mode's frontmatter `tools: [...]` list controls what the
-    model can actually call, not just what it's told in prose."""
-    return [s for s in TOOL_SCHEMAS if s["function"]["name"] in names]
+    model can actually call, not just what it's told in prose.
+
+    A mode opts into MCP tools with the sentinel "mcp" in its tools list,
+    not by naming individual mcp__<server>__<tool> entries — those are
+    dynamic per company/connection, so a mode's static frontmatter can't
+    enumerate them ahead of time. When present, every APPROVED tool on
+    every CONNECTED server is attached (see tools/mcp_registry.py's own
+    per-connection gating — a disconnected service's tools are never
+    attached regardless of this sentinel)."""
+    schemas = [s for s in TOOL_SCHEMAS if s["function"]["name"] in names]
+    if "mcp" in names:
+        schemas += schemas_for_connected_servers()
+    return schemas
 
 
 class ToolExecutionError(Exception):
@@ -245,6 +258,15 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
     the step's final output.
     """
     try:
+        if is_mcp_tool(name):
+            # Routed, never executed inline here — dispatcher/mcp_client.py
+            # is the only code with a live connection to the real server,
+            # and tools/mcp_registry.py's own dispatch() is what applies
+            # the write-confirmation gate before it ever gets there. This
+            # function never touches an MCP server directly, on purpose —
+            # JuanJo: "I don't want to mix them."
+            return dispatch_mcp_tool(name, arguments, context)
+
         if name == "web_search":
             query = arguments["query"]
             max_results = int(arguments.get("max_results", 5))
