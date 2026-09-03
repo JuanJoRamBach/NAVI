@@ -20,10 +20,13 @@ storage layer, since aiosqlite connections aren't loop-agnostic.
 """
 
 import asyncio
+import tempfile
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
 
 from dispatcher.executor import _extract_tool_results, _parse_tool_args, run_tool_loop
@@ -34,9 +37,19 @@ from storage.agent_work import (
     complete_step, create_step, create_run, due_workflows, get_workflow,
     set_step_input, update_run_status, update_workflow_trigger,
 )
+from tools.documents import DocumentRenderError, render_pdf
 from tools.notes import NoteError, save_note
 from tools.registry import schemas_for
-from tools.telegram_send import TelegramSendError, send_to_telegram
+from tools.telegram_send import TelegramSendError, send_file_to_telegram, send_to_telegram
+
+# Marks a node's string output as a reference to a real file on disk
+# rather than literal text to send/save as-is — currently only produced
+# by an Output node with output_type="pdf" (see _run_output_node) and
+# consumed by _run_send_telegram_node. A plain temp-file convention, not
+# a new storage layer: the file only needs to survive from one step to
+# the next within the SAME workflow run, which already executes start to
+# finish in one process (see this module's own docstring).
+FILE_OUTPUT_PREFIX = "navi-file://"
 
 # --- Node functions (2026-09-02) ---
 # Each workflow step is executed by a plain function with FIXED logic —
@@ -206,11 +219,21 @@ def _run_send_telegram_node(prompt: str, prior_context: str | None) -> str:
     (already-composed at workflow-creation time, not something to
     re-generate now). Raises WorkflowError on a real send failure
     (missing credentials, Telegram API error) — same disclosure
-    principle as every other node."""
+    principle as every other node.
+
+    FILE_OUTPUT_PREFIX (2026-09-03) is the one exception to "text" —
+    when the immediately preceding step was an Output node with
+    output_type="pdf", prior_context is a marked file path rather than
+    real message text; sent as a real Telegram document attachment
+    (send_file_to_telegram, tools/telegram_send.py) instead of stuffing
+    a local temp path into a chat message."""
     text = prior_context or prompt
     if not text:
         raise WorkflowError("send_to_telegram step has no text to send (empty prompt, no prior step output)")
     try:
+        if text.startswith(FILE_OUTPUT_PREFIX):
+            path = text[len(FILE_OUTPUT_PREFIX):]
+            return send_file_to_telegram(path, Path(path).name)
         return send_to_telegram(text)
     except TelegramSendError as e:
         raise WorkflowError(str(e))
@@ -257,17 +280,36 @@ def _run_input_node(prompt: str, prior_context: str | None) -> str:
     return prompt
 
 
-def _run_output_node(prompt: str, prior_context: str | None) -> str:
+def _run_output_node(prompt: str, prior_context: str | None, output_type: str | None = None) -> str:
     """No LLM call, ever — same reasoning as _run_input_node. An Output
-    node's whole job is returning whatever fed into it (a sub-agent
+    node's default job is returning whatever fed into it (a sub-agent
     handing a computed value back to whatever embeds it, per the Agent
     Vault design — see storage/agents.py), not taking a real-world
-    action itself the way send_to_telegram/save_note do. Falls back to
-    its own literal prompt only if genuinely nothing upstream produced
-    anything, so an Output node never silently returns empty."""
+    action itself the way send_to_telegram/save_note do.
+
+    output_type (2026-09-03, JuanJo: "create an output node before
+    sending to telegram with pdf as output, we already have that" — the
+    Agent Vault output_type vocabulary, chat/pdf/markdown) is the one
+    exception: "pdf" renders the text into a real file (via
+    tools/documents.py's render_pdf, already Unicode-safe — same
+    renderer /research's own file-export path uses) and returns a
+    FILE_OUTPUT_PREFIX-marked path instead of the raw text, which
+    _run_send_telegram_node below recognizes and sends as an attachment
+    rather than stuffing a file path into a chat message. Anything else
+    (None, "chat", "markdown") is the original plain pass-through —
+    markdown text renders fine as-is in a Telegram message, no separate
+    handling needed."""
     result = prior_context or prompt
     if not result:
         raise WorkflowError("Output step has nothing to return (no prior step output, no literal value set).")
+    if output_type == "pdf":
+        try:
+            pdf_bytes = render_pdf("NAVI Workflow Output", result)
+        except DocumentRenderError as e:
+            raise WorkflowError(f"PDF rendering failed: {e}")
+        path = Path(tempfile.gettempdir()) / f"navi-output-{uuid.uuid4().hex}.pdf"
+        path.write_bytes(pdf_bytes)
+        return f"{FILE_OUTPUT_PREFIX}{path}"
     return result
 
 
@@ -362,6 +404,13 @@ def _run_node(node: dict, prior_context: str | None = None) -> str:
     if not tool_names:
         return _run_text_node(prompt, prior_context)
     if len(tool_names) == 1 and tool_names[0] in SINGLE_TOOL_NODE_HANDLERS:
+        if tool_names[0] == "output":
+            # The only node whose behavior varies by a field beyond
+            # prompt/prior_context (2026-09-03: "create an output node
+            # before sending to telegram with pdf as output") — kept as a
+            # narrow special case rather than widening every handler's
+            # signature for one node kind.
+            return _run_output_node(prompt, prior_context, node.get("output_type"))
         return SINGLE_TOOL_NODE_HANDLERS[tool_names[0]](prompt, prior_context)
     return _run_generic_multi_tool_node(tool_names, prompt, prior_context)
 
