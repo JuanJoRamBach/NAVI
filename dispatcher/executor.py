@@ -277,6 +277,25 @@ MAX_TOOL_ITERATIONS = 5
 # provider re-issuing the same tool call within its own turn.
 _NON_IDEMPOTENT_TOOLS = {"create_workflow", "run_workflow", "send_to_telegram", "save_note"}
 
+# create_workflow specifically gets a HARDER rule than the identical-args
+# dedup above: at most one real execution per run_tool_loop call, full
+# stop, no matter what arguments the model uses on later attempts.
+# 2026-09-03, JuanJo, real evidence from production: a single stateless
+# Agent Work Chat turn (one "send Hola to my telegram" message, confirmed
+# by identical creation_transcript timestamps) called create_workflow 4
+# times, each with a DIFFERENT name ("Send Hola", "Send Hola Telegram",
+# "Send Hola to Telegram", "Send Hola Telegram" again) — the identical-
+# args guard above never caught it because the arguments genuinely
+# differed each time; the model wasn't repeating itself, it was retrying
+# with variations, seemingly not registering "Created workflow X." as a
+# real success. Same root cause explained why no Telegram message ever
+# arrived: none of the 4 was ever run — the model stayed stuck re-trying
+# creation and never reached its own brief's "call run_workflow" step.
+# One workflow per turn is also just the correct semantics here — Agent
+# Work Chat's whole job for a given message is building ONE workflow (or
+# running/checking one), never several.
+_ONCE_PER_TURN_TOOLS = {"create_workflow"}
+
 # Tells the model to cite sources as Markdown links rather than pasting
 # bare URLs — both messaging adapters render [text](url) as a clickable
 # link (Telegram via an HTML conversion, Discord natively), so this is
@@ -316,6 +335,7 @@ def run_tool_loop(
     # empty, since that path is already guarded separately (see
     # dispatcher/chat.py's own DECISION-to-stop logic).
     already_executed: dict[tuple[str, str], str] = {}
+    once_per_turn_executed: dict[str, str] = {}
     print(f"[run_tool_loop] start model={model} initial_tool_calls={[tc.name for tc in response.tool_calls]}")
     while response.tool_calls and iterations < MAX_TOOL_ITERATIONS:
         raw_choice = ((response.raw or {}).get("choices") or [{}])[0].get("message", {})
@@ -333,7 +353,22 @@ def run_tool_loop(
                 except json.JSONDecodeError:
                     args = {}
             dedup_key = (tc.name, json.dumps(args, sort_keys=True)) if tc.name in _NON_IDEMPOTENT_TOOLS else None
-            if dedup_key is not None and dedup_key in already_executed:
+            if tc.name in _ONCE_PER_TURN_TOOLS and tc.name in once_per_turn_executed:
+                # Hard stop regardless of arguments — see _ONCE_PER_TURN_TOOLS'
+                # own comment. Feeds the model an explicit correction (not
+                # just a silent repeat of the same result, which is what the
+                # softer identical-args guard below does) — the whole point
+                # is nudging it toward its next real step (run_workflow, or
+                # just reporting success) instead of retrying creation again.
+                prior_result = once_per_turn_executed[tc.name]
+                result_text = (
+                    f"Already done this turn: {prior_result} Do not call {tc.name} again — "
+                    "it already succeeded, calling it again would create a duplicate. If the user "
+                    "wants it to run right now, call run_workflow with the workflow_id from that "
+                    "result. Otherwise, just report it's been created."
+                )
+                print(f"[run_tool_loop] iteration={iterations} BLOCKED repeat call tool={tc.name} args={args} (already executed once this turn)")
+            elif dedup_key is not None and dedup_key in already_executed:
                 result_text = already_executed[dedup_key]
                 print(f"[run_tool_loop] iteration={iterations} SKIPPED duplicate call tool={tc.name} args={args} (reusing prior result)")
             else:
@@ -343,6 +378,8 @@ def run_tool_loop(
                 # "Instructions" — every other tool call ignores the key.
                 result_text = dispatch_tool(tc.name, args, {**context, "chat_messages": messages})
                 print(f"[run_tool_loop] iteration={iterations} RESULT tool={tc.name} result={result_text[:300]!r}")
+                if tc.name in _ONCE_PER_TURN_TOOLS:
+                    once_per_turn_executed[tc.name] = result_text
                 if dedup_key is not None:
                     already_executed[dedup_key] = result_text
             messages = messages + [ChatMessage(
