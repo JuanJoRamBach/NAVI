@@ -353,10 +353,10 @@ def run_tool_loop(
         iterations += 1
         print(
             f"[run_tool_loop] iteration={iterations} model replied "
-            f"text={response.text[:200]!r} next_tool_calls={[tc.name for tc in response.tool_calls]}"
+            f"text={(response.text or '')[:200]!r} next_tool_calls={[tc.name for tc in response.tool_calls]}"
         )
 
-    print(f"[run_tool_loop] done after {iterations} iteration(s), final text={response.text[:200]!r}")
+    print(f"[run_tool_loop] done after {iterations} iteration(s), final text={(response.text or '')[:200]!r}")
     return response, messages, iterations
 
 

@@ -258,7 +258,7 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
             response = await asyncio.to_thread(provider.chat, model=attempt["model"], messages=messages, tools=tools)
             print(
                 f"[run_stored_mode_chat] attempt {i} FIRST reply: "
-                f"text={response.text[:200]!r} tool_calls={[tc.name for tc in response.tool_calls]}"
+                f"text={(response.text or '')[:200]!r} tool_calls={[tc.name for tc in response.tool_calls]}"
             )
             choice_call = next((tc for tc in response.tool_calls if tc.name == "ask_user_choice"), None)
             if choice_call:
@@ -287,7 +287,7 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
                 created_workflow_id = _extract_created_workflow_id(sent_messages)
                 print(
                     f"[run_stored_mode_chat] attempt {i}: run_tool_loop returned iterations={iterations} "
-                    f"text={response.text[:200]!r} tool_calls={[tc.name for tc in response.tool_calls]} "
+                    f"text={(response.text or '')[:200]!r} tool_calls={[tc.name for tc in response.tool_calls]} "
                     f"created_workflow_id={created_workflow_id}"
                 )
                 if iterations > 0 and not response.text and not response.tool_calls:
