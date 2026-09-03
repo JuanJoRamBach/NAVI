@@ -76,6 +76,7 @@ from storage.agent_work import (
     delete_workflow as delete_workflow_definition,
     get_run, get_run_steps, get_workflow, list_runs, list_workflows,
 )
+from storage.agents import create_agent, delete_agent, get_agent, list_agents, update_agent
 from tools.devslate_tools import new_tool_call_id
 
 PORT = int(os.environ.get("PORT", "10000"))
@@ -735,6 +736,58 @@ async def mcp_approve_tools(name: str, request: Request) -> JSONResponse:
     to_approve = [t for t in discovered if t["name"] in tool_names]
     approve_tools(name, to_approve)
     return JSONResponse({"approved": [t["name"] for t in to_approve]})
+
+
+# ---- Agent Vault (2026-09-03) — saved, reusable agent configs. Separate
+# from /agent/workflows on purpose: a saved agent isn't a workflow (see
+# storage/agents.py's own docstring) — "Open in canvas" on the frontend
+# is the one-way fork that turns one into the other, not a live link. ----
+
+@app.post("/agents")
+async def agents_create(request: Request) -> JSONResponse:
+    payload = await request.json()
+    name = payload.get("name")
+    instructions = payload.get("instructions")
+    if not name or not instructions:
+        return JSONResponse({"error": "name and instructions are required"}, status_code=400)
+    agent_id = await create_agent(
+        name, instructions, payload.get("tools", []), payload.get("model"), payload.get("output_type"),
+    )
+    return JSONResponse({"id": agent_id})
+
+
+@app.get("/agents")
+async def agents_list() -> list[dict]:
+    return await list_agents()
+
+
+@app.get("/agents/{agent_id}")
+async def agents_get(agent_id: str) -> dict:
+    agent = await get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="not found")
+    return agent
+
+
+@app.put("/agents/{agent_id}")
+async def agents_update(agent_id: str, request: Request) -> JSONResponse:
+    payload = await request.json()
+    name = payload.get("name")
+    instructions = payload.get("instructions")
+    if not name or not instructions:
+        return JSONResponse({"error": "name and instructions are required"}, status_code=400)
+    await update_agent(
+        agent_id, name, instructions, payload.get("tools", []), payload.get("model"), payload.get("output_type"),
+    )
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/agents/{agent_id}")
+async def agents_delete(agent_id: str) -> JSONResponse:
+    deleted = await delete_agent(agent_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="not found")
+    return JSONResponse({"ok": True})
 
 
 # ---- Dev Slate: the live chat WebSocket ----
