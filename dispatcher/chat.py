@@ -117,43 +117,28 @@ def run_mode_chat(mode: str, text: str) -> str:
     return f"⚠️ normal_chat failed on every configured provider: {last_error}"
 
 
-# Agent Work's "review changes" mode (2026-09-01) — same review-vs-
-# auto-accept *concept* as Dev Slate's EditModeSelector, but a genuinely
-# different mechanism underneath: Dev Slate can literally pause mid-tool-
-# call and await the browser's Accept/Reject over its live WebSocket
-# (see dispatcher/devslate_chat.py's requestWriteReview). Agent Work's
-# chat is plain stateless REST — there's no live connection to pause on,
-# so there's nothing to await mid-request. This achieves the same
-# *behavior* (nothing gets created/run without the user seeing it first)
-# through prompt instruction instead: the model is told to describe what
-# it would do and wait for explicit confirmation on a LATER turn before
-# actually calling create_workflow/run_workflow. Less airtight than a
-# real gate (a model could still ignore the instruction), but the only
-# option available without adding a live connection just for this.
-AGENT_WORK_REVIEW_INSTRUCTION = (
-    "Before calling create_workflow or run_workflow, first describe what "
-    "you're about to create or run, then call ask_user_choice with that "
-    "description as the question and options like ['Yes, create it', "
-    "'No, let me revise it'] — don't just ask in plain text. Only call "
-    "create_workflow/run_workflow after they've picked (or typed) an "
-    "explicit yes in a later message — never on the same turn you proposed it."
-)
+# Agent Work's old "review changes" mode (2026-09-01 - 2026-09-03) lived
+# here as a prompt instruction telling the model to describe its plan and
+# wait for an explicit "yes" on a LATER turn before actually calling
+# create_workflow/run_workflow — the only option available without a live
+# connection to pause on, mirroring Dev Slate's EditModeSelector concept.
+# Removed 2026-09-03 once agent_work went stateless (JuanJo: "no context.md
+# for the chat... it should just create"): a confirm-on-a-later-turn design
+# cannot work once the model no longer sees its own earlier turns.
+# auto_accept is kept as a parameter (harmless no-op for agent_work now,
+# still meaningful for nothing else) purely so no caller needs updating.
 
 
 async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_accept: bool = True) -> dict:
     """Persisted sibling of run_mode_chat above — appends the user's
     message, replays a windowed slice of REAL history (not just this one
-    message) alongside the mode's brief, calls the model, persists the
-    reply. Returns {text, provider, model} (provider/model reflect
-    whichever fallback actually answered, mirroring
-    dispatcher/devslate_chat.py's run_devslate_turn, which this is
-    deliberately modeled on — same role-selection/fallback/tool-loop
+    message, except for agent_work — see below) alongside the mode's
+    brief, calls the model, persists the reply. Returns {text, provider,
+    model} (provider/model reflect whichever fallback actually answered,
+    mirroring dispatcher/devslate_chat.py's run_devslate_turn, which this
+    is deliberately modeled on — same role-selection/fallback/tool-loop
     shape as run_mode_chat above, just with storage/conversations.py
-    wrapped around it instead of nothing.
-
-    auto_accept only means anything for mode == "agent_work" (see
-    AGENT_WORK_REVIEW_INSTRUCTION above) — defaults True so every other
-    mode's behavior is completely unaffected by this parameter existing."""
+    wrapped around it instead of nothing."""
     await append_message(conversation_id, "user", text)
 
     brief = get_mode_brief(mode)
@@ -195,8 +180,12 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
     system_parts = [brief.system_prompt]
     if tools:
         system_parts.append(CITATION_STYLE_PROMPT)
-    if mode == "agent_work" and not auto_accept:
-        system_parts.append(AGENT_WORK_REVIEW_INSTRUCTION)
+    # AGENT_WORK_REVIEW_INSTRUCTION's "confirm on a LATER message" design
+    # requires the model to remember its own proposal on a future turn —
+    # incompatible with agent_work now being stateless (2026-09-03,
+    # JuanJo: "no context.md for the chat... just needs the LLM to create
+    # the json schema with the steps"). auto_accept stays a harmless no-op
+    # parameter for every other mode.
     messages = [ChatMessage(role="system", content="\n\n".join(system_parts))]
     # The just-appended user message is already the last row `history`
     # returns (get_messages reads it back from storage) — not double
@@ -213,10 +202,24 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
     # Still shown to the user in the UI (this only filters what's SENT to
     # the model, not what's persisted/displayed) — see get_messages calls
     # elsewhere, unaffected by this.
-    for m in history:
-        if m["role"] == "navi" and m["content"].startswith("⚠️"):
-            continue
-        messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
+    #
+    # agent_work is deliberately stateless (2026-09-03, JuanJo: "we
+    # actually make Agent Work Chat have no context. it should just
+    # create, it doesn't need any context") — each message is a
+    # standalone "build/run this" instruction, not a turn in an ongoing
+    # conversation. Replaying old turns was also part of what let a
+    # flaky model's confusion compound across turns (a stale tool result
+    # or an earlier vague reply sitting in context, nudging a later
+    # attempt toward repeating work). Still fully persisted via
+    # append_message above/below for the frontend's own display
+    # history — this only changes what's SENT to the model.
+    if mode == "agent_work":
+        messages.append(ChatMessage(role="user", content=text))
+    else:
+        for m in history:
+            if m["role"] == "navi" and m["content"].startswith("⚠️"):
+                continue
+            messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
     # UTC time grounding (JuanJo, 2026-09-01: "if it asks for something
     # close to 'do it in X time', must send the messages with a UTC
     # signal") — the model has no inherent sense of "now," so a request

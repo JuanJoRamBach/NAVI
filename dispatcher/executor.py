@@ -264,6 +264,19 @@ GRAPH_DATA_SYSTEM_PROMPT = (
 # tools instead of answering can't spin forever and burn the day's quota.
 MAX_TOOL_ITERATIONS = 5
 
+# Tools whose side effect is real and non-idempotent — calling one twice
+# with identical arguments doesn't "check again," it repeats the action
+# (a second Telegram message, a second scheduled workflow, a second run).
+# Deliberately NOT every tool: get_run_status/list_workflow_runs/
+# web_search/fetch_page can legitimately return a different answer on a
+# repeat call (time passed, a run's status changed) — guarding those
+# would serve stale/wrong data instead of a fresh check. 2026-09-03,
+# JuanJo: one "send me a Telegram message" request produced 5, then 10,
+# duplicate workflows — this guards the case that survives even after
+# dispatcher/chat.py stopped retrying a NEW fallback provider: the SAME
+# provider re-issuing the same tool call within its own turn.
+_NON_IDEMPOTENT_TOOLS = {"create_workflow", "run_workflow", "send_to_telegram", "save_note"}
+
 # Tells the model to cite sources as Markdown links rather than pasting
 # bare URLs — both messaging adapters render [text](url) as a clickable
 # link (Telegram via an HTML conversion, Discord natively), so this is
@@ -298,6 +311,11 @@ def run_tool_loop(
     free-form mode-based chat, not just /research's command chain."""
     tools = tools if tools is not None else TOOL_SCHEMAS
     iterations = 0
+    # Scoped to this one run_tool_loop call only — a fresh call (a new
+    # provider attempt in dispatcher/chat.py's fallback chain) starts
+    # empty, since that path is already guarded separately (see
+    # dispatcher/chat.py's own DECISION-to-stop logic).
+    already_executed: dict[tuple[str, str], str] = {}
     print(f"[run_tool_loop] start model={model} initial_tool_calls={[tc.name for tc in response.tool_calls]}")
     while response.tool_calls and iterations < MAX_TOOL_ITERATIONS:
         raw_choice = ((response.raw or {}).get("choices") or [{}])[0].get("message", {})
@@ -314,12 +332,19 @@ def run_tool_loop(
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {}
-            print(f"[run_tool_loop] iteration={iterations} CALLING tool={tc.name} args={args}")
-            # chat_messages lets create_workflow (tools/registry.py) capture
-            # the real conversation that led to it, for Agent Vault's
-            # "Instructions" — every other tool call ignores the key.
-            result_text = dispatch_tool(tc.name, args, {**context, "chat_messages": messages})
-            print(f"[run_tool_loop] iteration={iterations} RESULT tool={tc.name} result={result_text[:300]!r}")
+            dedup_key = (tc.name, json.dumps(args, sort_keys=True)) if tc.name in _NON_IDEMPOTENT_TOOLS else None
+            if dedup_key is not None and dedup_key in already_executed:
+                result_text = already_executed[dedup_key]
+                print(f"[run_tool_loop] iteration={iterations} SKIPPED duplicate call tool={tc.name} args={args} (reusing prior result)")
+            else:
+                print(f"[run_tool_loop] iteration={iterations} CALLING tool={tc.name} args={args}")
+                # chat_messages lets create_workflow (tools/registry.py) capture
+                # the real conversation that led to it, for Agent Vault's
+                # "Instructions" — every other tool call ignores the key.
+                result_text = dispatch_tool(tc.name, args, {**context, "chat_messages": messages})
+                print(f"[run_tool_loop] iteration={iterations} RESULT tool={tc.name} result={result_text[:300]!r}")
+                if dedup_key is not None:
+                    already_executed[dedup_key] = result_text
             messages = messages + [ChatMessage(
                 role="tool", content=result_text, tool_call_id=tc.id, name=tc.name,
             )]
