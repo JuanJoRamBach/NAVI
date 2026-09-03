@@ -52,6 +52,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from dispatcher.agent_work import WorkflowError, check_due_workflows, start_workflow_run
+from dispatcher.mcp_client import MCPError, approve_tools, discover_tools
 from dispatcher.scheduler import register_job, start_scheduler
 from dispatcher.chat import run_mode_chat, run_stored_mode_chat
 from dispatcher.devslate_chat import run_devslate_turn
@@ -651,6 +652,89 @@ async def agent_get_run(run_id: str) -> dict:
 @app.get("/agent/runs/{run_id}/steps")
 async def agent_get_run_steps(run_id: str) -> list[dict]:
     return await get_run_steps(run_id)
+
+
+# ---- MCP connections (see dispatcher/mcp_client.py for the actual
+# client/security model — this is just the REST surface over it) ----
+
+@app.post("/mcp/connections")
+async def mcp_create_connection(request: Request) -> JSONResponse:
+    """Registers a connection's transport config — does NOT connect yet,
+    that's the separate /connect call below, since a live handshake can
+    be slow or fail and shouldn't block "just save what I typed"."""
+    payload = await request.json()
+    name = payload.get("name")
+    transport = payload.get("transport")
+    if not name or transport not in ("stdio", "http"):
+        return JSONResponse({"error": "name and transport ('stdio' or 'http') are required"}, status_code=400)
+    config.set_mcp_connection(
+        name, transport,
+        command=payload.get("command"), args=payload.get("args"), env=payload.get("env"),
+        url=payload.get("url"), auth_header=payload.get("auth_header"),
+    )
+    return JSONResponse({"ok": True})
+
+
+@app.get("/mcp/connections")
+async def mcp_list_connections() -> list[dict]:
+    # Never echoes auth_header back — a saved token is write-only from
+    # the client's perspective from here on, same principle as a
+    # password field never round-tripping its own value.
+    return [
+        {
+            "name": name, "transport": conn.get("transport"), "connected": conn.get("connected", False),
+            "tools": [
+                {"name": tool_name, "read_only": t["read_only"], "approved_at": t["approved_at"]}
+                for tool_name, t in conn.get("tools", {}).items()
+            ],
+        }
+        for name, conn in config.list_mcp_connections().items()
+    ]
+
+
+@app.delete("/mcp/connections/{name}")
+async def mcp_delete_connection(name: str) -> JSONResponse:
+    config.remove_mcp_connection(name)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/mcp/connections/{name}/connect")
+async def mcp_connect(name: str) -> JSONResponse:
+    """Real handshake + tool discovery. Tools the server has never shown
+    before ("new") are auto-approved — the user just configured this
+    connection themselves, so first trust is reasonable. Tools whose
+    definition changed since a prior approval ("changed" — the rug-pull
+    case) are deliberately left unapproved for /approve below to handle;
+    silently re-trusting a changed tool here would defeat the entire
+    point of pinning it in the first place."""
+    try:
+        discovered = await asyncio.to_thread(discover_tools, name)
+    except MCPError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    new_tools = [t for t in discovered if t["status"] == "new"]
+    if new_tools:
+        approve_tools(name, new_tools)
+    config.set_mcp_connected(name, True)
+    return JSONResponse({"tools": discovered})
+
+
+@app.post("/mcp/connections/{name}/approve")
+async def mcp_approve_tools(name: str, request: Request) -> JSONResponse:
+    """Explicitly approves specific tools by name — the path for a
+    "changed" (rug-pull-flagged) tool the human has actually reviewed, or
+    a "new" tool that wasn't auto-approved. Re-discovers first rather
+    than trusting whatever the client last saw, so approval always pins
+    the server's CURRENT definition, not a stale one from an earlier
+    response."""
+    payload = await request.json()
+    tool_names = set(payload.get("tool_names", []))
+    try:
+        discovered = await asyncio.to_thread(discover_tools, name)
+    except MCPError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    to_approve = [t for t in discovered if t["name"] in tool_names]
+    approve_tools(name, to_approve)
+    return JSONResponse({"approved": [t["name"] for t in to_approve]})
 
 
 # ---- Dev Slate: the live chat WebSocket ----
