@@ -227,6 +227,37 @@ def _run_save_note_node(prompt: str, prior_context: str | None) -> str:
         raise WorkflowError(str(e))
 
 
+def _run_input_node(prompt: str, prior_context: str | None) -> str:
+    """No LLM call, ever (2026-09-03, JuanJo: "whatever instruction has
+    the Input and Output nodes, are deterministic, unless they want an
+    LLM input node" — that variant isn't built, this is the plain
+    default). An Input node IS its own literal configured value — its
+    whole job is marking "this is what comes in from outside" (the same
+    role a fan-out group's {{item}} already plays informally, just
+    generalized to the whole workflow), not generating or interpreting
+    anything. prior_context is accepted for signature symmetry with
+    every other node function but deliberately ignored — an Input node
+    has no meaningful predecessor by construction; if the graph gives it
+    one anyway, its own configured value still wins."""
+    if not prompt:
+        raise WorkflowError("Input step has no value set.")
+    return prompt
+
+
+def _run_output_node(prompt: str, prior_context: str | None) -> str:
+    """No LLM call, ever — same reasoning as _run_input_node. An Output
+    node's whole job is returning whatever fed into it (a sub-agent
+    handing a computed value back to whatever embeds it, per the Agent
+    Vault design — see storage/agents.py), not taking a real-world
+    action itself the way send_to_telegram/save_note do. Falls back to
+    its own literal prompt only if genuinely nothing upstream produced
+    anything, so an Output node never silently returns empty."""
+    result = prior_context or prompt
+    if not result:
+        raise WorkflowError("Output step has nothing to return (no prior step output, no literal value set).")
+    return result
+
+
 def _run_generic_multi_tool_node(tool_names: list[str], prompt: str, prior_context: str | None) -> str:
     """Safety net for a node with more than one tool — not a named kind
     of its own (nothing in the chat-facing tool catalog produces this
@@ -259,6 +290,8 @@ SINGLE_TOOL_NODE_HANDLERS: dict[str, Callable[[str, str | None], str]] = {
     "web_search": _run_web_search_node,
     "fetch_page": _run_fetch_page_node,
     "save_note": _run_save_note_node,
+    "input": _run_input_node,
+    "output": _run_output_node,
 }
 
 
