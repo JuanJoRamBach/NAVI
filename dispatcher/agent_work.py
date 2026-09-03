@@ -320,6 +320,15 @@ def _run_node(node: dict, prior_context: str | None = None) -> str:
     return _run_generic_multi_tool_node(tool_names, prompt, prior_context)
 
 
+def _substitute_item(text: str | None, item: str) -> str | None:
+    """The only templating this graph supports — a fan-out group's nodes
+    reference the current loop item as the literal string "{{item}}" in
+    their prompt. Deliberately not real Jinja2 (Conductor's own choice)
+    or anything more general — one substitution, one variable name, no
+    new dependency for a v1 slice."""
+    return text if text is None else text.replace("{{item}}", item)
+
+
 async def _execute_run(run_id: str, graph: dict) -> None:
     try:
         order = _topological_order(graph)
@@ -335,25 +344,74 @@ async def _execute_run(run_id: str, graph: dict) -> None:
         if edge["to"] in predecessors:
             predecessors[edge["to"]].append(edge["from"])
 
+    # Fan-out groups (2026-09-03) — Agent Work's "sub-flows". A group
+    # only affects execution if it was given an "items" list (built
+    # purely for visual organization otherwise, see
+    # navi-pwa/src/AgentWorkGraphEditor.tsx's Group node — those groups
+    # never appear in graph["groups"] at all). node_group maps each
+    # member node id to its group, so the main loop below can tell in
+    # O(1) whether a given node needs to run once or once per item.
+    node_group: dict[str, dict] = {
+        nid: group
+        for group in graph.get("groups", []) if group.get("items")
+        for nid in group.get("node_ids", [])
+    }
+
+    # Composite-keyed by design: a node OUTSIDE any fan-out group (or in
+    # a different one) keys its single output under its plain node id —
+    # unchanged from before this feature existed. A node INSIDE a fan-out
+    # group keys each iteration's output under "<node_id>#<item_index>",
+    # since it genuinely produces one output per item, not one overall.
     outputs: dict[str, str] = {}
+    seq = 0
 
     await update_run_status(run_id, "running")
-    for seq, node in enumerate(order):
-        prior = predecessors.get(node["id"], [])
-        prior_context = "\n\n".join(f"[{pid}]: {outputs[pid]}" for pid in prior if pid in outputs) or None
+    for node in order:
+        group = node_group.get(node["id"])
+        items = group["items"] if group else [None]  # [None] = run exactly once, no substitution
 
-        step_id = await create_step(run_id, node["id"], seq)
-        await set_step_input(step_id, {"prompt": node.get("prompt"), "role": node.get("role"), "tools": node.get("tools")})
-        try:
-            output = await asyncio.to_thread(_run_node, node, prior_context)
-            await complete_step(step_id, "completed", output=output)
-            outputs[node["id"]] = output
-        except WorkflowError as e:
-            await complete_step(step_id, "failed", error=str(e))
-            remaining = len(order) - seq - 1
-            skip_note = f" — {remaining} downstream step(s) were not run." if remaining else ""
-            await update_run_status(run_id, "failed", error=f"node '{node['id']}' failed: {e}{skip_note}")
-            return
+        for item_index, item in enumerate(items):
+            prior_context_parts = []
+            for pid in predecessors.get(node["id"], []):
+                # A predecessor in the SAME fan-out group ran once per
+                # item too — use THIS iteration's output from it. A
+                # predecessor outside the group (or in a different one)
+                # ran once total; that single output feeds every
+                # iteration equally — e.g. a node before the group that
+                # supplies shared context to each pass.
+                same_group_predecessor = pid in node_group and node_group[pid] is group
+                key = f"{pid}#{item_index}" if same_group_predecessor else pid
+                if key in outputs:
+                    prior_context_parts.append(f"[{pid}]: {outputs[key]}")
+            prior_context = "\n\n".join(prior_context_parts) or None
+
+            run_node = dict(node) if item is None else {**node, "prompt": _substitute_item(node.get("prompt"), item)}
+            step_label = node["id"] if item is None else f"{node['id']} (item {item_index + 1}/{len(items)})"
+
+            step_id = await create_step(run_id, node["id"], seq)
+            seq += 1
+            step_input = {"prompt": run_node.get("prompt"), "role": run_node.get("role"), "tools": run_node.get("tools")}
+            if item is not None:
+                step_input["item"] = item
+            await set_step_input(step_id, step_input)
+            try:
+                output = await asyncio.to_thread(_run_node, run_node, prior_context)
+                await complete_step(step_id, "completed", output=output)
+                if item is not None:
+                    outputs[f"{node['id']}#{item_index}"] = output
+                # Plain key always gets written too, even inside a
+                # fan-out — last iteration wins. A downstream node OUTSIDE
+                # the group has no per-item concept of its own, so "the
+                # most recent thing this node produced" is the only
+                # sensible single value to hand it (same convention as a
+                # variable reassigned each pass of a loop in any
+                # language) — without this, a node placed right after a
+                # fan-out group would see no context from it at all.
+                outputs[node["id"]] = output
+            except WorkflowError as e:
+                await complete_step(step_id, "failed", error=str(e))
+                await update_run_status(run_id, "failed", error=f"node '{step_label}' failed: {e}")
+                return
 
     await update_run_status(run_id, "completed")
 
