@@ -53,6 +53,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from dispatcher.agent_work import WorkflowError, check_due_workflows, start_workflow_run
 from dispatcher.mcp_client import MCPError, approve_tools, discover_tools
+from tools.mcp_marketplace import MCPMarketplaceError, search as search_mcp_marketplace
 from dispatcher.scheduler import register_job, start_scheduler
 from dispatcher.chat import run_mode_chat, run_stored_mode_chat
 from dispatcher.devslate_chat import run_devslate_turn
@@ -692,6 +693,20 @@ async def agent_unstar_workflow(workflow_id: str) -> JSONResponse:
 
 # ---- MCP connections (see dispatcher/mcp_client.py for the actual
 # client/security model — this is just the REST surface over it) ----
+
+@app.get("/mcp/marketplace/search")
+async def mcp_marketplace_search(q: str = "", limit: int = 20) -> JSONResponse:
+    """Real-time proxy over the official MCP Registry (tools/
+    mcp_marketplace.py) — lets ConnectionsOverlay show actual, searchable
+    MCP servers instead of only the fixed SERVICE_CATALOG. Read-only, no
+    connection is made here; a result just pre-fills the existing
+    /mcp/connections + /connect flow below with real transport info."""
+    try:
+        results = await asyncio.to_thread(search_mcp_marketplace, q, min(limit, 50))
+    except MCPMarketplaceError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    return JSONResponse({"results": results})
+
 
 @app.post("/mcp/connections")
 async def mcp_create_connection(request: Request) -> JSONResponse:

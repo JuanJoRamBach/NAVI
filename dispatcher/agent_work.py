@@ -105,6 +105,13 @@ FETCH_PAGE_NODE_SYSTEM_PROMPT = (
     "described in the prompt below, then summarize what you actually "
     "found."
 )
+CHOOSE_PATH_NODE_SYSTEM_PROMPT_TEMPLATE = (
+    "You are executing one step of an automated NAVI workflow: deciding "
+    "which branch applies, running unattended. Given the condition below "
+    "and anything the prior step(s) produced, respond with EXACTLY one "
+    "of these branch labels and nothing else, no punctuation or "
+    "explanation: {labels}"
+)
 GENERIC_MULTI_TOOL_NODE_SYSTEM_PROMPT = (
     "You are executing one step of an automated NAVI workflow, running "
     "unattended (no user available to answer follow-up questions). Do "
@@ -313,6 +320,49 @@ def _run_output_node(prompt: str, prior_context: str | None, output_type: str | 
     return result
 
 
+def _run_choose_path_node(prompt: str, prior_context: str | None, labels: list[str]) -> str:
+    """A real model call (2026-09-04) — unlike Input/Output's plain pass-
+    through, deciding which branch applies genuinely needs judgment
+    (JuanJo, 2026-09-03: "a conditional branch node is what we need").
+    `labels` are the edge labels the canvas collected for every edge
+    LEAVING this node (see AgentWorkGraphEditor.tsx's edge-label UI) —
+    the model must pick exactly one, and its choice becomes the node's
+    own string output, the same "the node's output IS what happened"
+    shape every other node already has. _execute_run below matches this
+    return value against the edge labels to decide which branch actually
+    runs and which get skipped.
+
+    Falls back to the first label — or one literally labeled "else" /
+    "default" / "otherwise" if any exists, matching Zapier Paths' and
+    Make's own default-route convention — when the model's reply doesn't
+    cleanly match any label, rather than crashing the whole run over a
+    flaky/free model returning noise (the exact failure mode this
+    codebase hit repeatedly on 2026-09-03)."""
+    if not labels:
+        raise WorkflowError("Choose a Path step has no labeled branches — label at least one outgoing edge.")
+    if len(labels) == 1:
+        return labels[0]
+    if not prompt:
+        raise WorkflowError("Choose a Path step has no condition set.")
+    messages = [
+        ChatMessage(
+            role="system",
+            content=_node_system_prompt(CHOOSE_PATH_NODE_SYSTEM_PROMPT_TEMPLATE.format(labels=", ".join(labels)), prior_context),
+        ),
+        ChatMessage(role="user", content=prompt),
+    ]
+    response, _provider, _model = _call_for_node("agent_work_step:choose_path", messages)
+    reply = (response.text or "").strip().strip(".\"'")
+    for label in labels:
+        if reply.lower() == label.lower():
+            return label
+    for label in labels:
+        if label.lower() in reply.lower():
+            return label
+    fallback = next((label for label in labels if label.lower() in ("else", "default", "otherwise")), labels[0])
+    return fallback
+
+
 def _run_generic_multi_tool_node(tool_names: list[str], prompt: str, prior_context: str | None) -> str:
     """Safety net for a node with more than one tool — not a named kind
     of its own (nothing in the chat-facing tool catalog produces this
@@ -379,7 +429,7 @@ def _topological_order(graph: dict) -> list[dict]:
     return order
 
 
-def _run_node(node: dict, prior_context: str | None = None) -> str:
+def _run_node(node: dict, prior_context: str | None = None, outgoing_labels: list[str] | None = None) -> str:
     """Router, not an executor — picks the node function whose fixed
     logic matches this node's declared tool(s), and calls it. See the
     "Node functions" section above for what each one actually does.
@@ -390,6 +440,11 @@ def _run_node(node: dict, prior_context: str | None = None) -> str:
     this, a step genuinely depending on a prior step's result (e.g.
     "research news" -> "send what you found") had no way to see it; each
     node ran in total isolation from every other node.
+
+    outgoing_labels (2026-09-04): only meaningful for a choose_path node
+    — the labels collected off this node's own outgoing edges, computed
+    by _execute_run (which has the graph) since a bare node dict has no
+    concept of its own edges.
 
     A node's optional "role" field (a per-node model-role override) is no
     longer read here — every node function now always uses the
@@ -403,14 +458,14 @@ def _run_node(node: dict, prior_context: str | None = None) -> str:
 
     if not tool_names:
         return _run_text_node(prompt, prior_context)
-    if len(tool_names) == 1 and tool_names[0] in SINGLE_TOOL_NODE_HANDLERS:
+    if len(tool_names) == 1 and tool_names[0] in ("output", "choose_path"):
+        # The two node kinds whose behavior varies by something beyond
+        # prompt/prior_context — kept as narrow special cases rather than
+        # widening every other handler's shared 2-arg signature for them.
         if tool_names[0] == "output":
-            # The only node whose behavior varies by a field beyond
-            # prompt/prior_context (2026-09-03: "create an output node
-            # before sending to telegram with pdf as output") — kept as a
-            # narrow special case rather than widening every handler's
-            # signature for one node kind.
             return _run_output_node(prompt, prior_context, node.get("output_type"))
+        return _run_choose_path_node(prompt, prior_context, outgoing_labels or [])
+    if len(tool_names) == 1 and tool_names[0] in SINGLE_TOOL_NODE_HANDLERS:
         return SINGLE_TOOL_NODE_HANDLERS[tool_names[0]](prompt, prior_context)
     return _run_generic_multi_tool_node(tool_names, prompt, prior_context)
 
@@ -439,6 +494,34 @@ async def _execute_run(run_id: str, graph: dict) -> None:
         if edge["to"] in predecessors:
             predecessors[edge["to"]].append(edge["from"])
 
+    # Labeled edges leaving a choose_path node — its own only source of
+    # "what are the possible branches" (a bare node dict has no concept
+    # of its own edges). Unlabeled edges out of a choose_path node are
+    # simply never eligible to be chosen or pruned; label at least one.
+    outgoing_labels_by_node: dict[str, list[str]] = {}
+    for edge in graph.get("edges", []):
+        label = edge.get("label")
+        if label:
+            outgoing_labels_by_node.setdefault(edge["from"], []).append(label)
+
+    # choose_path pruning (2026-09-04): a node is skipped iff EVERY edge
+    # feeding it is dead — either its source was itself skipped, or the
+    # specific edge was pruned by a choose_path decision. Evaluated once
+    # per node, in the SAME topological order already being walked below,
+    # so every predecessor's live/dead status is already final by the
+    # time a node is checked — no separate forward pass needed, and (the
+    # part a naive forward-BFS-from-the-pruned-branch gets wrong) a node
+    # reachable via BOTH a taken and an untaken branch correctly stays
+    # live, since at least one of its incoming edges is live.
+    skipped: set[str] = set()
+    pruned_edges: set[tuple[str, str]] = set()
+
+    def _is_skipped(node_id: str) -> bool:
+        preds = predecessors.get(node_id, [])
+        if not preds:
+            return False  # a root node always runs
+        return all(pid in skipped or (pid, node_id) in pruned_edges for pid in preds)
+
     # Fan-out groups (2026-09-03) — Agent Work's "sub-flows". A group
     # only affects execution if it was given an "items" list (built
     # purely for visual organization otherwise, see
@@ -462,6 +545,18 @@ async def _execute_run(run_id: str, graph: dict) -> None:
 
     await update_run_status(run_id, "running")
     for node in order:
+        if _is_skipped(node["id"]):
+            # A branch choose_path didn't take, or something only
+            # reachable through one — recorded as a real step (not
+            # silently absent) so the run history shows what was skipped
+            # and why, matching every other node's own transparency.
+            skipped.add(node["id"])
+            step_id = await create_step(run_id, node["id"], seq)
+            seq += 1
+            await set_step_input(step_id, {"prompt": node.get("prompt"), "role": node.get("role"), "tools": node.get("tools")})
+            await complete_step(step_id, "skipped", output="Skipped — branch not taken.")
+            continue
+
         group = node_group.get(node["id"])
         items = group["items"] if group else [None]  # [None] = run exactly once, no substitution
 
@@ -490,8 +585,20 @@ async def _execute_run(run_id: str, graph: dict) -> None:
                 step_input["item"] = item
             await set_step_input(step_id, step_input)
             try:
-                output = await asyncio.to_thread(_run_node, run_node, prior_context)
+                is_choose_path = run_node.get("tools") == ["choose_path"]
+                output = await asyncio.to_thread(
+                    _run_node, run_node, prior_context,
+                    outgoing_labels_by_node.get(node["id"]) if is_choose_path else None,
+                )
                 await complete_step(step_id, "completed", output=output)
+                if is_choose_path:
+                    # The chosen label IS this node's output — prune every
+                    # OTHER labeled edge leaving it; _is_skipped above
+                    # propagates that forward to whatever's only reachable
+                    # through a pruned edge, on each later node's own turn.
+                    for e in graph.get("edges", []):
+                        if e["from"] == node["id"] and e.get("label") and e["label"] != output:
+                            pruned_edges.add((e["from"], e["to"]))
                 if item is not None:
                     outputs[f"{node['id']}#{item_index}"] = output
                 # Plain key always gets written too, even inside a
