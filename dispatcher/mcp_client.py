@@ -164,7 +164,18 @@ class _Session:
                 if self._conn.get("auth_header") else None
             )
             self._transport_cm = streamable_http_client(self._conn["url"], http_client=http_client)
-            read, write, _ = await self._transport_cm.__aenter__()
+            # The installed mcp SDK's streamable_http_client yields a
+            # 2-tuple (read_stream, write_stream) — confirmed directly
+            # against its real source, not assumed. Real bug found
+            # 2026-09-04: this used to hard-unpack 3 values (an older SDK
+            # version apparently also yielded a get_session_id callable),
+            # which crashed EVERY http-transport connection with
+            # "ValueError: not enough values to unpack" before a single
+            # one ever worked. Accepting either shape defensively survives
+            # the exact kind of silent API drift that caused this, rather
+            # than re-hardcoding a new assumption that breaks again later.
+            transport_result = await self._transport_cm.__aenter__()
+            read, write = transport_result[0], transport_result[1]
         self._session_cm = ClientSession(read, write)
         session = await self._session_cm.__aenter__()
         await session.initialize()
