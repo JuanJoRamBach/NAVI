@@ -258,6 +258,21 @@ def _reconstruct_confirmed_text(pending: ParseResult) -> str:
 
 
 def handle_message(adapter: MessagingAdapter, msg: IncomingMessage) -> None:
+    """Real gap found and fixed 2026-09-04: nothing anywhere in this
+    inbound path checked WHO was messaging the bot — chat_id/sender_id
+    were only ever used to know where to send the reply, never compared
+    against JuanJo's own TELEGRAM_CHAT_ID (already set, already used
+    elsewhere to know where to SEND the daily digest — same identifier,
+    now also used to gate who's allowed to send TO the bot). Any Telegram
+    user who found the bot's @username could already run commands and
+    spend NAVI's own LLM quota, same shape as the API-auth gap fixed
+    earlier this session, just a different front door. Fails closed like
+    everything else touched this session (NAVI_API_KEY, NAVI_FILES_TOKEN):
+    an unset TELEGRAM_CHAT_ID means nobody is allowed through, not
+    "everybody is.\""""
+    owner_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not owner_chat_id or msg.chat_id != owner_chat_id:
+        return
     with _pending_lock:
         pending = _pending_confirmations.pop(msg.chat_id, None)
 
