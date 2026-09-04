@@ -49,10 +49,11 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 
 from dispatcher.agent_work import WorkflowError, check_due_workflows, start_workflow_run
 from dispatcher.mcp_client import MCPError, approve_tools, discover_tools
+from dispatcher.mcp_oauth import MCPOAuthError, exchange_code_for_token, start_authorization
 from tools.mcp_marketplace import MCPMarketplaceError, search as search_mcp_marketplace
 from dispatcher.scheduler import register_job, start_scheduler
 from dispatcher.chat import run_mode_chat, run_stored_mode_chat
@@ -115,6 +116,14 @@ PUSH_CHUNK_SIZE = 3000
 _pending_confirmations: dict[str, ParseResult] = {}
 _pending_lock = threading.Lock()
 
+# In-memory only, same reasoning as _pending_confirmations above — an
+# OAuth flow abandoned mid-way (browser closed before the redirect back)
+# just leaves a small unused entry until the process restarts; nothing
+# worth persisting through Filen for. Keyed by `state`, the standard
+# OAuth anti-CSRF token — see /mcp/oauth/callback's own comment.
+_pending_oauth: dict[str, dict] = {}
+_pending_oauth_lock = threading.Lock()
+
 app = FastAPI(title="NAVI")
 app.add_middleware(
     CORSMiddleware,
@@ -153,8 +162,15 @@ app.add_middleware(
 #                            nothing to act on), so left alone rather than
 #                            building real signature verification for a
 #                            handler that does nothing yet
+#   - "/mcp/oauth/callback"  the OAuth provider's own redirect (e.g.
+#                            GitHub) lands here directly — it can't carry
+#                            our custom header either. Real security here
+#                            is the `state` param, checked against the
+#                            pending flow stashed by /oauth/start below —
+#                            that's the standard OAuth anti-CSRF
+#                            mechanism, not something this gate adds.
 NAVI_API_KEY = os.environ.get("NAVI_API_KEY")
-_PUBLIC_PATHS = {"/", "/webhook/telegram", "/webhook/discord"}
+_PUBLIC_PATHS = {"/", "/webhook/telegram", "/webhook/discord", "/mcp/oauth/callback"}
 
 
 @app.middleware("http")
@@ -874,6 +890,77 @@ async def mcp_connect(name: str) -> JSONResponse:
         approve_tools(name, new_tools)
     config.set_mcp_connected(name, True)
     return JSONResponse({"tools": discovered})
+
+
+MCP_OAUTH_REDIRECT_URI = f"{NAVI_BASE_URL}/mcp/oauth/callback"
+
+
+@app.post("/mcp/connections/{name}/oauth/start")
+async def mcp_oauth_start(name: str) -> JSONResponse:
+    """Runs the real MCP-spec OAuth discovery chain (dispatcher/
+    mcp_oauth.py) against this connection's URL and returns an
+    authorize_url for the frontend to redirect the whole browser to (not
+    an XHR — the user needs to actually see and approve the provider's
+    consent screen). The resulting pending flow is stashed here, keyed by
+    state, for /mcp/oauth/callback below to pick back up once the
+    provider redirects the browser back."""
+    conn = config.get_mcp_connection(name)
+    if conn is None or not conn.get("url"):
+        return JSONResponse({"error": "connection has no URL configured yet — save the connection first"}, status_code=400)
+    try:
+        flow = await asyncio.to_thread(start_authorization, name, conn["url"], MCP_OAUTH_REDIRECT_URI)
+    except MCPOAuthError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    with _pending_oauth_lock:
+        _pending_oauth[flow["state"]] = {
+            "server_name": name, "code_verifier": flow["code_verifier"], "token_endpoint": flow["token_endpoint"],
+            "client_id": flow["client_id"], "client_secret": flow["client_secret"], "redirect_uri": flow["redirect_uri"],
+        }
+    return JSONResponse({"authorize_url": flow["authorize_url"]})
+
+
+@app.get("/mcp/oauth/callback")
+async def mcp_oauth_callback(request: Request) -> RedirectResponse:
+    """The provider's own redirect lands here (see _PUBLIC_PATHS above
+    for why this route is exempt from the shared API key). `state` is
+    looked up against the pending flow /oauth/start stashed — a request
+    with no match (forged, replayed, or expired-by-restart) is refused
+    before anything else happens, same anti-CSRF role `state` always
+    plays in OAuth, not something extra this route adds."""
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    with _pending_oauth_lock:
+        pending = _pending_oauth.pop(state, None) if state else None
+    if request.query_params.get("error") or not pending or not code:
+        return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=error")
+
+    try:
+        access_token = await asyncio.to_thread(
+            exchange_code_for_token, pending["token_endpoint"], code, pending["code_verifier"],
+            pending["client_id"], pending["client_secret"], pending["redirect_uri"],
+        )
+    except MCPOAuthError:
+        return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=error")
+
+    server_name = pending["server_name"]
+    conn = config.get_mcp_connection(server_name)
+    if conn is None:
+        return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=error")
+    # Stores the token exactly like a pasted one — encrypted at rest via
+    # config.set_mcp_connection's existing auth_header handling, same
+    # code path a manual paste already goes through.
+    config.set_mcp_connection(server_name, conn["transport"], url=conn["url"], auth_header=f"Bearer {access_token}")
+
+    try:
+        discovered = await asyncio.to_thread(discover_tools, server_name)
+        new_tools = [t for t in discovered if t["status"] == "new"]
+        if new_tools:
+            approve_tools(server_name, new_tools)
+        config.set_mcp_connected(server_name, True)
+    except MCPError:
+        return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=partial&connection={server_name}")
+
+    return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=success&connection={server_name}")
 
 
 @app.post("/mcp/connections/{name}/approve")
