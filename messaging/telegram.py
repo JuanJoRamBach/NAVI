@@ -89,11 +89,20 @@ class TelegramAdapter(MessagingAdapter):
         if resp.status_code >= 400:
             raise MessagingError(f"Telegram sendDocument error {resp.status_code}: {resp.text[:300]}")
 
-    def set_webhook(self, webhook_url: str) -> None:
+    def set_webhook(self, webhook_url: str, secret_token: str | None = None) -> None:
         """One-time setup: tells Telegram where to POST updates. Call this
-        once after deploying (or whenever the Render URL changes)."""
+        once after deploying (or whenever the Render/Lightsail URL
+        changes). `secret_token`, if given, is echoed back by Telegram on
+        every update as the X-Telegram-Bot-Api-Secret-Token header — the
+        real check against POST /webhook/telegram being reachable by
+        anyone who guesses the URL (2026-09-04: confirmed the whole API
+        had no auth at all; this is the one route that can't carry NAVI's
+        own shared-secret header since Telegram controls the request)."""
+        payload = {"url": webhook_url}
+        if secret_token:
+            payload["secret_token"] = secret_token
         try:
-            resp = requests.post(self._url("setWebhook"), json={"url": webhook_url}, timeout=30)
+            resp = requests.post(self._url("setWebhook"), json=payload, timeout=30)
         except requests.RequestException as e:
             raise MessagingError(f"Telegram setWebhook failed: {e}")
         if resp.status_code >= 400:

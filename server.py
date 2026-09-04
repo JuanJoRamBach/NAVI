@@ -120,8 +120,58 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[PWA_ORIGIN],
     allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "X-Navi-Api-Key"],
 )
+
+# Shared-secret gate for the whole API (2026-09-04) — real gap found and
+# confirmed by hand: every route here had zero authentication. A bare
+# `curl https://api.getnavi.online/mcp/connections` returned real data
+# with no credentials at all; anyone who found the URL could also POST a
+# new MCP connection, repoint /config/role to a different provider, or
+# spend NAVI's own LLM provider quota for free via /chat/send. CORS
+# (above) only restricts which *browser origins* can call this — it does
+# nothing against a direct request, which is exactly how the check above
+# was made.
+#
+# This is a stopgap for the testing phase, not real per-user auth — there
+# is no user-account system anywhere in NAVI yet (see IDEAS.md's "Project
+# as the real top-level container" gap). A single shared key raises the
+# bar from "anyone who finds the URL" to "someone who was actually given
+# the key"; it does not protect against a determined holder of that key
+# misusing it. Real per-user auth is the eventual proper fix.
+#
+# Exempt paths, deliberately narrow:
+#   - "/"                    health check, no sensitive data
+#   - "/files/..."           already gated by its own NAVI_FILES_TOKEN
+#                             query-param check (see files_get below) —
+#                             reached via a plain link, can't carry a
+#                             custom header
+#   - "/webhook/telegram"    Telegram calls this directly, can't send our
+#                            header — see TELEGRAM_WEBHOOK_SECRET below
+#                            for its own real check instead
+#   - "/webhook/discord"     currently a pure no-op (outbound-only phase,
+#                            nothing to act on), so left alone rather than
+#                            building real signature verification for a
+#                            handler that does nothing yet
+NAVI_API_KEY = os.environ.get("NAVI_API_KEY")
+_PUBLIC_PATHS = {"/", "/webhook/telegram", "/webhook/discord"}
+
+
+@app.middleware("http")
+async def _require_api_key(request: Request, call_next):
+    if (
+        request.method == "OPTIONS"  # let CORSMiddleware answer preflights
+        or request.url.path in _PUBLIC_PATHS
+        or request.url.path.startswith("/files/")
+    ):
+        return await call_next(request)
+    if not NAVI_API_KEY:
+        # Fail closed: an unset key locks the whole API down rather than
+        # silently running open, same principle as NAVI_FILES_TOKEN below.
+        return JSONResponse({"error": "NAVI_API_KEY is not configured on the server"}, status_code=503)
+    if request.headers.get("X-Navi-Api-Key") != NAVI_API_KEY:
+        return JSONResponse({"error": "missing or invalid API key"}, status_code=401)
+    return await call_next(request)
 
 
 async def _refresh_model_ranking_snapshot() -> None:
@@ -412,8 +462,21 @@ def file_download(relative_path: str, token: str | None = None, render: str | No
     )
 
 
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+
+
 @app.post("/webhook/telegram")
 async def webhook_telegram(request: Request) -> PlainTextResponse:
+    """Exempt from the shared NAVI_API_KEY gate above (Telegram can't send
+    our custom header) — verified instead via the secret_token Telegram
+    echoes back on every update once set_telegram_webhook.py registers
+    one (see TELEGRAM_WEBHOOK_SECRET's own docstring there). Optional, not
+    enforced, if the operator hasn't set one up yet — same reasoning as
+    NAVI_FILES_TOKEN's own "unset = feature just doesn't check" precedent
+    elsewhere in this file, since forcing this closed would silently break
+    an already-working bot for anyone who deployed before this existed."""
+    if TELEGRAM_WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_WEBHOOK_SECRET:
+        return PlainTextResponse("forbidden", status_code=403)
     payload = await request.json()
     adapter = _telegram_adapter()
     if adapter:
@@ -732,17 +795,22 @@ async def mcp_marketplace_search(q: str = "", limit: int = 20) -> JSONResponse:
 async def mcp_create_connection(request: Request) -> JSONResponse:
     """Registers a connection's transport config — does NOT connect yet,
     that's the separate /connect call below, since a live handshake can
-    be slow or fail and shouldn't block "just save what I typed"."""
+    be slow or fail and shouldn't block "just save what I typed".
+
+    http-only (2026-09-04): stdio (local subprocess) servers are refused
+    here — no sandbox exists yet for arbitrary local process execution,
+    see dispatcher/mcp_client.py's own docstring on why this is deferred
+    by cost rather than fixed."""
     payload = await request.json()
     name = payload.get("name")
     transport = payload.get("transport")
-    if not name or transport not in ("stdio", "http"):
-        return JSONResponse({"error": "name and transport ('stdio' or 'http') are required"}, status_code=400)
-    config.set_mcp_connection(
-        name, transport,
-        command=payload.get("command"), args=payload.get("args"), env=payload.get("env"),
-        url=payload.get("url"), auth_header=payload.get("auth_header"),
-    )
+    if not name or transport != "http":
+        return JSONResponse(
+            {"error": "name is required and transport must be 'http' — local (stdio) MCP "
+                      "servers are disabled until NAVI has a sandbox to run them in"},
+            status_code=400,
+        )
+    config.set_mcp_connection(name, transport, url=payload.get("url"), auth_header=payload.get("auth_header"))
     return JSONResponse({"ok": True})
 
 
@@ -755,7 +823,11 @@ async def mcp_list_connections() -> list[dict]:
         {
             "name": name, "transport": conn.get("transport"), "connected": conn.get("connected", False),
             "tools": [
-                {"name": tool_name, "read_only": t["read_only"], "approved_at": t["approved_at"]}
+                {
+                    "name": tool_name, "read_only": t["read_only"],
+                    "destructive": t.get("destructive", not t["read_only"]),
+                    "approved_at": t["approved_at"],
+                }
                 for tool_name, t in conn.get("tools", {}).items()
             ],
         }
@@ -887,7 +959,17 @@ async def devslate_ws(websocket: WebSocket, conversation_id: str) -> None:
     dict, not module-level) — two Slates open at once must never let one
     connection's disconnect resolve (or lose) the other's in-flight tool
     call.
+
+    NOT covered by _require_api_key above — that's HTTP-only middleware,
+    a WebSocket upgrade never passes through it (real gap, found and
+    fixed 2026-09-04 in the same pass). Checked here instead, and via a
+    ?key= query param rather than the X-Navi-Api-Key header, since the
+    browser's native WebSocket API has no way to set custom headers on
+    the handshake at all (see devslate.ts's wsUrl).
     """
+    if not NAVI_API_KEY or websocket.query_params.get("key") != NAVI_API_KEY:
+        await websocket.close(code=4401)
+        return
     await websocket.accept()
     pending: dict[str, asyncio.Future] = {}
     # Serializes turns on THIS connection (so two rapid user_message

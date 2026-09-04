@@ -7,6 +7,12 @@ changes).
 
 Usage:
     TELEGRAM_BOT_TOKEN=... RENDER_URL=https://navi-xxxx.onrender.com python scripts/set_telegram_webhook.py
+
+TELEGRAM_WEBHOOK_SECRET is optional but recommended (2026-09-04) — set it
+here AND as an env var on the server (server.py reads it under the same
+name to verify incoming updates). Without it, POST /webhook/telegram has
+no way to tell a real Telegram update from anyone who guesses the URL and
+POSTs a fake one.
 """
 
 import os
@@ -25,13 +31,14 @@ def main() -> None:
     if not bot_token or not render_url:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN and RENDER_URL env vars first.")
 
+    secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
     webhook_url = render_url.rstrip("/") + "/webhook/telegram"
     try:
-        TelegramAdapter(bot_token).set_webhook(webhook_url)
+        TelegramAdapter(bot_token).set_webhook(webhook_url, secret_token=secret)
     except MessagingError as e:
         raise SystemExit(f"Failed to set webhook: {e}")
 
-    print(f"Webhook set to {webhook_url}")
+    print(f"Webhook set to {webhook_url}" + (" (with a secret token)" if secret else " (NO secret token set — set TELEGRAM_WEBHOOK_SECRET and re-run)"))
 
 
 if __name__ == "__main__":

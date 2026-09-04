@@ -12,7 +12,10 @@ whenever a value changes, and if the service restarts, the config should be
 re-synced from Filen at startup, see restore_from_backup below).
 """
 
+import base64
+import hashlib
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -20,8 +23,75 @@ from typing import Any
 from config.backup import BackupError, backup_to_filen, restore_from_backup
 
 CONFIG_PATH = Path(__file__).parent / "agent_config.json"
+_MCP_KEY_PATH = Path(__file__).parent / ".mcp_secret.key"
 
 _lock = threading.Lock()
+_fernet_cache = None
+
+
+def _get_fernet():
+    """Lazily builds the Fernet cipher used to encrypt MCP connection
+    credentials (bearer tokens) at rest — these are third-party secrets
+    (GitHub/Google/Slack/etc tokens) NAVI holds on the company's behalf,
+    a different risk class than the plaintext-JSON pattern the rest of
+    this store already uses for its own provider keys (that's a known,
+    separately-flagged gap — see IDEAS.md — not fixed here).
+
+    Prefers NAVI_MCP_SECRET_KEY (set once on Lightsail, never written to
+    disk or backed up to Filen) over a locally-generated key file — a key
+    that lives on the same disk as the data it encrypts only protects
+    against a narrower set of leaks (e.g. the Filen backup, since
+    backup_to_filen() ships this file's plaintext bytes as-is), which is
+    still real protection, just not as strong as a key kept elsewhere."""
+    global _fernet_cache
+    if _fernet_cache is not None:
+        return _fernet_cache
+    from cryptography.fernet import Fernet
+
+    key_env = os.environ.get("NAVI_MCP_SECRET_KEY")
+    if key_env:
+        try:
+            _fernet_cache = Fernet(key_env.encode())
+        except Exception:
+            # Accept a human-typed passphrase, not just a properly-formed
+            # Fernet key — derive a valid 32-byte urlsafe-base64 key from it.
+            digest = hashlib.sha256(key_env.encode()).digest()
+            _fernet_cache = Fernet(base64.urlsafe_b64encode(digest))
+        return _fernet_cache
+
+    if _MCP_KEY_PATH.exists():
+        _fernet_cache = Fernet(_MCP_KEY_PATH.read_bytes())
+        return _fernet_cache
+
+    key = Fernet.generate_key()
+    _MCP_KEY_PATH.write_bytes(key)
+    print(
+        f"[config.store] WARNING: NAVI_MCP_SECRET_KEY not set — generated a local key file "
+        f"at {_MCP_KEY_PATH}. Set the env var in production so the key isn't stored on the "
+        f"same disk (and same Filen backup) as the data it protects."
+    )
+    _fernet_cache = Fernet(key)
+    return _fernet_cache
+
+
+def _encrypt_secret(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return _get_fernet().encrypt(value.encode()).decode()
+
+
+def _decrypt_secret(value: str | None) -> str | None:
+    if value is None:
+        return None
+    from cryptography.fernet import InvalidToken
+
+    try:
+        return _get_fernet().decrypt(value.encode()).decode()
+    except InvalidToken:
+        # Either the wrong/rotated key, or a value saved before this
+        # encryption existed — treat as legacy plaintext rather than
+        # silently breaking every connection saved before this change.
+        return value
 
 DEFAULTS = {
     "providers": {
@@ -222,7 +292,9 @@ DEFAULTS = {
     #   "transport": "stdio" | "http",
     #   "command": str | None, "args": list[str] | None,  # stdio only
     #   "url": str | None,                                 # http only
-    #   "auth_header": str | None,   # e.g. "Bearer <token>" — sent as-is
+    #   "auth_header": str | None,   # e.g. "Bearer <token>" — encrypted at
+    #                                 # rest (see _encrypt_secret above),
+    #                                 # decrypted only by get_mcp_connection
     #   "connected": bool,
     #   "tools": {
     #     tool_name: {
@@ -231,6 +303,10 @@ DEFAULTS = {
     #       "input_schema": dict,    # reads this instead of re-fetching live every call
     #       "read_only": bool,       # NAVI's own effective classification, seeded from
     #                                 # the server's readOnlyHint but not blindly trusted after
+    #       "destructive": bool,     # seeded from destructiveHint (MCP spec default: True
+    #                                 # for anything not read-only) — the ONE tier that still
+    #                                 # needs per-call confirmation; read-only and plain-write
+    #                                 # tools run autonomously once approved here
     #       "approved_at": float,    # epoch seconds
     #     }
     #   }
@@ -344,14 +420,22 @@ class ConfigStore:
         self._data["mcp_connections"][name] = {
             **existing,
             "transport": transport, "command": command, "args": args, "env": env,
-            "url": url, "auth_header": auth_header,
+            "url": url,
+            "auth_header": _encrypt_secret(auth_header) if auth_header is not None else existing.get("auth_header"),
             "connected": existing.get("connected", False),
             "tools": existing.get("tools", {}),
         }
         self._save()
 
     def get_mcp_connection(self, name: str) -> dict | None:
-        return self._data.get("mcp_connections", {}).get(name)
+        """Decrypts auth_header for actual use (dispatcher/mcp_client.py's
+        live handshake) — list_mcp_connections below stays encrypted since
+        nothing reads auth_header off it (the REST list route never echoes
+        it to the client either way)."""
+        conn = self._data.get("mcp_connections", {}).get(name)
+        if conn is None:
+            return None
+        return {**conn, "auth_header": _decrypt_secret(conn.get("auth_header"))}
 
     def list_mcp_connections(self) -> dict[str, dict]:
         return self._data.get("mcp_connections", {})
@@ -368,19 +452,23 @@ class ConfigStore:
         self._save()
 
     def set_mcp_tool_baseline(
-        self, server: str, tool_name: str, tool_hash: str, description: str, input_schema: dict, read_only: bool,
+        self, server: str, tool_name: str, tool_hash: str, description: str, input_schema: dict,
+        read_only: bool, destructive: bool,
     ):
         """Pins a tool's approved definition — the rug-pull defense. Called
         once per tool, right after its description has been sanitized and
         hashed at connect/re-approval time (never from inside a live call).
         Stores description/input_schema alongside the hash so schema-
         building (tools/mcp_registry.py) reads the pinned snapshot instead
-        of a live server round-trip on every request."""
+        of a live server round-trip on every request. `destructive` is the
+        one tier that still needs a per-call confirmation gate (see
+        tools/mcp_registry.py's dispatch()) — read-only and plain-write
+        tools run autonomously the moment they're approved here."""
         import time
         conn = self._data.setdefault("mcp_connections", {}).setdefault(server, {"tools": {}})
         conn.setdefault("tools", {})[tool_name] = {
             "hash": tool_hash, "description": description, "input_schema": input_schema,
-            "read_only": read_only, "approved_at": time.time(),
+            "read_only": read_only, "destructive": destructive, "approved_at": time.time(),
         }
         self._save()
 

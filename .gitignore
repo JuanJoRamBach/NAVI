@@ -9,6 +9,11 @@ env/
 .pytest_cache/
 config/agent_config.json
 
+# config/store.py's fallback encryption key for MCP connection credentials
+# (only generated when NAVI_MCP_SECRET_KEY isn't set) — never commit a
+# secret key next to the ciphertext it protects.
+config/.mcp_secret.key
+
 # storage/conversations.py's SQLite store — per-instance runtime state
 # (chat/Dev Slate conversation history), same reasoning as
 # config/agent_config.json above, not something to ship in the repo.

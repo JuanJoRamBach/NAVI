@@ -18,11 +18,22 @@ Security model (2026-09-03 design):
     ever hashed or shown to the LLM — hidden-instruction markers stripped,
     unusually-formatted descriptions rejected outright (OWASP's MCP Tool
     Poisoning guidance).
-  - **Read/write classification**: seeded from the tool's own
+  - **Read/write/destructive classification**: seeded from the tool's own
     readOnlyHint/destructiveHint annotations (a real MCP spec field,
     2025-03-26 revision) but stored as NAVI's own effective judgment — a
     hint is self-declared by the server, not verified, so it's a starting
-    point for human review, not a trust boundary on its own.
+    point for human review, not a trust boundary on its own. Only the
+    destructive tier still needs a per-call confirmation gate (see
+    is_destructive_tool below and tools/mcp_registry.py's dispatch()) —
+    the dispatcher runs read-only and plain-write tools autonomously once
+    a human approved them at connect time, matching NAVI's "the LLM only
+    proposes, the dispatcher decides, invisible to the user" design.
+  - **No sandbox for stdio servers** (2026-09-04, deferred by cost, not
+    forgotten): a stdio MCP server is an arbitrary local subprocess with
+    NAVI's own process privileges — disabled entirely (see
+    _connection_params) until a sandbox exists, server-side (funded) or
+    client-side (the eventual Tauri desktop build). Only http/remote
+    servers can be connected for now.
   - **Output sanitization**: a tool's *result* is exactly as capable of
     hiding instructions as its description was — sanitize_content() is
     reused for both.
@@ -121,18 +132,18 @@ def _hash_tool_def(name: str, description: str, input_schema: dict) -> str:
 
 def _connection_params(conn: dict):
     if conn["transport"] == "stdio":
-        # PYTHONUNBUFFERED forced on, always — a stdio server whose
-        # language runtime block-buffers stdout when it isn't attached
-        # to a real terminal (Python's default) sits on its own
-        # already-computed JSON-RPC replies until the buffer fills,
-        # while the client waits on a response that's technically ready
-        # but never flushed. Confirmed by hand: without this, a real
-        # Python test server hung session.initialize() indefinitely —
-        # not a timeout, a genuine deadlock. Harmless to set for
-        # non-Python servers (an unused env var), so it's unconditional
-        # rather than conditioned on the command being "python".
-        env = {"PYTHONUNBUFFERED": "1", **(conn.get("env") or {})}
-        return StdioServerParameters(command=conn["command"], args=conn.get("args") or [], env=env)
+        # Disabled (2026-09-04): a stdio server is an arbitrary local
+        # subprocess running with NAVI's own process privileges, no
+        # isolation of any kind — real sandboxing (e2b/Firecracker) is
+        # deferred, unfunded. server.py's /mcp/connections route already
+        # refuses to create one; this is the defense-in-depth check for
+        # any connection that predates that gate. Remove once a sandbox
+        # (server-side, or client-side via the eventual Tauri build)
+        # actually exists to run these in.
+        raise MCPConnectionError(
+            "Local (stdio) MCP servers are disabled — NAVI has no sandbox for arbitrary "
+            "local process execution yet. Connect via a hosted URL instead."
+        )
     if conn["transport"] == "http":
         return conn["url"]
     raise MCPConnectionError(f"Unknown transport: {conn['transport']}")
@@ -217,20 +228,28 @@ async def _async_discover_tools(server_name: str) -> list[dict]:
             baseline = config.get_mcp_tool_baseline(server_name, tool.name)
 
             read_only_hint = getattr(tool.annotations, "read_only_hint", None) if tool.annotations else None
+            destructive_hint = getattr(tool.annotations, "destructive_hint", None) if tool.annotations else None
 
             if baseline is None:
                 status = "new"
                 read_only = bool(read_only_hint) if read_only_hint is not None else False
+                # MCP spec default for destructiveHint is True when the tool
+                # isn't read-only and the server doesn't say otherwise — the
+                # fail-toward-caution tier that still needs per-call
+                # confirmation (tools/mcp_registry.py's dispatch()).
+                destructive = bool(destructive_hint) if destructive_hint is not None else (not read_only)
             elif baseline["hash"] != tool_hash:
                 status = "changed"
                 read_only = baseline["read_only"]  # keep prior classification until re-approved
+                destructive = baseline.get("destructive", not read_only)
             else:
                 status = "approved"
                 read_only = baseline["read_only"]
+                destructive = baseline.get("destructive", not read_only)
 
             results.append({
                 "name": tool.name, "description": description, "input_schema": input_schema,
-                "hash": tool_hash, "read_only": read_only, "status": status,
+                "hash": tool_hash, "read_only": read_only, "destructive": destructive, "status": status,
             })
     return results
 
@@ -252,7 +271,8 @@ def approve_tools(server_name: str, tools: list[dict]):
     with the server's own hint."""
     for t in tools:
         config.set_mcp_tool_baseline(
-            server_name, t["name"], t["hash"], t["description"], t["input_schema"], t["read_only"],
+            server_name, t["name"], t["hash"], t["description"], t["input_schema"],
+            t["read_only"], t.get("destructive", not t["read_only"]),
         )
 
 
@@ -308,8 +328,14 @@ def call_tool(server_name: str, tool_name: str, arguments: dict) -> str:
         raise MCPConnectionError(f"'{tool_name}' on '{server_name}' didn't respond within {_MCP_CALL_TIMEOUT_SECONDS}s.")
 
 
-def is_write_tool(server_name: str, tool_name: str) -> bool:
+def is_destructive_tool(server_name: str, tool_name: str) -> bool:
+    """The one tier that still needs a per-call confirmation gate (see
+    tools/mcp_registry.py's dispatch()) — read-only and plain-write tools
+    (create an issue, send a message, add a calendar event) run
+    autonomously once approved, matching NAVI's dispatcher-decides,
+    invisible-to-the-user design. Only genuinely destructive/irreversible
+    actions (destructiveHint, MCP spec) are held back."""
     baseline = config.get_mcp_tool_baseline(server_name, tool_name)
     if baseline is None:
         return True  # unknown tool defaults to the more restrictive assumption
-    return not baseline["read_only"]
+    return baseline.get("destructive", not baseline["read_only"])

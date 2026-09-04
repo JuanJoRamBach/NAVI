@@ -18,7 +18,7 @@ impossible, not just a convention someone has to remember to follow.
 """
 
 from config.store import config
-from dispatcher.mcp_client import MCPError, call_tool, is_write_tool
+from dispatcher.mcp_client import MCPError, call_tool, is_destructive_tool
 
 MCP_TOOL_PREFIX = "mcp__"
 
@@ -53,7 +53,12 @@ def schemas_for_connected_servers() -> list[dict]:
         if not conn.get("connected"):
             continue
         for tool_name, baseline in conn.get("tools", {}).items():
-            kind = "read-only" if baseline["read_only"] else "WRITE — requires confirmation"
+            if baseline.get("destructive", not baseline["read_only"]):
+                kind = "DESTRUCTIVE — requires confirmation"
+            elif baseline["read_only"]:
+                kind = "read-only"
+            else:
+                kind = "write"
             schemas.append({
                 "type": "function",
                 "function": {
@@ -73,24 +78,29 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
     """Mirrors tools/registry.py's dispatch() shape exactly, so a caller
     (tools/registry.py's own dispatch, once the two are merged at the
     executor level) can route mcp__* names here without changing its own
-    signature. `context` carries the same executor-owned state as the
-    internal dispatch — here it's also where an already-granted write
-    confirmation is threaded through, via context["mcp_confirmed_writes"]
-    (a set of namespaced tool names the user has explicitly approved for
-    this run). No confirmation UI is wired up yet on the frontend side —
-    until it is, that set stays empty, so every write tool safely refuses
-    by default rather than silently executing."""
+    signature. Read-only and plain-write tools (create an issue, send a
+    message, add a calendar event) run the moment the model calls them —
+    that's the whole point of the dispatcher-decides, invisible-to-the-
+    user design; the model never sees a confirmation step, and neither
+    does the user, beyond an eventual Status hint after the fact.
+
+    Only genuinely destructive tools (is_destructive_tool — deletes,
+    force-pushes, revokes access, anything with the MCP spec's
+    destructiveHint) are held back. `context["mcp_confirmed_writes"]` is
+    the hook for that gate (a set of namespaced tool names explicitly
+    approved for this run) — no UI grants that yet, so a destructive tool
+    safely refuses by default rather than silently executing."""
     split = _split_namespaced(name)
     if split is None:
         raise MCPToolExecutionError(f"Not an MCP tool: {name}")
     server_name, tool_name = split
 
     try:
-        if is_write_tool(server_name, tool_name):
+        if is_destructive_tool(server_name, tool_name):
             confirmed = name in (context.get("mcp_confirmed_writes") or set())
             if not confirmed:
                 return (
-                    f"'{tool_name}' on '{server_name}' makes a real change and needs explicit "
+                    f"'{tool_name}' on '{server_name}' is a destructive action and needs explicit "
                     f"user confirmation before it can run — it was not executed."
                 )
         return call_tool(server_name, tool_name, arguments)

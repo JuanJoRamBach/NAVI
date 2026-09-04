@@ -93,6 +93,11 @@ def search(query: str, limit: int = 20) -> list[dict]:
         if not meta.get("isLatest", True):
             continue
         simplified = _simplify(entry)
-        if simplified["transport"]:
+        # http-only (2026-09-04): stdio servers are disabled entirely — no
+        # sandbox exists for arbitrary local process execution (deferred,
+        # unfunded; see dispatcher/mcp_client.py). Surfacing a stdio-only
+        # result here would just be a dead end at connect time, so it's
+        # filtered before the user ever sees it rather than after.
+        if simplified["transport"] == "http":
             results.append(simplified)
     return results
