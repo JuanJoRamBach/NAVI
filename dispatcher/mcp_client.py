@@ -57,7 +57,7 @@ import re
 from config.store import config
 
 try:
-    import httpx2
+    import httpx
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
     from mcp.client.streamable_http import streamable_http_client
@@ -171,7 +171,7 @@ class _Session:
             # goes through an httpx client instance instead (checked
             # against the installed SDK's real signature, not assumed).
             http_client = (
-                httpx2.AsyncClient(headers={"Authorization": self._conn["auth_header"]})
+                httpx.AsyncClient(headers={"Authorization": self._conn["auth_header"]})
                 if self._conn.get("auth_header") else None
             )
             self._transport_cm = streamable_http_client(self._conn["url"], http_client=http_client)
