@@ -910,7 +910,9 @@ async def mcp_oauth_start(name: str) -> JSONResponse:
     try:
         flow = await asyncio.to_thread(start_authorization, name, conn["url"], MCP_OAUTH_REDIRECT_URI)
     except MCPOAuthError as e:
+        print(f"[mcp_oauth_start] discovery/registration failed for '{name}': {e}")
         return JSONResponse({"error": str(e)}, status_code=502)
+    print(f"[mcp_oauth_start] '{name}': redirecting to {flow['authorize_url'][:80]}…")
     with _pending_oauth_lock:
         _pending_oauth[flow["state"]] = {
             "server_name": name, "code_verifier": flow["code_verifier"], "token_endpoint": flow["token_endpoint"],
@@ -931,7 +933,14 @@ async def mcp_oauth_callback(request: Request) -> RedirectResponse:
     state = request.query_params.get("state")
     with _pending_oauth_lock:
         pending = _pending_oauth.pop(state, None) if state else None
-    if request.query_params.get("error") or not pending or not code:
+    if request.query_params.get("error"):
+        print(f"[mcp_oauth_callback] provider returned an error: {dict(request.query_params)}")
+        return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=error")
+    if not pending:
+        print(f"[mcp_oauth_callback] no pending flow for state={state!r} — expired, already used, or the server restarted mid-flow")
+        return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=error")
+    if not code:
+        print(f"[mcp_oauth_callback] no code in callback params: {dict(request.query_params)}")
         return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=error")
 
     try:
@@ -939,17 +948,20 @@ async def mcp_oauth_callback(request: Request) -> RedirectResponse:
             exchange_code_for_token, pending["token_endpoint"], code, pending["code_verifier"],
             pending["client_id"], pending["client_secret"], pending["redirect_uri"],
         )
-    except MCPOAuthError:
+    except MCPOAuthError as e:
+        print(f"[mcp_oauth_callback] token exchange failed for '{pending['server_name']}': {e}")
         return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=error")
 
     server_name = pending["server_name"]
     conn = config.get_mcp_connection(server_name)
     if conn is None:
+        print(f"[mcp_oauth_callback] connection '{server_name}' vanished between /oauth/start and this callback")
         return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=error")
     # Stores the token exactly like a pasted one — encrypted at rest via
     # config.set_mcp_connection's existing auth_header handling, same
     # code path a manual paste already goes through.
     config.set_mcp_connection(server_name, conn["transport"], url=conn["url"], auth_header=f"Bearer {access_token}")
+    print(f"[mcp_oauth_callback] token exchange succeeded for '{server_name}', discovering tools next")
 
     try:
         discovered = await asyncio.to_thread(discover_tools, server_name)
@@ -957,7 +969,9 @@ async def mcp_oauth_callback(request: Request) -> RedirectResponse:
         if new_tools:
             approve_tools(server_name, new_tools)
         config.set_mcp_connected(server_name, True)
-    except MCPError:
+        print(f"[mcp_oauth_callback] '{server_name}' fully connected, {len(discovered)} tool(s) discovered")
+    except MCPError as e:
+        print(f"[mcp_oauth_callback] token exchange succeeded but discover_tools failed for '{server_name}': {e}")
         return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=partial&connection={server_name}")
 
     return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=success&connection={server_name}")
