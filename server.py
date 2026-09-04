@@ -809,17 +809,20 @@ async def agent_unstar_workflow(workflow_id: str) -> JSONResponse:
 # client/security model — this is just the REST surface over it) ----
 
 @app.get("/mcp/marketplace/search")
-async def mcp_marketplace_search(q: str = "", limit: int = 20) -> JSONResponse:
+async def mcp_marketplace_search(q: str = "", limit: int = 20, cursor: str | None = None) -> JSONResponse:
     """Real-time proxy over the official MCP Registry (tools/
     mcp_marketplace.py) — lets ConnectionsOverlay show actual, searchable
-    MCP servers instead of only the fixed SERVICE_CATALOG. Read-only, no
+    MCP servers instead of only the fixed CORE_SERVICES list. Read-only, no
     connection is made here; a result just pre-fills the existing
-    /mcp/connections + /connect flow below with real transport info."""
+    /mcp/connections + /connect flow below with real transport info.
+    `cursor` (from a previous response's `next_cursor`) pages through
+    results — the registry's own empty-query listing is recency-only, not
+    curated, so there's no natural "end" short of paging through it."""
     try:
-        results = await asyncio.to_thread(search_mcp_marketplace, q, min(limit, 50))
+        results, next_cursor = await asyncio.to_thread(search_mcp_marketplace, q, min(limit, 50), cursor)
     except MCPMarketplaceError as e:
         return JSONResponse({"error": str(e)}, status_code=502)
-    return JSONResponse({"results": results})
+    return JSONResponse({"results": results, "next_cursor": next_cursor})
 
 
 @app.post("/mcp/connections")

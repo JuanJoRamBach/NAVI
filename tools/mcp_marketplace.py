@@ -68,13 +68,21 @@ def _simplify(entry: dict) -> dict:
     return result
 
 
-def search(query: str, limit: int = 20) -> list[dict]:
+def search(query: str, limit: int = 20, cursor: str | None = None) -> tuple[list[dict], str | None]:
     """Real names, no key needed. `query` searches server names/
     descriptions server-side (the registry's own `search` param);
-    empty returns whatever's most recently published."""
+    empty returns whatever's most recently published — NOT curated or
+    ranked by relevance/popularity, just recency, which is why an empty
+    search can look like an arbitrary grab-bag (real behavior, not a bug
+    here; ConnectionsOverlay labels it "Recently published" rather than
+    implying any curation). Returns (results, next_cursor) — cursor-based
+    pagination, matching the registry's own `metadata.nextCursor` shape;
+    pass a truthy `next_cursor` back in as `cursor` for the next page."""
     params: dict = {"limit": limit}
     if query:
         params["search"] = query
+    if cursor:
+        params["cursor"] = cursor
     try:
         resp = requests.get(REGISTRY_URL, params=params, timeout=15)
     except requests.RequestException as e:
@@ -100,4 +108,4 @@ def search(query: str, limit: int = 20) -> list[dict]:
         # filtered before the user ever sees it rather than after.
         if simplified["transport"] == "http":
             results.append(simplified)
-    return results
+    return results, data.get("metadata", {}).get("nextCursor")
