@@ -91,17 +91,28 @@ DEFAULTS = {
         # jobs/model_ranking.py's free-tier prefix list) — not
         # code-specific like Codestral, which is why dev_slate_chat's own
         # fallback isn't reused here as-is.
+        # Fallback chain widened 2026-09-04 (JuanJo): Cloudflare added as a
+        # second door before Mistral — llama-3.1-8b-instruct-fp8-fast has
+        # real native tool-calling support and is cheap (4,119/34,868
+        # neurons per M in/out — a typical exchange costs ~50 neurons, well
+        # inside the shared 10,000/day budget alongside dev_slate_chat's
+        # coding role). No prior reason ruled Cloudflare out here — it
+        # just hadn't been considered when this role was first wired.
         "normal_chat": {
             "provider": "llm7", "model": "gpt-oss",
-            "fallback": [{"provider": "mistral", "model": "mistral-small-latest"}],
+            "fallback": [
+                {"provider": "cloudflare", "model": "@cf/meta/llama-3.1-8b-instruct-fp8-fast"},
+                {"provider": "mistral", "model": "mistral-small-latest"},
+            ],
         },
         "dispatcher_autonomous": {"provider": "groq", "model": "openai/gpt-oss-120b"},
         # dev_slate_chat: backs Dev Slate's own chat (dispatcher/devslate_chat.py),
         # a separate role from normal_chat since it needs a genuinely
         # coding-capable model, not whatever's cheapest for everyday
-        # questions. Reuses the same model /code's task_routing already
-        # pins (Cloudflare's qwen2.5-coder), with Mistral's Codestral as
-        # fallback. Deliberately NO Groq anywhere in this role, primary
+        # questions. Cloudflare's qwen2.5-coder, with Mistral's Codestral
+        # as fallback — the only coding-model role left in this store
+        # since /code (a separate, redundant one-shot command) was
+        # retired 2026-09-04. Deliberately NO Groq anywhere in this role, primary
         # or fallback: Groq's free tier caps at 8K tokens/minute, and
         # Dev Slate's baseline turn (mode brief + task-state block + real
         # conversation history) realistically exceeds that before any
@@ -113,12 +124,26 @@ DEFAULTS = {
         },
         # agent_work: backs each node of an Agent Work workflow run
         # (dispatcher/agent_work.py) AND Agent Work's own chat
-        # (run_stored_mode_chat) — runs unattended / replays a real
-        # windowed history same as normal_chat, so same Groq-exclusion
-        # reasoning applies, same primary + fallback pair.
+        # (run_stored_mode_chat). Moved BACK onto Groq's gpt-oss-120b as
+        # primary (2026-09-04, JuanJo) — the reasoning that excluded Groq
+        # here on 2026-09-01 (a real 20-message history replay blowing
+        # past Groq's 8K tokens/minute cap) no longer applies: agent_work
+        # went deliberately stateless on 2026-09-03 (see dispatcher/
+        # chat.py's own comment, "agent_work is deliberately stateless"),
+        # so there's no big replayed window here anymore, just one bare
+        # prompt per node/turn. gpt-oss-120b over 20b since agent_work's
+        # job (planning workflow steps, deciding branches) benefits from
+        # the bigger model, and both share the same 30 RPM/1,000 RPD/
+        # 200K TPD free-tier ceiling — no quota cost to picking the
+        # stronger one. Fallback: same Cloudflare model as normal_chat's
+        # fallback (see that role's comment), then Mistral's Ministral as
+        # a second door.
         "agent_work": {
-            "provider": "llm7", "model": "gpt-oss",
-            "fallback": [{"provider": "mistral", "model": "mistral-small-latest"}],
+            "provider": "groq", "model": "openai/gpt-oss-120b",
+            "fallback": [
+                {"provider": "cloudflare", "model": "@cf/meta/llama-3.1-8b-instruct-fp8-fast"},
+                {"provider": "mistral", "model": "ministral-8b-latest"},
+            ],
         },
     },
     "task_routing": {
@@ -141,14 +166,6 @@ DEFAULTS = {
             "primary": {"provider": "ollama_cloud", "model": "minimax-m3:cloud"},
             "fallback": [],
         },
-        "code": {
-            # Verified directly against Cloudflare Workers AI on 2026-08-17 —
-            # real coding-specialist model, real 200 response, 2.7 Neurons for
-            # the test call (10,000/day free). No fallback yet since this is
-            # the first real thing wired in for /code.
-            "primary": {"provider": "cloudflare", "model": "@cf/qwen/qwen2.5-coder-32b-instruct"},
-            "fallback": [],
-        },
         "graph-data": {
             # Verified against OpenRouter's live /api/v1/models on 2026-08-17 —
             # free pricing AND supports the "tools" param (required for the
@@ -157,10 +174,6 @@ DEFAULTS = {
             # the churn problem the daily-ranking job is meant to solve.
             "primary": {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
             "fallback": [{"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}],
-        },
-        "create-image": {
-            "primary": {"provider": "openrouter", "model": None},  # filled in only on days one's free
-            "fallback": [],
         },
         "summarize": {
             # Own quota bucket, same reasoning as dispatcher_autonomous vs
@@ -187,18 +200,6 @@ DEFAULTS = {
             # models already verified to support that.
             "primary": {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
             "fallback": [{"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}],
-        },
-        "tailor": {
-            "primary": {"provider": "groq", "model": "openai/gpt-oss-20b"},
-            "fallback": [],
-        },
-        "design-read": {
-            # The only vision-capable model in the current roster — LLM7's
-            # turbo-tier gemini-3.1-flash-lite. Nothing else configured
-            # (Groq/OpenRouter/Cloudflare/Ollama Cloud roster here) does
-            # vision, so no fallback chain yet.
-            "primary": {"provider": "llm7", "model": "gemini-3.1-flash-lite"},
-            "fallback": [],
         },
         # No "brainstorm" entry — retired as a standalone command (2026-08-27):
         # Brainstorm mode's own conversational chat (dispatcher/modes/
@@ -320,6 +321,10 @@ class ConfigStore:
         self._data.setdefault("task_routing", {})[command] = {
             "primary": primary, "fallback": fallback,
         }
+        self._save()
+
+    def remove_task_routing(self, command: str):
+        self._data.get("task_routing", {}).pop(command, None)
         self._save()
 
     # ---- MCP connections (see DEFAULTS["mcp_connections"] for shape) ----
@@ -616,3 +621,56 @@ def _migrate_chat_roles_off_groq():
 
 
 _migrate_chat_roles_off_groq()
+
+
+def _migrate_remove_retired_commands():
+    """One-time cleanup (2026-09-04): /code, /tailor, /create-image, and
+    /design-read are retired — /code is redundant with dev_slate_chat
+    (same model, real conversational chat instead of a one-shot command);
+    the other three were JuanJo's call for a commercial-harness MVP
+    ("this will be a commercial harness... no placeholders for a MVP" —
+    design-read was already shipped disabled in the PWA). Editing
+    DEFAULTS alone only affects a brand-new store — an existing
+    config.json (this server included, live on Lightsail) keeps whatever
+    it already had until this runs once. Guarded so a manual re-add later
+    isn't fought by this."""
+    if config.get("migrated_remove_retired_commands"):
+        return
+    for command in ("code", "tailor", "create-image", "design-read"):
+        config.remove_task_routing(command)
+    config.set("migrated_remove_retired_commands", True)
+
+
+_migrate_remove_retired_commands()
+
+
+def _migrate_widen_chat_fallbacks_2026_09_04():
+    """One-time correction (2026-09-04) for an already-materialized
+    config.json (this server's live one included) — DEFAULTS above now
+    has normal_chat/agent_work on their new fallback chains, but that
+    only affects a brand-new store. Force-overwrites both roles (not a
+    fill-in-if-missing migration) since the whole point is correcting
+    values that already exist, same pattern as
+    _migrate_chat_roles_off_groq. agent_work also moves its primary back
+    to Groq's gpt-oss-120b — see that role's DEFAULTS comment for why
+    that's safe now (agent_work went stateless 2026-09-03)."""
+    if config.get("migrated_widen_chat_fallbacks_2026_09_04"):
+        return
+    config.set_role(
+        "normal_chat", "llm7", "gpt-oss",
+        fallback=[
+            {"provider": "cloudflare", "model": "@cf/meta/llama-3.1-8b-instruct-fp8-fast"},
+            {"provider": "mistral", "model": "mistral-small-latest"},
+        ],
+    )
+    config.set_role(
+        "agent_work", "groq", "openai/gpt-oss-120b",
+        fallback=[
+            {"provider": "cloudflare", "model": "@cf/meta/llama-3.1-8b-instruct-fp8-fast"},
+            {"provider": "mistral", "model": "ministral-8b-latest"},
+        ],
+    )
+    config.set("migrated_widen_chat_fallbacks_2026_09_04", True)
+
+
+_migrate_widen_chat_fallbacks_2026_09_04()

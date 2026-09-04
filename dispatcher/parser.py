@@ -17,7 +17,7 @@ the same output. Three possible results:
 import re
 from dataclasses import dataclass
 
-COMMANDS = ["research", "code", "graph-data", "create-image", "summarize", "recap", "note", "remind", "tailor", "design-read"]
+COMMANDS = ["research", "graph-data", "summarize", "recap", "note", "remind"]
 
 # Max edit distance to flag as a "near miss" worth confirming.
 # Slash-prefixed typos (e.g. "/cade") are a strong command-intent signal,
@@ -37,11 +37,6 @@ class Step:
     command: str
     text: str
     topic_slug: str = ""  # filled in by slugify.py after parsing
-    # Set only for /design-read, after parsing — a data: URL for an
-    # attached image. parse_message never sets this itself (it only ever
-    # sees text); server.py's handle_message threads it on from the
-    # IncomingMessage when a Telegram photo triggered the command.
-    image_data_url: str | None = None
 
 
 @dataclass

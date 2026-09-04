@@ -29,14 +29,9 @@ from pathlib import Path
 
 RCLONE_REMOTE = "filen"
 
-# Maps each command to its top-level Filen folder. create-image maps to
-# "images" per the earlier folder-naming decision (command name doesn't
-# match folder name 1:1 for that one case).
 FOLDER_FOR_COMMAND = {
     "research": "research",
-    "code": "code",
     "graph-data": "graph-data",
-    "create-image": "images",
     "brainstorm": "brainstorm",
 }
 

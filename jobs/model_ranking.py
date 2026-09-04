@@ -5,8 +5,8 @@ Step 1 of the daily self-healing routing design (see the
 navi-model-ranking-design memory, 2026-09-01 — fully specced there,
 this is the first real implementation pass): fetch every provider's
 LIVE model catalog, join it against Artificial Analysis' benchmark
-data, and rank candidates per NAVI task (research/code/graph-data/
-summarize/recap/note/remind/tailor/design-read).
+data, and rank candidates per NAVI task (research/graph-data/summarize/
+recap/note/remind).
 
 Deliberately does NOT write into config/store.py's task_routing yet.
 Same reasoning daily_model_digest.py already stated: auto-applying to
@@ -64,24 +64,19 @@ GROQ_EXCLUDE_PATTERNS = ("guard", "safeguard", "allam")
 # Per-task selection requirements. "tier" is a preference, not a hard
 # filter — small tasks prefer an SLM but will take an LLM if nothing
 # smaller qualifies; this mirrors NAVI's existing manual choices
-# (gpt-oss-20b for summarize/recap/note/tailor, bigger models for
-# research/code) rather than inventing new judgment calls.
+# (gpt-oss-20b for summarize/recap/note, bigger models for research)
+# rather than inventing new judgment calls.
 TASK_REQUIREMENTS = {
     "research": {"tools": True, "min_context": 8000, "tier": "large"},
-    "code": {"tools": False, "min_context": 8000, "tier": "large"},
     "graph-data": {"tools": True, "min_context": 4000, "tier": "small"},
     "remind": {"tools": True, "min_context": 4000, "tier": "small"},
     "summarize": {"tools": False, "min_context": 4000, "tier": "small"},
     "recap": {"tools": False, "min_context": 4000, "tier": "small"},
     "note": {"tools": False, "min_context": 4000, "tier": "small"},
-    "tailor": {"tools": False, "min_context": 4000, "tier": "small"},
-    "design-read": {"tools": False, "min_context": 4000, "tier": "small", "vision": True},
     # Dev Slate's own conversational coding chat (dispatcher/devslate_chat.py,
-    # 2026-09-01) — separate entry from "code" (the single-shot /code
-    # command) since the two may want to diverge later; same requirements
-    # for now. min_context is higher than /code's: a Dev Slate turn
-    # carries a mode brief + task-state block + real conversation history,
-    # not one bare prompt.
+    # 2026-09-01). min_context is higher than the other tasks': a Dev
+    # Slate turn carries a mode brief + task-state block + real
+    # conversation history, not one bare prompt.
     "devslate": {"tools": False, "min_context": 16000, "tier": "large"},
     # Agent Work's own chat (dispatcher/chat.py's run_stored_mode_chat,
     # mode: "agent_work", 2026-09-01) — tools=True since its whole point
@@ -461,7 +456,6 @@ def fetch_aa_benchmarks(api_key: str | None, force: bool = False) -> dict:
 # task, instead of always using the generic intelligence_index. Falls
 # back to intelligence_index for any task not listed here.
 TASK_QUALITY_DIMENSION = {
-    "code": "coding_index",
     "devslate": "coding_index",
 }
 
@@ -595,9 +589,22 @@ def build_ranking_snapshot() -> dict:
     }
 
 
-def main() -> None:
+def refresh_snapshot() -> dict:
+    """Builds a fresh snapshot and writes it to MODEL_RANKING_PATH — the
+    one real write path load_snapshot() reads back. Shared by main()
+    below and dispatcher/scheduler.py's in-process recurring job
+    (registered from server.py, 2026-09-04) — the job has to run wherever
+    this file is actually read from (the live server process), not on a
+    GitHub Actions runner's ephemeral disk, which is why this was never
+    reachable on a schedule before: no prior mechanism connected this
+    job's output to the live server at all, only a one-off manual run."""
     snapshot = build_ranking_snapshot()
     MODEL_RANKING_PATH.write_text(json.dumps(snapshot, indent=2))
+    return snapshot
+
+
+def main() -> None:
+    snapshot = refresh_snapshot()
 
     total_free = sum(c["free"] for c in snapshot["provider_counts"].values())
     print(f"Fetched {total_free} free models across providers: {snapshot['provider_counts']}")

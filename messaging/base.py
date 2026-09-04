@@ -18,10 +18,6 @@ class IncomingMessage:
     sender_id: str = ""
     sender_name: str = ""
     raw: dict | None = None
-    # Set when the incoming message carried an image (e.g. a Telegram
-    # photo) — a data: URL, ready to drop straight into a vision-model
-    # ChatMessage's content. None for a plain text message.
-    image_data_url: str | None = None
 
 
 class MessagingError(Exception):

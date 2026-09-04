@@ -31,7 +31,6 @@ from providers.registry import ProviderNotConfigured, get_provider
 from storage.filen import StorageError, save_bytes, save_result
 from tools.charts import CHART_TOOL_CHOICE, CHART_TOOL_NAME, CHART_TOOL_SCHEMA, ChartError, render_chart
 from tools.documents import DocumentRenderError, render as render_document
-from tools.image_gen import ImageGenError, generate_image
 from tools.registry import TOOL_SCHEMAS, schemas_for
 from tools.registry import dispatch as dispatch_tool
 
@@ -54,121 +53,6 @@ def _extract_file_request(text: str) -> tuple[str, str | None]:
     fmt = (match.group(1) or "pdf").lower()
     cleaned = (text[:match.start()] + text[match.end():]).strip()
     return cleaned, fmt
-
-
-# /code saved with a hardcoded ".py" regardless of what language the
-# model actually generated — detected instead from the language tag on
-# the first fenced code block in the reply (```python, ```javascript,
-# etc.), which every provider reliably includes for generated code.
-# Falls back to EXTENSION_FOR_COMMAND's "py" default when nothing
-# matches, rather than guessing.
-_CODE_LANG_EXTENSIONS = {
-    "python": "py", "py": "py",
-    "javascript": "js", "js": "js",
-    "typescript": "ts", "ts": "ts",
-    "jsx": "jsx", "tsx": "tsx",
-    "go": "go", "golang": "go",
-    "rust": "rs", "rs": "rs",
-    "java": "java",
-    "c": "c",
-    "cpp": "cpp", "c++": "cpp",
-    "csharp": "cs", "c#": "cs", "cs": "cs",
-    "ruby": "rb", "rb": "rb",
-    "php": "php",
-    "swift": "swift",
-    "kotlin": "kt",
-    "html": "html",
-    "css": "css",
-    "sql": "sql",
-    "bash": "sh", "sh": "sh", "shell": "sh",
-    "json": "json",
-    "yaml": "yaml", "yml": "yaml",
-    "xml": "xml",
-}
-_CODE_BLOCK_RE = re.compile(r"```(\w+)\n(.*?)```", re.DOTALL)
-# Catches a fence the model opened but never closed — a real, observed
-# formatting slip (e.g. a CSS block cut off with no trailing ```). Only
-# searched in the text *after* the last complete match, so a properly
-# closed block never gets double-counted as also being this trailing one.
-_UNCLOSED_CODE_BLOCK_RE = re.compile(r"```(\w+)\n(.*)\Z", re.DOTALL)
-
-
-def _extract_code_blocks(text: str) -> list[tuple[str, str]]:
-    """Returns [(language, code), ...] for every fenced block in the
-    reply, in order — not just the first, so an html+css+js reply can be
-    bundled into one viewable page instead of only ever looking at the
-    first block. A trailing block with no closing fence is still
-    included (as "everything to the end") rather than silently dropped."""
-    blocks = [(lang.lower(), code.strip("\n")) for lang, code in _CODE_BLOCK_RE.findall(text)]
-    consumed_end = 0
-    for m in _CODE_BLOCK_RE.finditer(text):
-        consumed_end = m.end()
-    trailing = _UNCLOSED_CODE_BLOCK_RE.search(text[consumed_end:])
-    if trailing:
-        blocks.append((trailing.group(1).lower(), trailing.group(2).strip("\n")))
-    return blocks
-
-
-# Filenames for /code's separate-files mode — real project-shaped names
-# for the languages that pair up in a typical web reply, rather than
-# generic "code.css"/"code.js".
-_SEPARATE_FILE_NAME_FOR_LANG = {"html": "index", "css": "styles", "javascript": "script", "js": "script"}
-
-
-@dataclass
-class CodeFile:
-    filename: str
-    content: str
-    ext: str
-    viewable: bool = False
-
-
-def _build_code_artifact(text: str, base_name: str) -> list[CodeFile]:
-    """Turns a /code reply into real downloadable file(s) — deliberately
-    NOT the raw chat reply (prose explanation + markdown fences), just
-    the actual generated code, so the download button hands over real
-    source, not a markdown transcript.
-
-    Bundles into ONE self-contained HTML document (CSS/JS inlined) only
-    when there's an HTML block AND 3+ total code blocks — JuanJo's call:
-    a 2-block html+css reply is exactly the "two real files" case (an
-    index.html that legitimately wants to sit next to its own styles.css)
-    and shouldn't get silently merged; 3+ is where bundling into one
-    viewable page actually saves real friction. Below that threshold, or
-    with no HTML at all, every block becomes its own separate file.
-    Falls back to the raw reply text as one .txt file if no fenced block
-    was found at all, so nothing is silently dropped.
-    """
-    blocks = _extract_code_blocks(text)
-    if not blocks:
-        return [CodeFile(filename=f"{base_name}.txt", content=text, ext="txt")]
-
-    html_blocks = [code for lang, code in blocks if lang == "html"]
-    if html_blocks and len(blocks) >= 3:
-        html = html_blocks[0]
-        css_blocks = [code for lang, code in blocks if lang == "css"]
-        js_blocks = [code for lang, code in blocks if lang in ("javascript", "js")]
-        if css_blocks and "<style" not in html:
-            style_tag = "<style>\n" + "\n".join(css_blocks) + "\n</style>"
-            html = html.replace("</head>", f"{style_tag}\n</head>") if "</head>" in html else f"{style_tag}\n{html}"
-        if js_blocks and "<script" not in html:
-            script_tag = "<script>\n" + "\n".join(js_blocks) + "\n</script>"
-            html = html.replace("</body>", f"{script_tag}\n</body>") if "</body>" in html else f"{html}\n{script_tag}"
-        return [CodeFile(filename=f"{base_name}.html", content=html, ext="html", viewable=True)]
-
-    files = []
-    used_names: set[str] = set()
-    for lang, code in blocks:
-        ext = _CODE_LANG_EXTENSIONS.get(lang, "txt")
-        stem = _SEPARATE_FILE_NAME_FOR_LANG.get(lang, base_name)
-        name = f"{stem}.{ext}"
-        suffix = 2
-        while name in used_names:
-            name = f"{stem}_{suffix}.{ext}"
-            suffix += 1
-        used_names.add(name)
-        files.append(CodeFile(filename=name, content=code, ext=ext, viewable=(lang == "html")))
-    return files
 
 
 def _attach_requested_file(result: "StepResult", file_format: str | None) -> "StepResult":
@@ -225,15 +109,11 @@ RESEARCH_DOC_CHAR_BUDGET = 100_000 * 4
 # File extension per command — used when saving each step's output.
 EXTENSION_FOR_COMMAND = {
     "research": "md",
-    "code": "py",  # best-guess default; language-specific naming can improve this later
     "graph-data": "png",
-    "create-image": "png",
     "summarize": "md",
     "recap": "md",
     "note": "md",
     "remind": "md",
-    "tailor": "md",
-    "design-read": "md",
 }
 
 # /summarize gets exactly one tool (fetch_page), not the full research
@@ -449,14 +329,6 @@ class StepResult:
     rendered_file_bytes: bytes | None = None
     rendered_file_name: str | None = None
     rendered_file_saved_path: str | None = None  # "filen:..." — set once actually saved
-    # Set only for /code — the extracted code file(s) (see
-    # _build_code_artifact): one entry for a single-language reply or a
-    # bundled HTML+CSS+JS page, multiple entries for a reply that
-    # produced separate files (e.g. index.html + styles.css). Each gets
-    # its own Filen save and its own download chip — real source, not
-    # the raw chat reply's prose + markdown fences.
-    code_files: list[CodeFile] = field(default_factory=list)
-    code_saved: list[tuple[str, str]] = field(default_factory=list)  # [(filename, "filen:...saved_path"), ...]
 
 
 def _parse_tool_args(raw_args) -> dict:
@@ -499,22 +371,6 @@ def _run_graph_data_step(
     title = args.get("title", "chart")
     filename = f"{title[:40].strip().replace(' ', '-') or 'chart'}.png"
     return png_bytes, filename, f"📊 {title}"
-
-
-def _run_create_image_step(step: Step) -> StepResult:
-    """
-    /create-image has no LLM/provider involved at all — a fixed free
-    endpoint (see tools/image_gen.py), not something task_routing's
-    primary/fallback shape fits. Bypasses the routing/attempts loop below
-    entirely rather than forcing a "provider" that doesn't exist onto it.
-    """
-    try:
-        image_bytes = generate_image(step.text)
-    except ImageGenError as e:
-        return StepResult(step=step, text="", error=str(e))
-
-    filename = f"{step.topic_slug or 'image'}.png"
-    return StepResult(step=step, text=f"🎨 {step.text[:80]}", image_bytes=image_bytes, image_filename=filename)
 
 
 def _make_snippet(text: str, max_chars: int = 600) -> str:
@@ -878,114 +734,6 @@ def _run_summarize_step(step: Step, prior_context: str | None) -> StepResult:
     return _attach_requested_file(result, file_format)
 
 
-# The only command whose input is an image, not text — routed to a
-# vision-capable model (see config/store.py's task_routing entry) via a
-# ChatMessage.content list (see providers/base.py) instead of a plain
-# string. Currently only reachable via a Telegram photo (see
-# messaging/telegram.py) — the PWA has no upload UI yet, deliberately
-# deferred (see NAVI v2 handoff notes).
-DESIGN_READ_SYSTEM_PROMPT = (
-    "You're given a screenshot of a UI or design. Identify the design pattern(s) "
-    "in use (e.g. 'card grid with sticky filter bar', 'stepped onboarding wizard', "
-    "'inline validation form') — be specific, not generic. Then write a ready-to-"
-    "paste prompt for Claude Code that would recreate this UI in a real codebase: "
-    "specific about layout, spacing, states, and interaction, not vague. "
-    "Structure your reply exactly as:\n\n"
-    "Pattern: <name>\n\n"
-    "Claude Code prompt:\n<the prompt, ready to paste as-is>"
-)
-
-
-def _run_design_read_step(step: Step, prior_context: str | None) -> StepResult:
-    if not step.image_data_url:
-        return StepResult(
-            step=step, text="",
-            error="No image attached — send a screenshot along with /design-read.",
-        )
-
-    routing = config.get_task_routing("design-read")
-    if not routing:
-        return StepResult(step=step, text="", error="No routing configured for /design-read")
-
-    attempts = [routing["primary"]] + routing.get("fallback", [])
-    last_error = None
-
-    user_content = [
-        {"type": "text", "text": step.text or "Read this design."},
-        {"type": "image_url", "image_url": {"url": step.image_data_url}},
-    ]
-
-    for i, attempt in enumerate(attempts):
-        model = attempt.get("model")
-        if not model:
-            continue
-        try:
-            provider = get_provider(attempt["provider"])
-        except Exception as e:
-            last_error = str(e)
-            continue
-
-        messages = [
-            ChatMessage(role="system", content=DESIGN_READ_SYSTEM_PROMPT),
-            ChatMessage(role="user", content=user_content),
-        ]
-
-        try:
-            response = provider.chat(model=model, messages=messages)
-            return StepResult(
-                step=step,
-                text=response.text or "",
-                degraded=(i > 0),
-                fallback_used=attempt if i > 0 else None,
-                usage_note=response.usage_note,
-            )
-        except ProviderError as e:
-            last_error = str(e)
-            continue
-
-    return StepResult(step=step, text="", error=last_error or "All design-read providers failed")
-
-
-# The CV lives at a link JuanJo controls (portfolio site, hosted PDF, etc.)
-# rather than pasted text or stored raw — set once via "/tailor cv: <link>",
-# read back on every later /tailor call. A deterministic "cv:" prefix
-# rather than guessing intent from a bare URL, since a job posting can
-# also be just a link.
-TAILOR_SYSTEM_PROMPT_TEMPLATE = (
-    "You're helping tailor a job application. The user's CV is at this link — "
-    "call fetch_page on it to read it: {cv_link}\n\n"
-    "The job posting is given below in the user's message; if it's a URL, call "
-    "fetch_page on that too, otherwise it's already pasted text.\n\n"
-    "Produce two clearly separated sections:\n"
-    "1. A tailored cover note — short, specific to this posting, grounded only "
-    "in what's actually in the CV, no invented experience.\n"
-    "2. An honest fit rundown: why they'd likely fit, and where they might not "
-    "— a realistic read is more useful than a flattering one."
-)
-
-
-def _run_tailor_step(step: Step, prior_context: str | None) -> StepResult:
-    text = step.text.strip()
-
-    if text.lower().startswith("cv:"):
-        link = text[3:].strip()
-        if not link:
-            return StepResult(step=step, text="", error="No link given after 'cv:'")
-        config.set("cv_link", link)
-        return StepResult(step=step, text=f"CV link saved: {link}")
-
-    cv_link = config.get("cv_link")
-    if not cv_link:
-        return StepResult(
-            step=step, text="",
-            error="No CV link on file yet — set one first with /tailor cv: <link>",
-        )
-
-    tailor_step = Step(command=step.command, text=text, topic_slug=step.topic_slug)
-    system_prompt = TAILOR_SYSTEM_PROMPT_TEMPLATE.format(cv_link=cv_link)
-    return _run_text_transform_step(tailor_step, prior_context, "tailor", system_prompt, ["fetch_page"])
-
-
 def _run_recap_step(step: Step, prior_context: str | None) -> StepResult:
     text, file_format = _extract_file_request(step.text)
     working_step = Step(command=step.command, text=text, topic_slug=step.topic_slug)
@@ -1001,8 +749,6 @@ def _run_note_step(step: Step, prior_context: str | None) -> StepResult:
 
 
 def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
-    if step.command == "create-image":
-        return _run_create_image_step(step)
     if step.command == "research":
         return _run_research_step(step, prior_context)
     if step.command == "summarize":
@@ -1013,10 +759,6 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
         return _run_note_step(step, prior_context)
     if step.command == "remind":
         return _run_remind_step(step, prior_context)
-    if step.command == "tailor":
-        return _run_tailor_step(step, prior_context)
-    if step.command == "design-read":
-        return _run_design_read_step(step, prior_context)
 
     routing = config.get_task_routing(step.command)
     if not routing:
@@ -1028,7 +770,7 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
     for i, attempt in enumerate(attempts):
         model = attempt.get("model")
         if not model:
-            continue  # e.g. create-image with nothing free today — skip to next fallback
+            continue
         try:
             provider = get_provider(attempt["provider"])
         except Exception as e:
@@ -1060,16 +802,12 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
                 )
 
             response = provider.chat(model=model, messages=messages)
-            code_files = []
-            if step.command == "code":
-                code_files = _build_code_artifact(response.text or "", step.topic_slug or "code")
             return StepResult(
                 step=step,
                 text=response.text or "",
                 degraded=(i > 0),  # true if this wasn't the primary
                 fallback_used=attempt if i > 0 else None,
                 usage_note=response.usage_note,
-                code_files=code_files,
             )
         except (ProviderError, ChartError) as e:
             last_error = str(e)
@@ -1115,20 +853,6 @@ def run_chain(steps: list[Step]) -> list[StepResult]:
                 )
             except StorageError as e:
                 result.save_error = str(e)
-        elif result.code_files:
-            # /code — one save per extracted file (see _build_code_artifact:
-            # a bundled HTML page is still exactly one entry here, a
-            # separate-files reply is several). Each failure is disclosed
-            # individually rather than aborting the rest.
-            for cf in result.code_files:
-                try:
-                    saved = save_result(
-                        command=step.command, topic_slug=step.topic_slug,
-                        filename=cf.filename, content=cf.content,
-                    )
-                    result.code_saved.append((cf.filename, saved))
-                except StorageError as e:
-                    result.save_error = (result.save_error or "") + f" {cf.filename} not saved: {e}"
         elif result.text:
             ext = EXTENSION_FOR_COMMAND.get(step.command, "txt")
             filename = f"{step.command}.{ext}"

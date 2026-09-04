@@ -66,7 +66,7 @@ from messaging.base import IncomingMessage, MessagingAdapter, MessagingError
 from messaging.discord import DiscordAdapter
 from messaging.telegram import TelegramAdapter
 from config.store import config
-from jobs.model_ranking import fetch_aa_benchmarks, list_candidates, load_snapshot
+from jobs.model_ranking import fetch_aa_benchmarks, list_candidates, load_snapshot, refresh_snapshot
 from push.sender import PushError, add_subscription, send_push, subscription_count
 from storage.filen import StorageError, download_for_reply
 from storage.conversations import (
@@ -124,6 +124,20 @@ app.add_middleware(
 )
 
 
+async def _refresh_model_ranking_snapshot() -> None:
+    """Regenerates model_ranking_snapshot.json in-process, on the live
+    server itself — the only place load_snapshot() (GET /config/models,
+    the PWA's "Today's models" picker) actually reads it from. Real gap
+    found 2026-09-04 (JuanJo: a model confirmed live on LLM7 wasn't
+    selectable — the snapshot on disk was 3 days stale): nothing ever
+    ran jobs/model_ranking.py on a schedule anywhere. A GitHub Actions
+    cron would write to that runner's own ephemeral disk, never reaching
+    this process, so this has to be an in-process job, not an external
+    ping. build_ranking_snapshot() does real blocking HTTP calls to every
+    provider — run off the event loop so it can't stall other requests."""
+    await asyncio.to_thread(refresh_snapshot)
+
+
 @app.on_event("startup")
 async def _start_background_scheduler() -> None:
     """In-process cron (dispatcher/scheduler.py) — registered here so it
@@ -131,6 +145,7 @@ async def _start_background_scheduler() -> None:
     import time (matters for tests/tooling that import server.py without
     running it, e.g. this file's own TestClient-based checks)."""
     register_job("check_due_agent_workflows", config.get("agent_work_due_check_cron", "*/5 * * * *"), check_due_workflows)
+    register_job("refresh_model_ranking_snapshot", "0 6 * * *", _refresh_model_ranking_snapshot)
     start_scheduler()
 
 
@@ -151,9 +166,11 @@ def _file_download_url(saved_path: str | None, render: bool = False) -> str | No
 
     render=True asks /files/ to serve the content inline (renders as a
     real page in a browser tab) instead of forcing a download — only
-    meaningful for /code's HTML output (see CodeFile.viewable in
-    dispatcher/executor.py); every other saved artifact just wants the
-    plain download behavior."""
+    meaningful for a saved .html artifact; every other saved artifact
+    just wants the plain download behavior. No current caller passes
+    render=True (its one use, /code's bundled HTML output, was retired
+    2026-09-04) — kept as generic /files/ capability rather than ripped
+    out, since it isn't /code-specific machinery itself."""
     if not NAVI_FILES_TOKEN or not saved_path or not saved_path.startswith("filen:"):
         return None
     relative = saved_path[len("filen:"):]
@@ -165,24 +182,12 @@ def _pwa_download_links(results: list) -> str:
     """The PWA has no file-attachment channel (unlike Telegram's real
     sendDocument) — a saved artifact reaches it as plain URLs appended
     to the reply text instead, which the frontend detects and renders
-    as clickable chips. Skips image results (graph-data/create-image)
+    as clickable chips. Skips image results (graph-data)
     since those aren't meant to be re-downloaded as a separate file —
-    they're the image. A viewable /code result (bundled HTML) gets
-    BOTH a download line and a separate view line, same file, two
-    different Content-Disposition modes."""
+    they're the image."""
     lines = []
     for r in results:
-        if r.code_saved:
-            viewable_by_name = {cf.filename: cf.viewable for cf in r.code_files}
-            for filename, saved_path in r.code_saved:
-                download_url = _file_download_url(saved_path)
-                if download_url:
-                    lines.append(f"📎 {filename}: {download_url}")
-                if viewable_by_name.get(filename):
-                    view_url = _file_download_url(saved_path, render=True)
-                    if view_url:
-                        lines.append(f"🌐 {filename}: {view_url}")
-        elif r.rendered_file_saved_path and r.rendered_file_name:
+        if r.rendered_file_saved_path and r.rendered_file_name:
             url = _file_download_url(r.rendered_file_saved_path)
             if url:
                 lines.append(f"📎 {r.rendered_file_name}: {url}")
@@ -215,11 +220,6 @@ def handle_message(adapter: MessagingAdapter, msg: IncomingMessage) -> None:
         result = ParseResult(kind="plain_chat", raw_text=pending.raw_text)
     else:
         result = parse_message(msg.text)
-
-    if msg.image_data_url and result.kind == "commands":
-        for s in result.steps:
-            if s.command == "design-read":
-                s.image_data_url = msg.image_data_url
 
     reply_text, attachments = _handle_parse_result(result, msg.chat_id)
 

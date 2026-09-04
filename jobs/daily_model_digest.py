@@ -44,9 +44,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 CAPABILITIES = [
     ("research", "/research"),
-    ("Image-generation", "/create-image"),
     ("graph-data", "/graph-data"),
-    ("code", "/code"),
     ("brainstorm", "/brainstorm"),
 ]
 
@@ -55,8 +53,8 @@ OpenRouter's own API (not a third-party tracker — this is exactly what OpenRou
 actually accept right now). Each line is: model_id (context: N tokens, tools: yes/no).
 
 Based ONLY on what's in the snapshot below, pick the single best current free model \
-for each of these five capabilities, plus up to two fallback models each: \
-research, image-generation, graph-data (data analysis / structured output), code, \
+for each of these three capabilities, plus up to two fallback models each: \
+research, graph-data (data analysis / structured output), \
 brainstorm (general creative/conversational reasoning).
 
 graph-data and brainstorm's "remind" sibling capability both require forced tool-calling \
@@ -69,9 +67,7 @@ snapshot below — never a model you recall from training, even if it sounds pla
 
 Reply in EXACTLY this format, one line per capability, no extra commentary:
 research: MODEL_NAME; fallbacks: MODEL_NAME, MODEL_NAME
-Image-generation: MODEL_NAME; fallbacks: MODEL_NAME
 graph-data: MODEL_NAME; fallbacks: MODEL_NAME
-code: MODEL_NAME; fallbacks: MODEL_NAME
 brainstorm: MODEL_NAME; fallbacks: MODEL_NAME
 
 If none available for a line, write "none available today" in place of MODEL_NAME \
