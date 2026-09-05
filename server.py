@@ -444,6 +444,20 @@ def config_routing() -> dict:
 #   - Mistral: JuanJo's own figure — $10/month free "Experiment" tier
 #     credit — compared against the real billed-dollar total from
 #     providers.mistral.get_admin_usage(), not computed locally.
+#   - OpenRouter: 50 free-model requests/day — JuanJo confirmed directly
+#     (2026-09-05) his account has never crossed the $10-lifetime-
+#     purchased threshold that bumps this to 1,000/day. This can't be
+#     auto-detected from OpenRouter's own API: GET /api/v1/key's `usage`
+#     field is all-time CONSUMED credits, but the real threshold that
+#     decides 50 vs 1,000 is all-time PURCHASED credits (confirmed via
+#     OpenRouter's own docs) — a field their API doesn't expose at all.
+#     Also confirmed (2026-09-05): OpenRouter sends NO rate-limit headers
+#     on successful responses (unlike Groq) — X-RateLimit-Remaining only
+#     appears on the 429 itself, after the limit's already been hit — so
+#     this compares NAVI's own local request count (same generic
+#     per-provider tracking Cloudflare/LLM7 use) against this confirmed
+#     number, an approximation that could drift if something outside NAVI
+#     ever calls this same key, not an OpenRouter-reported live figure.
 # Groq has NO entry here on purpose — its quota is per-model (JuanJo has
 # had to correct this more than once, see the feedback-groq-per-model-
 # quotas memory) and comes from storage.usage.get_groq_snapshots(),
@@ -452,6 +466,7 @@ CLOUDFLARE_DAILY_NEURON_CAP = 10_000
 LLM7_KEYED_DAILY_TOKEN_CAP = 1_000_000
 LLM7_ANONYMOUS_DAILY_TOKEN_CAP = 500_000  # real, but unused by NAVI today
 MISTRAL_MONTHLY_CREDIT_USD = 10.0
+OPENROUTER_DAILY_REQUEST_CAP = 50
 
 
 @app.get("/usage/counters")
@@ -486,16 +501,27 @@ def usage_counters() -> dict:
     ollama_requests = sum(r["requests"] for r in ollama_rows)
     ollama_tokens = sum(r["tokens"] for r in ollama_rows)
 
+    or_rows = get_usage_today("openrouter")
+    openrouter_requests = sum(r["requests"] for r in or_rows)
     key = config.get_provider_key("openrouter")
-    openrouter_key_info = None
+    openrouter_spend_info = None
     if key:
         from providers.openrouter import get_key_info
-        openrouter_key_info = get_key_info(key)
+        openrouter_spend_info = get_key_info(key)
 
     return {
         "groq": {"models": groq_models},
         "cloudflare": {"neurons_used": cloudflare_neurons, "neurons_cap": CLOUDFLARE_DAILY_NEURON_CAP},
-        "openrouter": openrouter_key_info,  # None if no key configured or the live fetch failed
+        "openrouter": {
+            # Requests-left is NAVI's own local count against the
+            # confirmed 50/day cap (see the constant's comment above) —
+            # OpenRouter's API can't tell us this number directly.
+            "requests_used": openrouter_requests,
+            "requests_cap": OPENROUTER_DAILY_REQUEST_CAP,
+            # Real, live spend data OpenRouter DOES report accurately —
+            # shown alongside as context, not as the cap figure itself.
+            "spend": openrouter_spend_info,
+        },
         "llm7": {
             "tokens_used": llm7_tokens,
             "keyed_cap": LLM7_KEYED_DAILY_TOKEN_CAP,
