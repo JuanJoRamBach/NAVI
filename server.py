@@ -211,7 +211,12 @@ async def _start_background_scheduler() -> None:
     import time (matters for tests/tooling that import server.py without
     running it, e.g. this file's own TestClient-based checks)."""
     register_job("check_due_agent_workflows", config.get("agent_work_due_check_cron", "*/5 * * * *"), check_due_workflows)
-    register_job("refresh_model_ranking_snapshot", "0 6 * * *", _refresh_model_ranking_snapshot)
+    # 04:45 UTC = 6:45 Madrid (CEST) / 00:45 New York (EDT) — picked to run
+    # shortly after providers' confirmed 00:00 UTC daily-quota resets
+    # (Cloudflare docs) rather than an arbitrary hour. Drifts by up to an
+    # hour during the ~1-week EU/US DST-changeover gap in late Oct/early
+    # Nov since the two regions switch on different dates — known, not a bug.
+    register_job("refresh_model_ranking_snapshot", "45 4 * * *", _refresh_model_ranking_snapshot)
     start_scheduler()
 
 
@@ -422,6 +427,95 @@ def config_routing() -> dict:
         "task_routing": {cmd: config.get_task_routing(cmd) for cmd in COMMANDS},
         "enabled_providers": config.enabled_providers(),
     }
+
+
+
+# Static caps for providers where "the cap" isn't something a live
+# endpoint or per-response header can tell us (see storage/usage.py and
+# providers/{groq,openrouter,mistral}.py for the providers that ARE
+# tracked live instead of via a hardcoded number here). Sourced from each
+# provider's own docs, checked directly, not guessed:
+#   - Cloudflare: developers.cloudflare.com — "All limits reset daily at
+#     00:00 UTC", 10,000 free Neurons/day, shared across all models.
+#   - LLM7: this repo's own providers/llm7.py docstring, confirmed
+#     2026-09-01 against docs.llm7.io — 1,000,000 tokens/24h keyed pool
+#     (NAVI always sends a key), separate unused-by-NAVI 500,000/24h
+#     anonymous pool shown for context only.
+#   - Mistral: JuanJo's own figure — $10/month free "Experiment" tier
+#     credit — compared against the real billed-dollar total from
+#     providers.mistral.get_admin_usage(), not computed locally.
+# Groq has NO entry here on purpose — its quota is per-model (JuanJo has
+# had to correct this more than once, see the feedback-groq-per-model-
+# quotas memory) and comes from storage.usage.get_groq_snapshots(),
+# Groq's own live numbers, not a table NAVI maintains.
+CLOUDFLARE_DAILY_NEURON_CAP = 10_000
+LLM7_KEYED_DAILY_TOKEN_CAP = 1_000_000
+LLM7_ANONYMOUS_DAILY_TOKEN_CAP = 500_000  # real, but unused by NAVI today
+MISTRAL_MONTHLY_CREDIT_USD = 10.0
+
+
+@app.get("/usage/counters")
+def usage_counters() -> dict:
+    """Real, server-side data for the PWA's Usage counters panel —
+    replaces the old hardcoded USAGE_COUNTERS mock in App.tsx. Mistral is
+    deliberately NOT included here (see /usage/mistral) — it's a monthly
+    billing figure fetched lazily on-demand, not something to compute on
+    every load of this route."""
+    from storage.usage import get_groq_snapshots, get_usage_today
+
+    groq_models = [
+        {
+            "model": row["model"],
+            "used": (row["limit_requests"] - row["remaining_requests"]) if row["limit_requests"] is not None and row["remaining_requests"] is not None else None,
+            "limit": row["limit_requests"],
+            "reset_seconds": row["reset_requests_seconds"],
+        }
+        for row in get_groq_snapshots()
+    ]
+
+    cf_rows = get_usage_today("cloudflare")
+    cloudflare_neurons = sum(r["neurons"] for r in cf_rows)
+
+    llm7_rows = get_usage_today("llm7")
+    llm7_tokens = sum(r["tokens"] for r in llm7_rows)
+
+    gmi_rows = get_usage_today("gmi")
+    gmi_requests = sum(r["requests"] for r in gmi_rows)
+
+    ollama_rows = get_usage_today("ollama_cloud")
+    ollama_requests = sum(r["requests"] for r in ollama_rows)
+    ollama_tokens = sum(r["tokens"] for r in ollama_rows)
+
+    key = config.get_provider_key("openrouter")
+    openrouter_key_info = None
+    if key:
+        from providers.openrouter import get_key_info
+        openrouter_key_info = get_key_info(key)
+
+    return {
+        "groq": {"models": groq_models},
+        "cloudflare": {"neurons_used": cloudflare_neurons, "neurons_cap": CLOUDFLARE_DAILY_NEURON_CAP},
+        "openrouter": openrouter_key_info,  # None if no key configured or the live fetch failed
+        "llm7": {
+            "tokens_used": llm7_tokens,
+            "keyed_cap": LLM7_KEYED_DAILY_TOKEN_CAP,
+            "anonymous_cap": LLM7_ANONYMOUS_DAILY_TOKEN_CAP,
+        },
+        "gmi": {"requests_today": gmi_requests, "status": "checking — promo status unconfirmed past 2026-09-06"},
+        "ollama_cloud": {"requests_today": ollama_requests, "tokens_today": ollama_tokens, "cap": None},
+    }
+
+
+@app.get("/usage/mistral")
+def usage_mistral() -> dict:
+    """Separate route, fetched on-demand when the panel's Mistral card is
+    actually opened — see providers/mistral.py's get_admin_usage() for why
+    this isn't folded into /usage/counters above."""
+    key = config.get_provider_key("mistral")
+    if not key:
+        return {"usage": None, "credit_usd": MISTRAL_MONTHLY_CREDIT_USD}
+    from providers.mistral import get_admin_usage
+    return {"usage": get_admin_usage(key), "credit_usd": MISTRAL_MONTHLY_CREDIT_USD}
 
 
 @app.get("/research/status")

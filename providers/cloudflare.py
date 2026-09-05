@@ -132,6 +132,15 @@ class CloudflareProvider(Provider):
 
         neurons = result.get("usage", {}).get("neurons")
         usage_note = f"{neurons:.2f} Neurons" if neurons is not None else None
+        if neurons is not None:
+            # Real per-call Neuron cost, straight from Cloudflare's own
+            # response — no estimation. Usage counters panel sums today's
+            # (UTC) total against the confirmed 10,000/day free allowance.
+            try:
+                from storage.usage import record_usage
+                record_usage("cloudflare", model, neurons=neurons)
+            except Exception:
+                pass
 
         return ChatResponse(
             text=text,

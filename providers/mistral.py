@@ -36,11 +36,22 @@ sum-per-call-usage-field approach the other providers would need — pull
 the authoritative number straight from this endpoint instead.
 """
 
+import time
+
 import requests
 
 from providers.base import ChatMessage, ChatResponse, Provider, ProviderError, ToolCall
 
 BASE_URL = "https://api.mistral.ai/v1/chat/completions"
+ADMIN_USAGE_URL = "https://api.mistral.ai/v1/admin/usage"
+
+# Fetched lazily (only when the Usage counters panel's Mistral card is
+# opened, not on every chat call) and cached — this is a monthly-
+# granularity billing endpoint, not a per-request counter, so polling it
+# after every Mistral chat call would just be wasted admin-API traffic
+# without even guaranteeing fresher data.
+_admin_usage_cache: dict = {"data": None, "fetched_at": 0.0}
+_ADMIN_USAGE_TTL_SECONDS = 600
 
 
 def _serialize_message(m: ChatMessage) -> dict:
@@ -52,6 +63,28 @@ def _serialize_message(m: ChatMessage) -> dict:
     if m.tool_calls:
         entry["tool_calls"] = m.tool_calls
     return entry
+
+
+def get_admin_usage(api_key: str) -> dict | None:
+    """Real billed-dollar consumption for the current month, straight from
+    Mistral's own admin endpoint — deliberately NOT computed locally from
+    per-model $/token pricing, since that would need knowing which tokens
+    hit the (opt-in, not currently wired) prompt-cache discount to be
+    accurate. Mistral already knows the real answer; this just asks.
+    Returns None on failure — display-only, never blocks a chat request."""
+    now = time.time()
+    if _admin_usage_cache["data"] is not None and (now - _admin_usage_cache["fetched_at"]) < _ADMIN_USAGE_TTL_SECONDS:
+        return _admin_usage_cache["data"]
+    try:
+        resp = requests.get(ADMIN_USAGE_URL, headers={"x-api-key": api_key}, timeout=10)
+        if resp.status_code >= 400:
+            return _admin_usage_cache["data"]
+        data = resp.json()
+        _admin_usage_cache["data"] = data
+        _admin_usage_cache["fetched_at"] = now
+        return data
+    except requests.RequestException:
+        return _admin_usage_cache["data"]
 
 
 class MistralProvider(Provider):

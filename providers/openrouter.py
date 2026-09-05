@@ -20,11 +20,21 @@ providers/groq.py for how caching differs there (fully automatic, no
 exceptions) — behavior is NOT uniform across NAVI's providers.
 """
 
+import time
+
 import requests
 
 from providers.base import ChatMessage, ChatResponse, Provider, ProviderError, ToolCall
 
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+KEY_INFO_URL = "https://openrouter.ai/api/v1/key"
+
+# Short server-side cache for the Usage counters panel's "requests left"
+# card — OpenRouter's own /api/v1/key endpoint is the real source (rate
+# limit + spend tied to the actual key), so there's no local counting to
+# do here at all, just don't hammer it on every panel open.
+_key_info_cache: dict = {"data": None, "fetched_at": 0.0}
+_KEY_INFO_TTL_SECONDS = 60
 
 
 def _serialize_message(m: ChatMessage) -> dict:
@@ -36,6 +46,29 @@ def _serialize_message(m: ChatMessage) -> dict:
     if m.tool_calls:
         entry["tool_calls"] = m.tool_calls
     return entry
+
+
+def get_key_info(api_key: str) -> dict | None:
+    """Real, authoritative usage/limit info for this API key, straight
+    from OpenRouter — sidesteps needing to know their exact reset-time
+    behavior (unconfirmed from a primary source, see storage/usage.py's
+    docstring) by just asking OpenRouter what it currently thinks.
+    Returns None on any failure rather than raising — this backs a
+    display-only panel, not a chat request. Cached briefly since this is
+    an account-info endpoint, not meant for high-frequency polling."""
+    now = time.time()
+    if _key_info_cache["data"] is not None and (now - _key_info_cache["fetched_at"]) < _KEY_INFO_TTL_SECONDS:
+        return _key_info_cache["data"]
+    try:
+        resp = requests.get(KEY_INFO_URL, headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
+        if resp.status_code >= 400:
+            return _key_info_cache["data"]  # stale-but-present beats nothing
+        data = resp.json().get("data")
+        _key_info_cache["data"] = data
+        _key_info_cache["fetched_at"] = now
+        return data
+    except requests.RequestException:
+        return _key_info_cache["data"]
 
 
 class OpenRouterProvider(Provider):

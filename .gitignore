@@ -23,6 +23,10 @@ conversations.db
 # history) — same reasoning as conversations.db above.
 agent_work.db
 
+# storage/usage.py's SQLite store (Usage counters panel's per-day request/
+# token/Neuron counts + Groq rate-limit snapshots) — same reasoning.
+usage.db
+
 # Local-only running notes across Claude Code sessions — scratch
 # continuity, not project documentation, not meant to be committed.
 # Auto-loaded via CLAUDE.md's @IDEAS.md import.

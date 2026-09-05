@@ -20,11 +20,29 @@ uniform across NAVI's providers, check the specific transport before
 assuming.
 """
 
+import re
+
 import requests
 
 from providers.base import ChatMessage, ChatResponse, Provider, ProviderError, ToolCall
 
 BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# Groq's x-ratelimit-reset-* headers are a duration string, NOT a plain
+# seconds float — confirmed real examples: "2s", "7.66s", "120ms",
+# "2m59.56s". A naive float(value.rstrip("s")) breaks on the "ms" and
+# "Xm Ys" shapes, which is exactly when this matters most (a longer wait
+# after actually hitting the limit tends to format as "XmY.Zs", not a bare
+# number). Handles h/m/s/ms components in any combination Groq sends.
+_DURATION_RE = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?(?:(\d+)ms)?")
+
+
+def _parse_duration_seconds(value: str) -> float | None:
+    m = _DURATION_RE.fullmatch(value.strip())
+    if not m or not any(m.groups()):
+        return None
+    h, mnt, s, ms = m.groups()
+    return (int(h or 0) * 3600) + (int(mnt or 0) * 60) + float(s or 0) + (int(ms or 0) / 1000)
 
 
 def _serialize_message(m: ChatMessage) -> dict:
@@ -68,6 +86,23 @@ class GroqProvider(Provider):
             )
         except requests.RequestException as e:
             raise ProviderError(f"Groq request failed: {e}")
+
+        # Capture BEFORE the status-code checks below, deliberately — a
+        # 429 is exactly the response where remaining_requests=0 and this
+        # snapshot matters most for the Usage counters panel. Groq's own
+        # headers are the real per-model quota/reset source (see
+        # storage/usage.py's docstring) — nothing here is estimated.
+        try:
+            from storage.usage import record_groq_snapshot
+            h = resp.headers
+            record_groq_snapshot(
+                model,
+                int(h["x-ratelimit-limit-requests"]) if "x-ratelimit-limit-requests" in h else None,
+                int(h["x-ratelimit-remaining-requests"]) if "x-ratelimit-remaining-requests" in h else None,
+                _parse_duration_seconds(h["x-ratelimit-reset-requests"]) if "x-ratelimit-reset-requests" in h else None,
+            )
+        except Exception:
+            pass  # usage tracking must never break a real chat request
 
         if resp.status_code == 429:
             raise ProviderError("Groq rate limited", is_rate_limit=True)

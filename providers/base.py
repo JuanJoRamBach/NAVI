@@ -111,6 +111,21 @@ class Provider(ABC):
         """
         key = (self.name, model)
         _REQUEST_COUNTS[key] = _REQUEST_COUNTS.get(key, 0) + 1
+        # Generic, provider-agnostic persistence for the Usage counters
+        # panel (storage/usage.py) — every provider gets at least a real
+        # request count for free from this one hook. Providers with a
+        # richer real signal (Groq's rate-limit headers, Cloudflare's
+        # per-call Neuron cost, LLM7's token totals) additionally record
+        # that from inside their own _do_chat(), which base.py has no
+        # access to (headers/usage live on the raw HTTP response, not on
+        # ChatResponse). Import here, not at module level, to avoid a
+        # storage -> providers -> storage import cycle risk as this
+        # module grows.
+        from storage.usage import record_usage
+        try:
+            record_usage(self.name, model, requests=1)
+        except Exception:
+            pass  # usage tracking must never break a real chat request
         return self._do_chat(model, messages, tools=tools, tool_choice=tool_choice)
 
     @abstractmethod
