@@ -22,12 +22,22 @@ than in each command, since every command that saves a result shares
 this same path-building logic and was equally exposed.
 """
 
+import os
 import subprocess
 import tempfile
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 RCLONE_REMOTE = "filen"
+
+# Same values server.py already defines for its own routes — duplicated
+# here rather than imported, since server.py imports FROM dispatcher/chat.py
+# (which needs file_download_url below for the new create_document tool,
+# 2026-09-06), and dispatcher modules can't import back from server.py
+# without a circular import.
+NAVI_BASE_URL = "https://api.getnavi.online"
+NAVI_FILES_TOKEN = os.environ.get("NAVI_FILES_TOKEN")
 
 FOLDER_FOR_COMMAND = {
     "research": "research",
@@ -140,3 +150,24 @@ def download_for_reply(remote_path: str) -> bytes:
         return Path(tmp_path).read_bytes()
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+
+def file_download_url(saved_path: str | None, render: bool = False) -> str | None:
+    """saved_path is a full 'filen:...' path as returned by save_result/
+    save_bytes. Returns None (rather than a link that would just 403)
+    if NAVI_FILES_TOKEN isn't configured or the path is missing.
+
+    Moved here from server.py (2026-09-06) so dispatcher/chat.py's new
+    create_document tool can build a real link too, not just server.py's
+    own routes — see this module's own top-of-file note on why this
+    couldn't just be imported from server.py instead.
+
+    render=True asks /files/ to serve the content inline (renders as a
+    real page in a browser tab) instead of forcing a download — only
+    meaningful for a saved .html artifact; every other saved artifact
+    just wants the plain download behavior."""
+    if not NAVI_FILES_TOKEN or not saved_path or not saved_path.startswith("filen:"):
+        return None
+    relative = saved_path[len("filen:"):]
+    url = f"{NAVI_BASE_URL}/files/{quote(relative)}?token={NAVI_FILES_TOKEN}"
+    return f"{url}&render=1" if render else url

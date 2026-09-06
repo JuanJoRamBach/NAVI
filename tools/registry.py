@@ -15,6 +15,7 @@ model as the tool result.
 import json
 from urllib.parse import urlparse as _urlparse
 
+from tools.document_save import DocumentError, create_document
 from tools.fetch import FetchError, fetch_page
 from tools.notes import NoteError, save_note
 from tools.search import SearchError, web_search
@@ -98,6 +99,26 @@ TOOL_SCHEMAS = [
                     "content": {"type": "string", "description": "The note content."},
                 },
                 "required": ["filename", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_document",
+            "description": "Save a finished document as a real downloadable file and get back "
+                            "a link to it — use when the user asks for something written up as a "
+                            "file/document to keep or share (a report, an itinerary, a list), not "
+                            "for a normal chat reply. Give it the complete, real content — never a "
+                            "placeholder or a description of what the document would contain.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short title — used to group this with related saves."},
+                    "filename": {"type": "string", "description": "e.g. 'trip-itinerary.md' or 'summary.html'. Extension controls how it's served."},
+                    "content": {"type": "string", "description": "The complete document content."},
+                },
+                "required": ["title", "filename", "content"],
             },
         },
     },
@@ -453,6 +474,18 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
                 content=arguments["content"],
             )
             return f"Saved to {path}"
+
+        if name == "create_document":
+            try:
+                url = create_document(
+                    command=context.get("command", "chat"),
+                    title=arguments["title"],
+                    filename=arguments["filename"],
+                    content=arguments["content"],
+                )
+            except DocumentError as e:
+                return f"Failed to save document: {e}"
+            return f"Document saved — download link: {url}"
 
         if name == "send_to_telegram":
             return send_to_telegram(arguments["text"])

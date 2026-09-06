@@ -45,7 +45,6 @@ import mimetypes
 import os
 import threading
 import time
-from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -69,7 +68,7 @@ from messaging.telegram import TelegramAdapter
 from config.store import config
 from jobs.model_ranking import fetch_aa_benchmarks, list_candidates, load_snapshot, refresh_snapshot
 from push.sender import PushError, add_subscription, send_push, subscription_count
-from storage.filen import StorageError, download_for_reply
+from storage.filen import StorageError, download_for_reply, file_download_url
 from storage.conversations import (
     create_conversation, get_conversation, get_messages, get_task_state,
 )
@@ -254,25 +253,6 @@ def _discord_adapter() -> DiscordAdapter | None:
     return DiscordAdapter(token) if token else None
 
 
-def _file_download_url(saved_path: str | None, render: bool = False) -> str | None:
-    """saved_path is a full 'filen:...' path as returned by save_result/
-    save_bytes. Returns None (rather than a link that would just 403)
-    if NAVI_FILES_TOKEN isn't configured or the path is missing.
-
-    render=True asks /files/ to serve the content inline (renders as a
-    real page in a browser tab) instead of forcing a download — only
-    meaningful for a saved .html artifact; every other saved artifact
-    just wants the plain download behavior. No current caller passes
-    render=True (its one use, /code's bundled HTML output, was retired
-    2026-09-04) — kept as generic /files/ capability rather than ripped
-    out, since it isn't /code-specific machinery itself."""
-    if not NAVI_FILES_TOKEN or not saved_path or not saved_path.startswith("filen:"):
-        return None
-    relative = saved_path[len("filen:"):]
-    url = f"{NAVI_BASE_URL}/files/{quote(relative)}?token={NAVI_FILES_TOKEN}"
-    return f"{url}&render=1" if render else url
-
-
 def _pwa_download_links(results: list) -> str:
     """The PWA has no file-attachment channel (unlike Telegram's real
     sendDocument) — a saved artifact reaches it as plain URLs appended
@@ -291,12 +271,12 @@ def _pwa_download_links(results: list) -> str:
     lines = []
     for r in results:
         if r.rendered_file_saved_path and r.rendered_file_name:
-            url = _file_download_url(r.rendered_file_saved_path)
+            url = file_download_url(r.rendered_file_saved_path)
             if url:
                 lines.append(f"📎 {r.rendered_file_name}: {url}")
         elif r.saved_path:
             filename = r.saved_path.rsplit("/", 1)[-1]
-            download_url = _file_download_url(r.saved_path)
+            download_url = file_download_url(r.saved_path)
             if download_url:
                 lines.append(f"📎 {filename}: {download_url}")
     return ("\n\n" + "\n".join(lines)) if lines else ""
