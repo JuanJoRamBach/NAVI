@@ -279,7 +279,17 @@ def run_tool_loop(
                 print(f"[run_tool_loop] iteration={iterations} RESULT tool={tc.name} result={result_text[:300]!r}")
                 if tc.name in _ONCE_PER_TURN_TOOLS:
                     once_per_turn_executed[tc.name] = result_text
-                if dedup_key is not None:
+                # save_source's content-quality guard (tools/registry.py)
+                # sends the model a "NOT usable, try again" message rather
+                # than a hard failure — deliberately meant to be retried
+                # for the SAME (term, url) with better content. Caching
+                # that rejection under the (term, url) dedup key would
+                # permanently block the retry from ever re-executing,
+                # replaying the same rejection forever instead — so a
+                # rejected save_source call is excluded from the cache
+                # (2026-09-06), while an actually-saved one still is.
+                is_rejected_retry = tc.name == "save_source" and result_text.startswith("NOT usable")
+                if dedup_key is not None and not is_rejected_retry:
                     already_executed[dedup_key] = result_text
             messages = messages + [ChatMessage(
                 role="tool", content=result_text, tool_call_id=tc.id, name=tc.name,

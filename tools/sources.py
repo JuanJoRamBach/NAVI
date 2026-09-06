@@ -23,12 +23,20 @@ class SourceSaveError(Exception):
     pass
 
 
-def save_source_document(batch_id: str, term: str, title: str, url: str, content: str) -> str:
+def save_source_document(
+    batch_id: str, term: str, title: str, url: str, content: str,
+    status: str = "pending_review", reason: str | None = None,
+) -> str:
     """Saves `content` to Filen (same storage every other saved artifact
-    in this codebase uses) and records a source_documents row with
-    status='pending_review' — nothing saved through this tool is usable
-    as real chat context until a human reviews and accepts it (see
-    server.py's /sources/{id}/review route). Returns the new document id."""
+    in this codebase uses) and records a source_documents row — default
+    status='pending_review', nothing usable as real chat context until a
+    human reviews and accepts it (see server.py's /sources/{id}/review
+    route). `status`/`reason` are overridden by the caller only for a
+    document the dispatcher already auto-rejected (tools/registry.py's
+    content-quality guard) — still saved to Filen and still visible in
+    the UI, just pre-marked 'rejected' with a reason so the human can see
+    exactly what was extracted and why it wasn't good enough, rather than
+    the term just silently having nothing. Returns the new document id."""
     filen_path = None
     try:
         filen_path = save_result(command="sources", topic_slug=term, filename=f"{title[:60]}.md", content=content)
@@ -41,4 +49,4 @@ def save_source_document(batch_id: str, term: str, title: str, url: str, content
         # diagnostic trail (JuanJo found every document in a real batch
         # came back "content unavailable" with no way to see why).
         print(f"[save_source_document] Filen save failed for {url!r} (term={term!r}): {e}")
-    return create_document(batch_id=batch_id, term=term, title=title, url=url, filen_path=filen_path)
+    return create_document(batch_id=batch_id, term=term, title=title, url=url, filen_path=filen_path, status=status, reason=reason)

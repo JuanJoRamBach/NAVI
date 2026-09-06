@@ -64,6 +64,16 @@ def _connect():
     try:
         if not _initialized:
             conn.executescript(_SCHEMA)
+            # ADD COLUMN migration, not baked into _SCHEMA — CREATE TABLE
+            # IF NOT EXISTS never alters an already-existing table on a
+            # live database, only a brand-new one. `reason` explains an
+            # AUTO-rejected document (2026-09-06, JuanJo: "why some were
+            # rejected... must be informed to the user") — NULL for every
+            # normal pending_review/human-reviewed row.
+            try:
+                conn.execute("ALTER TABLE source_documents ADD COLUMN reason TEXT")
+            except sqlite3.OperationalError:
+                pass  # already applied in a prior run
             conn.commit()
             _initialized = True
         yield conn
@@ -116,16 +126,35 @@ def latest_batch() -> dict | None:
         return dict(row) if row else None
 
 
-def create_document(batch_id: str, term: str, title: str, url: str, filen_path: str | None) -> str:
+def create_document(
+    batch_id: str, term: str, title: str, url: str, filen_path: str | None,
+    status: str = "pending_review", reason: str | None = None,
+) -> str:
+    """`status`/`reason` default to the normal human-review flow — passed
+    explicitly only for a document the DISPATCHER already auto-rejected
+    (tools/registry.py's save_source content-quality guard) before a
+    human ever saw it, so `reason` can explain why right in the UI
+    instead of the row just silently never existing."""
     doc_id = str(uuid.uuid4())
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO source_documents (id, batch_id, term, title, url, domain, filen_path, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (doc_id, batch_id, term, title, url, domain_of(url), filen_path, time.time()),
+            "INSERT INTO source_documents (id, batch_id, term, title, url, domain, filen_path, status, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (doc_id, batch_id, term, title, url, domain_of(url), filen_path, status, reason, time.time()),
         )
         conn.commit()
     return doc_id
+
+
+def delete_document(doc_id: str) -> bool:
+    """Permanent removal — 2026-09-06, JuanJo: 'I need to be able to
+    eliminate rejected documents.' Doesn't touch the backing Filen file
+    (if any); the DB row disappearing from every list/review view is
+    the actual ask, not real storage reclamation."""
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM source_documents WHERE id = ?", (doc_id,))
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def list_documents(batch_id: str | None = None, status: str | None = None) -> list[dict]:

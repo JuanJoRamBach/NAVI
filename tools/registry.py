@@ -414,10 +414,24 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
             title, content = arguments["title"], arguments["content"]
             min_len = max(200, len(title.strip()) + 50)
             if len(content.strip()) < min_len:
+                # Still saved, not silently dropped — 2026-09-06, JuanJo:
+                # "That kind of stuff must be informed to the user. why
+                # some were rejected." Pre-marked 'rejected' with a real
+                # reason, so the human sees the term DID get a candidate
+                # and can inspect the actual (too-thin) extracted text
+                # that caused the rejection, instead of the term just
+                # having zero documents with no explanation anywhere.
+                reason = "Auto-rejected: content was too short / just repeated the title, not real extracted page content."
+                doc_id = save_source_document(
+                    batch_id=context["batch_id"],
+                    term=arguments["term"], title=title,
+                    url=arguments["url"], content=content,
+                    status="rejected", reason=reason,
+                )
                 return (
-                    f"NOT saved — the content you gave for '{title}' was too short to be real "
-                    "extracted page content (it looked like just the title repeated, not an actual "
-                    "excerpt). Look at what fetch_page actually returned and extract several real "
+                    f"NOT usable (saved as rejected, doc {doc_id}) — the content you gave for '{title}' "
+                    "was too short to be real extracted page content (it looked like just the title "
+                    "repeated). Look at what fetch_page actually returned and extract several real "
                     "sentences or paragraphs relevant to the search term, or skip this page entirely "
                     "if there's nothing substantial worth keeping."
                 )

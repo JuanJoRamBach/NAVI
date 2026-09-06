@@ -80,7 +80,7 @@ from storage.agent_work import (
     get_run, get_run_steps, get_workflow, list_runs, list_workflows,
 )
 from storage.agents import create_agent, delete_agent, get_agent, get_agent_by_workflow_id, list_agents, update_agent
-from storage.sources import get_document as get_source_document, latest_batch as latest_source_batch, list_documents as list_source_documents, set_document_status as set_source_document_status
+from storage.sources import delete_document as delete_source_document, get_document as get_source_document, latest_batch as latest_source_batch, list_documents as list_source_documents, set_document_status as set_source_document_status
 from dispatcher.source_fetch import start_source_fetch_batch
 from tools.devslate_tools import new_tool_call_id
 
@@ -624,6 +624,17 @@ async def sources_review(doc_id: str, request: Request) -> JSONResponse:
     if status not in ("accepted", "rejected"):
         return JSONResponse({"error": "status must be 'accepted' or 'rejected'"}, status_code=400)
     ok = set_source_document_status(doc_id, status)
+    if not ok:
+        return JSONResponse({"error": "Document not found"}, status_code=404)
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/sources/{doc_id}")
+def sources_delete(doc_id: str) -> JSONResponse:
+    """Permanent removal — 2026-09-06, JuanJo: 'I need to be able to
+    eliminate rejected documents.' Doesn't touch the backing Filen file;
+    the row disappearing from every list/review view is the actual ask."""
+    ok = delete_source_document(doc_id)
     if not ok:
         return JSONResponse({"error": "Document not found"}, status_code=404)
     return JSONResponse({"ok": True})
