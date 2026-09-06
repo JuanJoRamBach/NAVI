@@ -155,7 +155,21 @@ MAX_TOOL_ITERATIONS = 5
 # duplicate workflows — this guards the case that survives even after
 # dispatcher/chat.py stopped retrying a NEW fallback provider: the SAME
 # provider re-issuing the same tool call within its own turn.
-_NON_IDEMPOTENT_TOOLS = {"create_workflow", "run_workflow", "send_to_telegram", "save_note"}
+_NON_IDEMPOTENT_TOOLS = {"create_workflow", "run_workflow", "send_to_telegram", "save_note", "save_source"}
+
+# Some non-idempotent tools legitimately vary a field the identical-args
+# dedup above would otherwise treat as "different." save_source's title/
+# content wording can differ slightly between retries of the literal same
+# page — the same shape of problem create_workflow's varying names caused
+# (see _ONCE_PER_TURN_TOOLS below) — but unlike create_workflow, one real
+# turn legitimately calls save_source more than once (one page can be
+# relevant to several different search terms in the same batch), so a
+# blanket once-per-turn rule would be wrong here. This narrows the dedup
+# key to just the fields that actually identify "the same source for the
+# same term," so wording differences in title/content don't defeat it —
+# 2026-09-06, JuanJo: a single Sources batch saved 8 near-duplicate
+# documents for one term, same root cause as the create_workflow incident.
+_DEDUP_KEY_FIELDS = {"save_source": ("term", "url")}
 
 # create_workflow specifically gets a HARDER rule than the identical-args
 # dedup above: at most one real execution per run_tool_loop call, full
@@ -232,7 +246,12 @@ def run_tool_loop(
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {}
-            dedup_key = (tc.name, json.dumps(args, sort_keys=True)) if tc.name in _NON_IDEMPOTENT_TOOLS else None
+            if tc.name in _NON_IDEMPOTENT_TOOLS:
+                key_fields = _DEDUP_KEY_FIELDS.get(tc.name)
+                key_args = {f: args.get(f) for f in key_fields} if key_fields else args
+                dedup_key = (tc.name, json.dumps(key_args, sort_keys=True))
+            else:
+                dedup_key = None
             if tc.name in _ONCE_PER_TURN_TOOLS and tc.name in once_per_turn_executed:
                 # Hard stop regardless of arguments — see _ONCE_PER_TURN_TOOLS'
                 # own comment. Feeds the model an explicit correction (not
