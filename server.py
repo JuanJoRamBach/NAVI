@@ -101,13 +101,20 @@ PWA_ORIGIN = "https://getnavi.online"
 
 # CORS allow-list — broader than PWA_ORIGIN alone. The Tauri desktop
 # build (2026-09-06, v0.3.1) is the SAME built PWA code, just served
-# from its own webview origin instead of GitHub Pages — tauri://localhost
-# on macOS/Linux, https://tauri.localhost on Windows (WebView2's own
-# requirement). Confirmed live: a fresh Windows install hit "Couldn't
-# reach NAVI" on the access-key screen because CORS only allowed the
-# GitHub Pages origin. Both desktop platform origins are listed since a
-# Mac build is planned too, not just what today's Windows build uses.
-PWA_CORS_ORIGINS = [PWA_ORIGIN, "tauri://localhost", "https://tauri.localhost"]
+# from its own webview origin instead of GitHub Pages. Real gap found
+# live: a fresh Windows install hit "Couldn't reach NAVI" on the
+# access-key screen even after tauri://localhost/https://tauri.localhost
+# were added — Tauri's own config schema (useHttpsScheme, defaults to
+# false) clarifies the ACTUAL Windows default is http://tauri.localhost,
+# not https. All four are listed (both schemes, since useHttpsScheme
+# could change; tauri:// for macOS/Linux, a Mac build being planned too)
+# rather than betting on one guess a second time.
+PWA_CORS_ORIGINS = [
+    PWA_ORIGIN,
+    "tauri://localhost",
+    "https://tauri.localhost",
+    "http://tauri.localhost",
+]
 
 # Gates GET /files/<path> — unlike Telegram (which gets real file
 # attachments via sendDocument) the PWA has no attachment channel of its
