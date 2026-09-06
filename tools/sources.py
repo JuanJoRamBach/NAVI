@@ -32,9 +32,13 @@ def save_source_document(batch_id: str, term: str, title: str, url: str, content
     filen_path = None
     try:
         filen_path = save_result(command="sources", topic_slug=term, filename=f"{title[:60]}.md", content=content)
-    except StorageError:
+    except StorageError as e:
         # A save failure shouldn't lose the document from the review
         # queue entirely — it just won't have a backing file. The DB row
         # (with filen_path=None) is still real and still reviewable.
-        pass
+        # Logged now (2026-09-06) — this used to swallow the real rclone
+        # error completely, so a whole batch failing to save left zero
+        # diagnostic trail (JuanJo found every document in a real batch
+        # came back "content unavailable" with no way to see why).
+        print(f"[save_source_document] Filen save failed for {url!r} (term={term!r}): {e}")
     return create_document(batch_id=batch_id, term=term, title=title, url=url, filen_path=filen_path)
