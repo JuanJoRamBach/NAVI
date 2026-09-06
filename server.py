@@ -813,6 +813,16 @@ async def chat_send(request: Request) -> JSONResponse:
         return JSONResponse({
             "reply": reply["text"], "conversation_id": conversation_id,
             "usage_note": reply.get("usage_note"), "choices": reply.get("choices"),
+            # run_stored_mode_chat already computes these (which attempt in
+            # its fallback chain actually answered) — this route just never
+            # forwarded them to the client before (2026-09-06, JuanJo: "I
+            # don't see which model was used... can't see how many
+            # tokens"). The fallback notice itself was always appended
+            # into reply["text"] as a "⚡ (primary was unavailable...)"
+            # line; these two fields are what let the frontend show a
+            # real model badge instead of relying on that string being
+            # parsed back out of the message body.
+            "provider": reply.get("provider"), "model": reply.get("model"),
             # Set only when this turn's create_workflow call actually ran
             # (dispatcher/chat.py's _extract_created_workflow_id) — lets
             # AgentWorkChat.tsx load the real graph onto the canvas as
