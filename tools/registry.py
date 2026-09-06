@@ -399,10 +399,32 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
             return "\n".join(lines)
 
         if name == "save_source":
+            # Enforced in code, not just asked for in the tool description
+            # — same "dispatcher enforces, model doesn't get to just
+            # comply or not" philosophy already used for trusted-site
+            # scoping and duplicate-call blocking. Real failure this
+            # catches (2026-09-06, JuanJo, live batch): a smaller model
+            # called save_source with `content` that was just the page
+            # title again ("Harnessing Design for Long-Running Apps"),
+            # producing a real document row backed by a real Filen file
+            # that was useless to actually review. A minimum length AND
+            # "meaningfully longer than the title" check catches both an
+            # exact echo and a lightly-reworded one — a real relevant
+            # excerpt is always substantially longer than a title.
+            title, content = arguments["title"], arguments["content"]
+            min_len = max(200, len(title.strip()) + 50)
+            if len(content.strip()) < min_len:
+                return (
+                    f"NOT saved — the content you gave for '{title}' was too short to be real "
+                    "extracted page content (it looked like just the title repeated, not an actual "
+                    "excerpt). Look at what fetch_page actually returned and extract several real "
+                    "sentences or paragraphs relevant to the search term, or skip this page entirely "
+                    "if there's nothing substantial worth keeping."
+                )
             doc_id = save_source_document(
                 batch_id=context["batch_id"],
-                term=arguments["term"], title=arguments["title"],
-                url=arguments["url"], content=arguments["content"],
+                term=arguments["term"], title=title,
+                url=arguments["url"], content=content,
             )
             return f"Saved source document {doc_id} for review."
 
