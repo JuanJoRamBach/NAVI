@@ -277,16 +277,24 @@ def _pwa_download_links(results: list) -> str:
     """The PWA has no file-attachment channel (unlike Telegram's real
     sendDocument) — a saved artifact reaches it as plain URLs appended
     to the reply text instead, which the frontend detects and renders
-    as clickable chips. Skips image results (graph-data)
-    since those aren't meant to be re-downloaded as a separate file —
-    they're the image."""
+    as clickable chips (App.tsx's parseAttachments/DOWNLOAD_LINE_RE).
+
+    Real gap found and fixed 2026-09-06 (JuanJo: "/graph-data DOES not
+    show the graph on the chat, it only says it was created in filen") —
+    this used to skip image results (graph-data) entirely on the theory
+    that "they're the image, not a file to re-download," but no OTHER
+    delivery path for the web client was ever built to back that theory:
+    the PWA's reply_text ended up with nothing but format_summary's own
+    literal "Saved to filen:..." line, an internal path notation the
+    browser can't do anything with. Image results now get a real
+    clickable link the same as everything else here."""
     lines = []
     for r in results:
         if r.rendered_file_saved_path and r.rendered_file_name:
             url = _file_download_url(r.rendered_file_saved_path)
             if url:
                 lines.append(f"📎 {r.rendered_file_name}: {url}")
-        elif r.saved_path and not r.image_bytes:
+        elif r.saved_path:
             filename = r.saved_path.rsplit("/", 1)[-1]
             download_url = _file_download_url(r.saved_path)
             if download_url:
@@ -722,7 +730,14 @@ def file_download(relative_path: str, token: str | None = None, render: str | No
     filename = relative_path.rsplit("/", 1)[-1]
     content_type, _ = mimetypes.guess_type(filename)
     wants_render = render == "1"
-    inline = wants_render and filename.lower().endswith(".html")
+    # Images default to inline regardless of ?render= (2026-09-06 — a
+    # graph-data chart forced through Content-Disposition: attachment
+    # never got a chance to display, only to download; an image has no
+    # "meant to be saved as a document" case the way .html/.md do).
+    # .html still needs the explicit ?render=1 opt-in — that one's the
+    # existing /code bundled-preview behavior, unrelated to this fix.
+    is_image = (content_type or "").startswith("image/")
+    inline = is_image or (wants_render and filename.lower().endswith(".html"))
     disposition = "inline" if inline else "attachment"
     return Response(
         content=content,
