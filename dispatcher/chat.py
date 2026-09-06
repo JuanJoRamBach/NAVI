@@ -38,6 +38,34 @@ RECENT_MESSAGE_WINDOW = 20
 
 _CREATE_WORKFLOW_ID_RE = re.compile(r"Created workflow ([0-9a-fA-F-]{36})\.")
 
+# A real, observed failure mode (2026-09-06, JuanJo: a normal_chat reply
+# repeated the same paragraph 4 times in one message) — not fixable by
+# picking a "better" model alone, since any model can degenerate into a
+# repetition loop under the wrong conditions; this is a deterministic,
+# model-agnostic safety net applied to every chat reply regardless of
+# which provider produced it. Threshold at 40 chars deliberately excludes
+# short recurring lines (a bullet marker, "---", "Thanks!") that can
+# legitimately repeat in real content — only substantial prose repeating
+# verbatim is the actual degenerate-loop signature.
+_REPEAT_MIN_PARAGRAPH_CHARS = 40
+
+
+def _collapse_repeated_paragraphs(text: str) -> str:
+    """If the same substantial paragraph appears again later in the
+    reply, cuts the reply at the point the repeat starts — everything
+    from there on is the model looping, not real additional content."""
+    paragraphs = text.split("\n\n")
+    seen: set[str] = set()
+    kept: list[str] = []
+    for p in paragraphs:
+        normalized = p.strip()
+        if len(normalized) > _REPEAT_MIN_PARAGRAPH_CHARS:
+            if normalized in seen:
+                break
+            seen.add(normalized)
+        kept.append(p)
+    return "\n\n".join(kept)
+
 
 def _extract_created_workflow_id(sent_messages: list[ChatMessage]) -> str | None:
     """Agent Work Chat's whole point is that the model, not the user,
@@ -105,7 +133,7 @@ def run_mode_chat(mode: str, text: str) -> str:
                     context={"command": f"chat-{mode}", "topic_slug": "chat"},
                     tools=tools,
                 )
-            reply = response.text or "(empty reply)"
+            reply = _collapse_repeated_paragraphs(response.text or "(empty reply)")
             if i > 0:
                 reply += f"\n\n⚡ (Groq was busy, answered via {attempt['provider']}/{attempt['model']} instead)"
             elif response.usage_note:
@@ -347,6 +375,7 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
                 reply = _extract_tool_results(sent_messages) or "(empty reply)"
             else:
                 reply = response.text or "(empty reply)"
+            reply = _collapse_repeated_paragraphs(reply)
             if i > 0:
                 reply += f"\n\n⚡ (primary was unavailable, answered via {attempt['provider']}/{attempt['model']} instead)"
             print(f"[run_stored_mode_chat] attempt {i}: DECISION = success, returning (created_workflow_id={created_workflow_id})")

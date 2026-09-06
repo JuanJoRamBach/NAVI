@@ -169,10 +169,20 @@ DEFAULTS = {
         # inside the shared 10,000/day budget alongside dev_slate_chat's
         # coding role). No prior reason ruled Cloudflare out here — it
         # just hadn't been considered when this role was first wired.
+        # Fallback swapped from @cf/meta/llama-3.1-8b-instruct-fp8-fast to
+        # @cf/openai/gpt-oss-120b (2026-09-06) — a real repetition-loop
+        # bug hit live (a reply repeated the same paragraph 4 times), and
+        # a small 8B model is exactly the class more prone to that. Groq's
+        # gpt-oss-120b was ruled out for this role already (8K TPM cap vs
+        # a real 20-message replay window) — but Cloudflare's own hosted
+        # gpt-oss-120b (verified live on Cloudflare's own model catalog,
+        # 2026-08 GA) sidesteps that entirely: it's Cloudflare's Neuron-
+        # based free tier, not Groq's per-minute-token one, so this is a
+        # real quality upgrade with no new quota risk, not a tradeoff.
         "normal_chat": {
             "provider": "llm7", "model": "gpt-oss",
             "fallback": [
-                {"provider": "cloudflare", "model": "@cf/meta/llama-3.1-8b-instruct-fp8-fast"},
+                {"provider": "cloudflare", "model": "@cf/openai/gpt-oss-120b"},
                 {"provider": "mistral", "model": "mistral-small-latest"},
             ],
         },
@@ -916,3 +926,27 @@ def _migrate_source_fetch_off_openrouter_2026_09_06():
 
 
 _migrate_source_fetch_off_openrouter_2026_09_06()
+
+
+def _migrate_normal_chat_fallback_off_small_model_2026_09_06():
+    """One-time correction for an already-materialized config.json (this
+    server's live one included) — a real normal_chat reply repeated the
+    same paragraph 4 times (JuanJo, live), traced to the fallback firing
+    on Cloudflare's small llama-3.1-8b-instruct-fp8-fast, exactly the
+    class of model more prone to repetition-looping. See normal_chat's
+    DEFAULTS comment above for why @cf/openai/gpt-oss-120b is a real
+    upgrade with no new quota risk (still Cloudflare's Neuron-based free
+    tier, not Groq's per-minute-token one)."""
+    if config.get("migrated_normal_chat_fallback_off_small_model_2026_09_06"):
+        return
+    config.set_role(
+        "normal_chat", "llm7", "gpt-oss",
+        fallback=[
+            {"provider": "cloudflare", "model": "@cf/openai/gpt-oss-120b"},
+            {"provider": "mistral", "model": "mistral-small-latest"},
+        ],
+    )
+    config.set("migrated_normal_chat_fallback_off_small_model_2026_09_06", True)
+
+
+_migrate_normal_chat_fallback_off_small_model_2026_09_06()
