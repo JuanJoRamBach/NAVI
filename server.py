@@ -80,7 +80,7 @@ from storage.agent_work import (
     get_run, get_run_steps, get_workflow, list_runs, list_workflows,
 )
 from storage.agents import create_agent, delete_agent, get_agent, get_agent_by_workflow_id, list_agents, update_agent
-from storage.sources import latest_batch as latest_source_batch, list_documents as list_source_documents, set_document_status as set_source_document_status
+from storage.sources import get_document as get_source_document, latest_batch as latest_source_batch, list_documents as list_source_documents, set_document_status as set_source_document_status
 from dispatcher.source_fetch import start_source_fetch_batch
 from tools.devslate_tools import new_tool_call_id
 
@@ -581,6 +581,35 @@ def sources_list(status: str | None = None) -> list[dict]:
     `?status=accepted` is the query a future context-building consumer
     needs — everything a human has actually reviewed and approved."""
     return list_source_documents(status=status)
+
+
+@app.get("/sources/{doc_id}")
+def sources_get_one(doc_id: str) -> JSONResponse:
+    """The actual review needs something to review AGAINST — until now
+    /sources only ever returned title/url/domain/status, never the saved
+    content itself (2026-09-06, JuanJo: 'I can't see the documents it
+    created, so I can't review them'). Reads the real file back from
+    Filen via filen_path, same mechanism download_for_reply already uses
+    for Telegram/Discord attachments. `content` is None (not an error)
+    when filen_path was never set — save_source_document already treats
+    a Filen save failure as non-fatal, so the DB row can legitimately
+    exist with no backing file; the frontend should show that as
+    'content unavailable', not surface it as a fetch error."""
+    doc = get_source_document(doc_id)
+    if not doc:
+        return JSONResponse({"error": "Document not found"}, status_code=404)
+    content = None
+    if doc.get("filen_path"):
+        try:
+            content = download_for_reply(doc["filen_path"]).decode("utf-8")
+        except StorageError as e:
+            # Logged now (2026-09-06) — same silent-swallow mistake as
+            # save_source_document originally made, caught immediately
+            # this time: every document read back as "content
+            # unavailable" with nothing in the logs explaining why.
+            print(f"[sources_get_one] Filen read-back failed for doc {doc_id} (path={doc['filen_path']!r}): {e}")
+            content = None
+    return JSONResponse({**doc, "content": content})
 
 
 @app.post("/sources/{doc_id}/review")
