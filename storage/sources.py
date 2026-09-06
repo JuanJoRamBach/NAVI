@@ -153,6 +153,17 @@ def list_documents(batch_id: str | None = None, status: str | None = None) -> li
         return [dict(r) for r in rows]
 
 
+def get_document(doc_id: str) -> dict | None:
+    """Single-row lookup — needed so the PWA can actually show a
+    document's saved content before the user accepts/rejects it (2026-
+    09-06, JuanJo: 'I can't see the documents it created, so I can't
+    review them'). Mirrors get_batch's shape; list_documents alone never
+    covered this since it always returns the whole set."""
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM source_documents WHERE id = ?", (doc_id,)).fetchone()
+        return dict(row) if row else None
+
+
 def set_document_status(doc_id: str, status: str) -> bool:
     if status not in ("pending_review", "accepted", "rejected"):
         raise ValueError(f"Invalid status: {status}")
