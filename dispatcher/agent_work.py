@@ -20,6 +20,7 @@ storage layer, since aiosqlite connections aren't loop-agnostic.
 """
 
 import asyncio
+import random
 import re
 import tempfile
 import threading
@@ -545,6 +546,82 @@ def _run_node(node: dict, prior_context: str | None = None, outgoing_labels: lis
     return _run_generic_multi_tool_node(tool_names, prompt, prior_context)
 
 
+# Deterministic, network/IO-bound node kinds — the ones with no retry of
+# their own. LLM-backed kinds (writeText/generateAi/choose_path/text,
+# the legacy no-`kind` text path, and the generic multi-tool fallback)
+# already get a provider-fallback retry from _call_for_node; wrapping
+# them in a SECOND retry here would just multiply latency for no benefit,
+# so they get exactly one attempt in _run_node_with_resilience below
+# (still timeout-guarded — every node kind gets that part).
+_RETRYABLE_KINDS = {"send_to_telegram", "web_search", "fetch_page", "save_note", "send_email"}
+
+# Reliability numbers (2026-09-07) — researched, not guessed, against the
+# actual tools this design is modeled on: LangGraph's own published
+# RetryPolicy default is EXACTLY max_attempts=3, initial_interval=0.5s,
+# backoff_factor=2.0, max_interval=128s, jitter=True (confirmed against
+# LangChain's own reference docs) — used verbatim here rather than
+# inventing different numbers, since NAVI's whole reliability model for
+# Agent Work is already explicitly built off LangGraph's fault-tolerance
+# primitives (RetryPolicy/TimeoutPolicy/error_handler). n8n's own "sane
+# baseline" for its opt-in per-node retry independently lands on the same
+# 3-attempt count, for what that's worth as a second data point. The 60s
+# per-node timeout isn't as precisely sourced — n8n and Langflow both
+# reference something in this range (n8n caps its own per-retry wait at
+# 5s, Langflow's community discussion treats 60s as the ordinary
+# component-timeout ceiling worth raising past) rather than publishing
+# one canonical default, so 60s here is a reasonable middle point, not a
+# copied constant the way the retry numbers are.
+_NODE_TIMEOUT_SECONDS = 60
+_MAX_NODE_ATTEMPTS = 3
+_RETRY_INITIAL_INTERVAL = 0.5
+_RETRY_BACKOFF_FACTOR = 2.0
+_RETRY_MAX_INTERVAL = 128.0
+
+
+def _is_retryable_node(run_node: dict) -> bool:
+    """Mirrors _run_node's own kind-vs-legacy-tools dispatch logic (see its
+    docstring) so retry eligibility matches whatever _run_node will
+    actually treat this node as, including a workflow saved before the
+    `kind` field existed."""
+    kind = run_node.get("kind")
+    if kind in _RETRYABLE_KINDS:
+        return True
+    if kind is not None:
+        return False
+    tools = run_node.get("tools") or []
+    return len(tools) == 1 and tools[0] in _RETRYABLE_KINDS
+
+
+async def _run_node_with_resilience(
+    run_node: dict, prior_context: str | None, outgoing_labels: list[str] | None,
+) -> str:
+    """Wraps a single node's execution in a wall-clock timeout (every node
+    kind) plus a bounded exponential-backoff retry (deterministic action
+    kinds only — see _RETRYABLE_KINDS above). Raises WorkflowError on
+    final failure either way, same as a plain _run_node call would — this
+    is purely "survive a transient blip before giving up," not a change
+    to _execute_run's own all-or-nothing run-failure semantics (that's a
+    separate, later step: continue-on-error/error edges)."""
+    attempts = _MAX_NODE_ATTEMPTS if _is_retryable_node(run_node) else 1
+    last_error: BaseException = WorkflowError("node never ran")
+    for attempt in range(attempts):
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_run_node, run_node, prior_context, outgoing_labels),
+                timeout=_NODE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            last_error = WorkflowError(f"timed out after {_NODE_TIMEOUT_SECONDS}s")
+        except WorkflowError as e:
+            last_error = e
+        if attempt + 1 >= attempts:
+            break
+        interval = min(_RETRY_INITIAL_INTERVAL * (_RETRY_BACKOFF_FACTOR ** attempt), _RETRY_MAX_INTERVAL)
+        interval *= 1 + random.uniform(-0.1, 0.1)  # jitter, +/-10%, matching LangGraph's own default
+        await asyncio.sleep(interval)
+    raise last_error
+
+
 def _substitute_item(text: str | None, item: str) -> str | None:
     """The only templating this graph supports — a fan-out group's nodes
     reference the current loop item as the literal string "{{item}}" in
@@ -670,8 +747,8 @@ async def _execute_run(run_id: str, graph: dict) -> None:
             await set_step_input(step_id, step_input)
             try:
                 is_choose_path = run_node.get("kind") == "choose_path" or run_node.get("tools") == ["choose_path"]
-                output = await asyncio.to_thread(
-                    _run_node, run_node, prior_context,
+                output = await _run_node_with_resilience(
+                    run_node, prior_context,
                     outgoing_labels_by_node.get(node["id"]) if is_choose_path else None,
                 )
                 await complete_step(step_id, "completed", output=output)
