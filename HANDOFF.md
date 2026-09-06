@@ -1,76 +1,211 @@
-# Handoff — NAVI backend, 2026-09-01
+# Handoff — NAVI, 2026-09-07 — next phase: Agent Work graphs & automation
 
-Written to close out this session. Read this instead of re-deriving context from scratch. Repo: `JuanJoRamBach/NAVI`, working dir `C:\Users\juanj\Proyectos IA\NAVI`, branch `main` (all work this session landed directly on `main` — no feature branch).
+Written to start a fresh chat because this one's context kept getting compacted.
+Read this instead of re-deriving context. Two repos:
+- Backend: `JuanJoRamBach/NAVI`, `C:\Users\juanj\Proyectos IA\NAVI`, branch `main`,
+  deployed to AWS Lightsail at `api.getnavi.online`.
+- Frontend: `navi-pwa` (React/TS), `C:\Users\juanj\Proyectos IA\navi-pwa`, deployed
+  via GitHub Pages at `getnavi.online`, plus a Tauri desktop wrapper built earlier.
 
-## What shipped this session (committed + pushed, verified on live AWS Lightsail)
+**Supersedes the 2026-09-01 HANDOFF.md** (still in git history if needed). This one's
+narrowly scoped: JuanJo's explicit next-phase target is making **Agent Work's
+workflow graphs and automation genuinely ready** — not a repeat of the whole
+project's history. `IDEAS.md` and `how_to_handle_context.md` (both gitignored,
+auto-loaded via `CLAUDE.md`) remain the authoritative running indexes for
+everything outside this scope; this file is the on-ramp for this one thread.
 
-### 1. Real per-provider request counting
-- `providers/base.py`: `Provider.chat()` changed from `@abstractmethod` to a concrete method that increments a module-level `_REQUEST_COUNTS[(provider, model)]` counter *before* delegating to a new abstract `_do_chat()`. Every transport (`groq.py`, `openrouter.py`, `cloudflare.py`, `llm7.py`, `mistral.py`, `ollama_cloud.py`) had its old `chat()` renamed to `_do_chat()`, bodies unchanged.
-- `get_request_counts()` exposes the tally. Process-lifetime only, not persisted — a known, deliberately-flagged gap, not silently claimed as solved.
-- Why: NAVI had no way to know how close a provider/model was to its own rate limit until it got rejected. This is step one toward that; nothing consumes the counts yet.
+## Where Agent Work actually stands right now (verified by reading the real code, not memory)
 
-### 2. Mistral and GMI Cloud added as full chat providers
-- `providers/mistral.py` (new): OpenAI-compatible, `/v1/chat/completions`. Free "Experiment" tier confirmed (~1B tokens/month, non-commercial).
-- `providers/gmi.py` (new): OpenAI-compatible, `api.gmi-serving.com/v1`. Added specifically for MiniMax M3's free promo (GMI's own tweet: MiniMax M3 + M2.7, unlimited, free 8/24–9/6/2026) — the model slug is never hardcoded anywhere in the transport, only discovered live via the ranking job (see below).
-- Both registered in `providers/registry.py`'s `_TRANSPORTS`, both seeded from env vars (`MISTRAL_API_KEY`, `GMI_API_KEY`) in `server.py`'s `_seed_keys_from_env()`.
+Backend: `dispatcher/agent_work.py` (899 lines) + `storage/agent_work.py`
+(`workflow_definitions`/`agent_runs`/`agent_run_steps`). Frontend:
+`navi-pwa/src/agentWorkNodeKinds.tsx` (153 lines, the node palette) +
+`AgentWorkGraphEditor.tsx`/`AgentWorkGraphNode.tsx`/`agentWorkGraphConvert.ts`
+(the `@xyflow/react` canvas). Both read in full this session.
 
-### 3. `dispatcher_chat` role renamed to `normal_chat`
-- Across `config/store.py` (DEFAULTS + a new one-time migration function, following the exact pattern of 3 existing migrations), `dispatcher/chat.py`, `dispatcher/parser.py`, `server.py`, `providers/registry.py` (`get_dispatcher_role`'s `_ROLE_NAME_FOR_CONTEXT` map), and `navi-pwa/src/App.tsx` (5 references).
-- Why: "dispatcher" in the name was confusing once NAVI had multiple named chat modes (Normal/Research/Brainstorm/Plan) — this role specifically backs Normal Chat.
-- The migration copies a live server's already-persisted `dispatcher_chat` role over to `normal_chat` on first boot after the update, rather than silently losing it. Verified with a real runtime test (migration ran, fallback chain intact).
+- **Real, working today**: topological execution (Kahn's algorithm, cycle/dangling-
+  edge detection), fan-out groups (sub-flows over a literal `items` list), a
+  `choose_path` branching/pruning node, shared-state refs (`{{state.<node_id>}}`),
+  a linear provider-fallback loop (`_call_for_node`) as the only existing retry
+  mechanism, background-thread execution mirroring `/research`'s async pattern.
+  The canvas is real and wired end-to-end (Agent Vault star flow creates graph
+  nodes from chat, saves them as runnable agents) — not a placeholder.
+- **Trigger types that exist: `manual` and `scheduled` only.** `scheduled` is
+  externally polled (`GET /agent/workflows/due`, same shape as `/reminders/check`
+  — no in-process scheduler anywhere in this codebase; something outside the repo
+  must be pinging that route on a cron, unconfirmed whether it actually is —
+  flagged as a real open question in `IDEAS.md` already).
+- **Node palette, frontend (11 kinds)**: `writeText`, `generateAi`, `searchWeb`,
+  `readPage`, `apiCall`, `sendMessage`, `sendMail`, `saveFile`, `choosePath`,
+  `input`, `output`. Several are visual/definitional only — not fully wired to a
+  backend handler (the file's own header comment says so).
+- **Node handlers, backend**: `send_to_telegram`, `web_search`, `fetch_page`,
+  `save_note`, `send_email`, `input`, `output`, `choose_path`, `text`, plus a
+  generic multi-tool fallback. **Naming doesn't line up 1:1 with the frontend
+  palette** (e.g. `apiCall`, `sendMail` vs `send_email`, `saveFile` vs
+  `save_note`, `writeText` vs `text`) — this mismatch needs reconciling as part
+  of "putting meat on the nodes," not assumed to already be wired.
+- **Reliability gaps, concrete, from reading `_execute_run` and `_call_for_node`**:
+  no per-node retry/backoff for deterministic action nodes (only LLM-backed nodes
+  get the provider-fallback retry); no per-node timeout (a hanging `apiCall`/
+  `fetch_page` can stall a run indefinitely); **any single node failure kills the
+  entire run** (`_execute_run`'s `except WorkflowError: return` is unconditional
+  — no continue-on-error, no partial resume); no circuit breaker / step cap at
+  the workflow level (only `run_tool_loop`'s own `MAX_TOOL_ITERATIONS` guards a
+  single node's internal tool-calling loop).
 
-### 4. `StepResult.attempt_count` — real friction signal for Plan Chat
-- **The actual correction that drove this**: I first designed a `duration_seconds` field to flag "this step took too long." JuanJo corrected it directly: *"took too long" refers to "too many tries and chats with the LLM"* — an attempt/retry count, not wall-clock time (elapsed time can just reflect network/queue latency, not real difficulty).
-- `dispatcher/executor.py`: `run_tool_loop()`'s return signature changed from a 2-tuple `(response, messages)` to a 3-tuple `(response, messages, iterations)` — the iteration count was already being computed internally, just silently discarded before. `StepResult.attempt_count: int = 1` added, fully wired through `/research`'s two-phase pipeline (`_run_research_gather_phase` now returns a 6-tuple ending in attempt count; `_run_research_synthesis` returns a 3-tuple; `_run_research_step` combines both into `total_attempts`). Also wired into the shared `_run_text_transform_step` (backs `/summarize`, `/recap`, `/note`).
-- **This introduced and then fixed a real regression**: changing `run_tool_loop`'s signature broke two other call sites in the same file still doing 2-value unpacking — caught and fixed in the same session, verified via `ast.parse` + a real `import dispatcher.executor` before moving on.
-- **Deliberately NOT wired**: the other ~20 `StepResult(...)` construction sites (`/remind`, `/design-read`, `/cv`, image generation) still default to `attempt_count=1`. Explicit scoping decision, not an oversight — extend the same pattern to those when there's a real need, not speculatively.
+## This session's work: research + a full written plan (no code changed in Agent Work)
 
-### 5. Daily model fetch + rank job — `jobs/model_ranking.py` (new, ~500 lines)
-Step 1 of the "daily self-healing routing" design (fully specced in memory `navi-model-ranking-design.md` before this session, not built until now). Fetches every provider's live model catalog, joins against Artificial Analysis benchmark data, ranks candidates per NAVI task. **Does not** write into `config/store.py`'s live `task_routing` — same boundary `daily_model_digest.py` already drew; it produces a JSON snapshot (`model_ranking_snapshot.json`, gitignored) for a human to act on, not an auto-apply.
+JuanJo's ask, verbatim shape: (1) a written accounts/audit-trail plan, plan-only,
+no real provider accounts created yet; (2) "we need more reliability, and work on
+the proper agentic work"; (3) his brother's question — can a workflow detect a
+call/200 from an always-connected API and turn that into a flow; (4) build the
+missing "pin"/webhook-receiver trigger node; (5) audit Agent Work's node system
+broadly for reliability and "meat"; (6) research what LangChain/LangGraph do for
+this and what `@xyflow/react` can support.
 
-**Per-provider fetchers, each verified against a real live response** (this mattered — every one of these had a real, non-obvious bug caught only by actually running it against live data, not by trusting docs or memory):
-- `fetch_groq_models` — live-verified. Filters out Whisper/Orpheus (via `output_modalities != ["text"]`) and prompt-guard/safeguard/allam by name pattern. 6 relevant chat models currently.
-- `fetch_openrouter_models` — live-verified, unauthenticated. ~21 genuinely free models.
-- `fetch_llm7_models` — live-verified, keyless. Only `tier == "turbo"` entries carry a free daily allotment. 5 models.
-- `fetch_mistral_models` — live-verified against JuanJo's real key. **Real bug found and fixed twice**: (a) every model AND every alias is listed as a separate duplicate row with identical capabilities — deduped by `billing_model_name`; (b) a billing group can have *multiple* `-latest`-suffixed aliases (Codestral's group has `codestral-latest`, `mistral-code-latest`, AND `mistral-code-fim-latest`) — the dedup was keeping whichever came last in the API response, and the free-tier heuristic checked against that arbitrary surviving alias instead of the stable `billing_model_name`, silently missing Codestral/Mistral Small from the free set. Fixed: free-check now reads `billing_model_name`; alias tie-break now prefers the *shortest* `-latest` alias. No pricing field exists anywhere in Mistral's `/v1/models` response — free-vs-paid is a name-prefix heuristic (`ministral-`/`mistral-small`/`codestral`), not a confirmed API signal.
-- `fetch_cloudflare_models` — live-verified against JuanJo's real key. **Real bug found**: the endpoint's top-level `id` field is Cloudflare's internal catalog UUID, NOT the callable model slug — the real slug is the `name` field. Also genuinely paginated (65 of 299 total on page 1 without pagination) — now pages through fully. Free-vs-paid reads the real `require_workers_paid` property (confirmed live) instead of the hand-maintained exclusion list I originally guessed. 31 text-generation models, 24 free.
-- `fetch_gmi_models` — live-verified against JuanJo's real key. **Real bug found (caught directly by JuanJo)**: promotional free models (MiniMax M3 *and* M2.7, not just M3) appear TWICE — once at paid pricing, once as a duplicate row with identical `id` but `is_free: true` and zeroed pricing. Deduped by `id`, free if *any* duplicate carries `is_free`. 79 total models, exactly 2 free — confirmed by JuanJo independently via a literal grep of `"is_free": true` against the raw response (2 matches, matching the fetcher's output exactly).
-- `fetch_aa_benchmarks` — Artificial Analysis's bulk model+benchmark endpoint (`GET /api/v2/data/llms/models`, `x-api-key` header), weekly-cached (`aa_benchmarks_cache.json`, gitignored). Live-confirmed on AWS: 896 models cached. **This is a benchmark-data API, not a chat provider** — clarified mid-session after a real miscommunication where I momentarily suggested it as something to route chat through; it never was.
+Everything below was **proposed in chat, not yet implemented** — standing rule
+this session followed throughout: propose code changes and wait for go-ahead,
+even small ones.
 
-**Ranking logic** (`rank_for_task`, `_score_candidate`, `_tier_fit`):
-- Hard filters: `free`, required `tools`, required `vision`, `min_context`.
-- **Real bug found and fixed (JuanJo: "it repeats the same model all the time... it's not assigning properly")**: size-tier preference (small vs. large model per task) was a *hard filter* that treated an unparseable size as `0`, which fails BOTH the small (`<=30B`) and large (`>30B`) checks — silently excluding every branded model without a digit+"b" pattern in its name (MiniMax-M3, GLM-5.3, GPT-5.6-Luna, Claude Opus 5 — i.e. most of GMI's newer catalog) from every task's candidate pool, permanently. This is why ranking kept collapsing onto whichever Groq model happened to have a parseable size. Fixed: `_tier_fit()` is now a *soft scoring dimension* (1 = fits or unknown size, 0 = confirmed wrong tier) instead of an exclusionary filter.
-- Also added `TASK_QUALITY_DIMENSION` so `/code`'s quality tiebreak reads AA's `coding_index` specifically instead of the generic `intelligence_index` (MiniMax-M3 scores 45.4 intelligence / 58.6 coding vs. Groq gpt-oss-120b's 24.1 / 30.4 — same relative gap either way today, but future models may specialize differently per axis, and this makes /code and /research genuinely capable of diverging instead of always agreeing).
-- **Not yet re-verified on AWS after the tier-fit fix** — pushed (`a165c29`), JuanJo was about to re-run when the conversation moved to the navi-pwa handoff request. **Next action for whoever picks this up: pull + rerun on Lightsail and confirm MiniMax M3/Ministral now actually surface as real candidates, not just theoretically eligible.**
+### 1. Accounts / audit trail — the plan (deferred, no provider accounts touched)
 
-### 6. `jobs/model_ranking.py`'s summary-line bug (also fixed)
-`provider_counts` originally counted *every* catalog entry per provider as if it were free — correct by coincidence for Groq/OpenRouter/LLM7 (whose fetchers only ever append free-eligible entries), but wrong for Mistral/GMI/Cloudflare (whose fetchers deliberately return every model, free and paid, with a `free` flag attached, since ranking needs the full catalog for AA-joining). This is what made GMI look like "79 free models" when only 2 actually were. Fixed: `provider_counts` is now `{provider: {"total": N, "free": M}}`.
+New tables: `accounts`, `users` (magic-link or OAuth login, no passwords —
+avoids inventing a password-reset/hashing/breach-monitoring flow NAVI has
+nothing for), `roles` (fixed v1 enum: owner/admin/member/viewer — gates exactly
+the write/destructive tiers `dispatcher/mcp_client.py`'s trust model already
+distinguishes), `sessions`, `audit_log` (append-only, one row per mutating/
+side-effecting action — workflow create/run/delete, sent messages, provider-
+connection changes, destructive MCP calls; plain chat replies don't get rows).
 
-## Design decisions agreed, not yet built
+Auth: demote `NAVI_API_KEY` from "the only auth" to a service key for machine
+callers only (webhooks, the Tauri app's bootstrap); humans get a real session
+cookie from login.
 
-- **Plan Chat's two-section output format** (dispatcher-parseable section first, human-readable summary second — the summary must only restate what's in the first section, never add new content, specifically so the two encodings can't drift apart). `dispatcher/modes/PLAN_CHAT.md` exists but is the *earlier* single-section Plan-and-Solve/Least-to-Most draft, not yet rewritten to this design. Not registered in `dispatcher/mode_briefs.py`'s `MODE_FILES` dict.
-- **Plan Chat's model selection**: Ministral (any size, structured-output guaranteed per Mistral's own docs) for the final document-formatting call; Ollama Cloud and Groq's `gpt-oss-120b` both explicitly ruled out (Ollama: no structured-output support at all + "never primary" principle; Groq: 8K TPM hard ceiling too tight for a whole-conversation call). Which Ministral size (3B/8B/14B) is sufficient — proposed as an empirical fidelity test, never built or run. The conversational/steering half of Plan Chat (distinct from the formatting call) is unresolved — Mistral Medium 3.5 surfaced as a candidate, untested.
-- **Correction, added after this was originally written**: at the time this was written, both Dev Slate and Agent Work genuinely had no backend, and that section said so. Since then (confirmed 2026-09-01, real commits `524b88c` through `e598286` on `main`), a **parallel Claude Code session built real backends for both** — Agent Work's workflow/run/step data model + graph executor (`storage/agent_work.py`, `dispatcher/agent_work.py`, `tools/workflows.py`, 4 new tool schemas, real `/agent/workflows*` routes), and a real Dev Slate chat loop (`dispatcher/devslate_chat.py`, `server.py` migrated stdlib→FastAPI). See `IDEAS.md` (gitignored, auto-loaded) for the current, accurate state of both — it is the authoritative source, not this paragraph. `jobs/model_ranking.py`'s `TASK_REQUIREMENTS` still doesn't have entries for either — that's still a real, current gap now that both have something to route to.
-- **The self-improving-skill trigger** for Plan Chat (re-using existing `StepResult` friction fields — now including the new `attempt_count`) is only sketched as "gets called with the flagged friction data," not designed in detail.
-- **Full navi-pwa UI buildout for Plan Chat**: a "Plans" tab, `ChatMode` type addition for `"plan"`, a branch-creation accordion (Chat/Research/Brainstorm/Plan), multi-status deferred-job tracking (backend job registry replacing `dispatcher/research_status.py`'s single global slot, new server routes, PWA polling/status pills/expand-on-click, message queueing, disabled-send-while-streaming). None of this started.
-- **Topic-boundary classification** (repurposing `openai/gpt-oss-safeguard-20b`'s bring-your-own-policy mechanism, off-label from its safety training): validated empirically three separate ways (single-message, batch, named-registry — all real test runs, not simulated) via `dispatcher/topic_classifier.py` + `dispatcher/policies/*.md` + the `jobs/test_topic_*.py` scripts. Not yet wired into any live conversation-history-windowing feature — it's proven-viable tooling, not yet consumed by anything.
+Key point that unblocked this: **none of steps 1–4 below need any new Groq/
+LLM7/Cloudflare accounts** — they run fine against NAVI's existing shared
+provider pool. BYOK (each account bringing its own provider keys) is a real
+step but explicitly last, built only once a second paying account needs it —
+that's the part JuanJo didn't want to spend days provisioning for speculatively.
 
-## New files this session
+Build order when picked up: (1) `users`/`accounts`/`sessions` + magic-link login
++ PWA login screen → (2) `audit_log` table + one `record_audit(...)` helper
+called from the existing write/destructive routes/tools → (3) role checks on
+those same routes → (4) an audit viewer (likely just the existing Activity tab,
+filtered) → (5) BYOK, deferred.
 
-- `providers/mistral.py`, `providers/gmi.py` — chat transports.
-- `jobs/model_ranking.py` — the fetch+rank job described above.
-- `dispatcher/modes/PLAN_CHAT.md`, `dispatcher/policies/TOPIC_CONTINUITY.md`, `TOPIC_CONTINUITY_BATCH.md`, `TOPIC_REGISTRY_MATCH.md`, `dispatcher/topic_classifier.py`, `jobs/classify_topic.py`, `jobs/test_topic_classifier.py`, `jobs/test_topic_classifier_batch.py`, `jobs/test_topic_registry_match.py`, `jobs/test_openrouter.py` — Plan Chat draft + topic-classification research tooling.
+### 2. Webhook trigger — answers the brother's question, unblocks "pin" node
 
-## Known gaps / things to watch
+Yes, directly buildable, same pattern n8n/Zapier/Make all use (checked via
+research, not assumed):
 
-- `jobs/model_ranking.py`'s tier-fit fix (item 5 above) needs one more real rerun on AWS to confirm it actually changes the picks, not just that it's logically correct.
-- `attempt_count` is only real for `/research` and the shared text-transform commands — everything else silently defaults to `1`.
-- Request counting (`get_request_counts()`) is process-lifetime only, not persisted, and nothing consumes it yet.
-- Mistral's free-vs-paid detection is a name heuristic, not a confirmed API signal — worth revisiting against `/v1/admin/usage` if it ever matters for real billing decisions.
-- `config/agent_config.json` is gitignored by design (per-instance secrets) — a fresh clone or a fresh AWS instance needs its provider keys seeded via `.env` + `_seed_keys_from_env()`, same as this session's own debugging showed (the ranking job needed `sudo -E` + sourcing `/opt/navi/.env` to see `CLOUDFLARE_ACCOUNT_ID`/`AANALYSIS_API_KEY`, since those two are read straight from `os.environ` rather than the config store).
+- New trigger type: `{"type": "webhook", "token": <random>}` on a workflow,
+  generated when the trigger is added → stable URL
+  `api.getnavi.online/agent/webhooks/{token}`.
+- New route, **outside** `_require_api_key`'s gate (an external caller can't
+  send NAVI's own header) — protected by the token itself being unguessable in
+  the path, same trust model already used for the Telegram webhook secret
+  (`TELEGRAM_WEBHOOK_SECRET`). Optional HMAC verification for services that sign
+  payloads (Stripe, GitHub).
+- New canvas node kind, **"Webhook Trigger"** (the "pin" node): graph-entry node,
+  no input handle, only output — `@xyflow/react` supports this natively (a node
+  with only a `source` Handle, no `target` Handle rendered), no library gap.
+  Its output is the incoming payload. **Cheap to wire**: the webhook route just
+  seeds `outputs["<trigger_node_id>"]` with the parsed payload before the run
+  starts; every downstream node already reads prior context from `outputs` via
+  the existing mechanism the `input` node uses today — almost no executor change.
+
+### 3. Reliability — LangGraph's model, translated to concrete NAVI changes
+
+Researched LangGraph's actual fault-tolerance primitives (RetryPolicy,
+TimeoutPolicy, error_handler — real, current, from LangChain's own blog) and
+checked each against `agent_work.py`'s real gaps listed above:
+
+- **Retry with backoff for deterministic action nodes** (`_run_send_telegram_node`
+  etc.) — wrap the existing node call in `_execute_run` with a small N-attempt/
+  backoff loop. No new dependency.
+- **Per-node timeout** — wrap the existing `asyncio.to_thread(_run_node, ...)`
+  call in `asyncio.wait_for`.
+- **Continue-on-error / error routing** — an optional `continue_on_error` flag on
+  a node (skip to normal successors with a placeholder failure note instead of
+  aborting the whole run), plus an optional "error" edge label reusing the exact
+  label-matching mechanism `choose_path` edges already have.
+- **Circuit breaker / step cap** — needed before any future loop-style node
+  ships (see below); nothing analogous exists at the workflow level today.
+
+Suggested build order for reliability specifically: retry + timeout first (zero
+new node kinds, protects every existing workflow immediately) → continue-on-
+error/error edges.
+
+### 4. Node system audit — what's genuinely missing, prioritized
+
+Beyond the naming reconciliation noted above:
+
+- **Delay/Wait node** — nothing lets a workflow pause N seconds/until-a-time
+  mid-run.
+- **Dynamic loop/iterate node** — fan-out groups only iterate a literal,
+  pre-set `items` list; nothing iterates over an array a *prior step* produced
+  at run time. Since `_resolve_state_refs` and fan-out groups both already
+  exist independently, letting a group's `items` be a `{{state.node_id}}`
+  reference resolved to a JSON array at run time is a contained change, not a
+  new subsystem.
+- **Respond-to-webhook node** — once trigger #2 exists, a synchronous reply
+  (Stripe-style) isn't expressible yet. v1 can just always ack 200 immediately
+  and run async (matches `/research`'s own pattern) — build a real Respond node
+  only once a specific integration needs a computed body back.
+- **Merge/wait-for-all node** — parallel branches converging on one downstream
+  node rely on topological-sort ordering today, not an explicit join. Low
+  priority until branching graphs get common enough that ordering ambiguity
+  actually bites someone.
+- **Human-in-the-loop / approval node** — LangGraph has first-class pause/
+  resume; Agent Work has no equivalent. Build once a real workflow needs it.
+
+**React Flow/xyflow is not the bottleneck anywhere in this list** — checked
+directly: distinct trigger-node shapes, live per-node run-status coloring,
+edge validation, labeled/conditional edges (already used by `choose_path`) are
+all natively supported. Every gap above is backend logic in
+`dispatcher/agent_work.py` plus a new `agentWorkNodeKinds.tsx` entry — the
+canvas plumbing to display new nodes already scales fine.
+
+**Recommended overall order for the next phase**: retry + timeout → Webhook
+Trigger node + route → continue-on-error/error edges → node-name reconciliation
+(frontend↔backend) → Delay node → dynamic loop → Respond/Approval nodes only
+once something concrete needs them. Accounts/audit-trail stays parked until
+JuanJo raises it again — it's fully specced above, just not urgent for this
+phase.
+
+Sources checked this session: LangChain's own "Fault Tolerance in LangGraph"
+blog post, a LangGraph error-handling/retry writeup, two n8n webhook-node
+guides.
+
+## Separately open, not part of this phase but don't lose track
+
+- **Uncommitted, working, in-progress right now**: `server.py` and
+  `storage/filen.py` have uncommitted local changes — `file_download_url` was
+  moved from a private `_file_download_url` in `server.py` into
+  `storage/filen.py` as a public function, specifically so `dispatcher/chat.py`'s
+  new `create_document` tool can build a download link too (dispatcher modules
+  can't import back from `server.py`). This refactor step is done; the rest of
+  `create_document` (tool schema, dispatch branch, transcript-extraction logic,
+  `NORMAL_CHAT.md` registration) was still in progress before this handoff was
+  written — check `dispatcher/chat.py` for how far it actually got before
+  continuing it, don't assume it's finished.
+- Several pending NAVI backend deploys to Lightsail may still be queued from
+  before this — confirm current deployed state before assuming local `main`
+  matches production.
+- `jobs/model_ranking.py`'s tier-fit fix (from the 2026-09-01 handoff) needed
+  one more real rerun on AWS to confirm it actually changes model picks — status
+  unconfirmed as of this handoff, check before assuming it's done.
 
 ## Process notes for whoever picks this up
 
-- **Ask before code changes** — propose the edit, wait for go-ahead, even for small/safe ones (standing rule this session followed throughout).
-- **Verify against real data, not docs/memory** — every provider fetcher in `jobs/model_ranking.py` had a real bug that only surfaced once run against a live response; the design memory's confident claims about API shapes were sometimes wrong (Mistral aliasing, Cloudflare's id-vs-name) even when written as "confirmed real."
-- Cross-repo: navi-pwa's own handoff (`navi-pwa/handoff.md`) covers this session's frontend work (V3 UI token/color redesign) separately.
+- **Ask before code changes** — propose the edit, wait for go-ahead, even small/
+  safe ones. Followed throughout this session (this handoff is itself the
+  result of a planning-only pass, zero Agent Work code touched).
+- **Verify against real code/data, not memory or docs** — every claim above
+  about what exists/doesn't in Agent Work came from actually reading
+  `dispatcher/agent_work.py` and `agentWorkNodeKinds.tsx` in full this session,
+  not from recalling an earlier description of them.
+- This chat was compacting too often to keep going — that's the whole reason
+  this file exists. Start the next session by reading this file, then
+  `IDEAS.md`'s "Agent Work backend" section for any updates since, before
+  proposing which piece of the build order above to start with.
