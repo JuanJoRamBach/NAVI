@@ -89,10 +89,25 @@ NAVI_BASE_URL = "https://api.getnavi.online"
 
 # The PWA (navi-ui, on GitHub Pages, custom domain getnavi.online) calls
 # this server from a different origin — browsers block that without an
-# explicit CORS allow. Scoped to the one real frontend origin rather than
-# "*", since several of these endpoints accept real data (push
-# subscriptions, chat text, file writes relayed from Dev Slate).
+# explicit CORS allow. Scoped to real frontend origins rather than "*",
+# since several of these endpoints accept real data (push subscriptions,
+# chat text, file writes relayed from Dev Slate).
+#
+# The real public site — used for OAuth redirects below (an external
+# provider's consent screen sends the browser back here; a Tauri-only
+# pseudo-origin isn't a navigable destination for that), and as the one
+# real entry in PWA_CORS_ORIGINS just below.
 PWA_ORIGIN = "https://getnavi.online"
+
+# CORS allow-list — broader than PWA_ORIGIN alone. The Tauri desktop
+# build (2026-09-06, v0.3.1) is the SAME built PWA code, just served
+# from its own webview origin instead of GitHub Pages — tauri://localhost
+# on macOS/Linux, https://tauri.localhost on Windows (WebView2's own
+# requirement). Confirmed live: a fresh Windows install hit "Couldn't
+# reach NAVI" on the access-key screen because CORS only allowed the
+# GitHub Pages origin. Both desktop platform origins are listed since a
+# Mac build is planned too, not just what today's Windows build uses.
+PWA_CORS_ORIGINS = [PWA_ORIGIN, "tauri://localhost", "https://tauri.localhost"]
 
 # Gates GET /files/<path> — unlike Telegram (which gets real file
 # attachments via sendDocument) the PWA has no attachment channel of its
@@ -129,7 +144,7 @@ _pending_oauth_lock = threading.Lock()
 app = FastAPI(title="NAVI")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[PWA_ORIGIN],
+    allow_origins=PWA_CORS_ORIGINS,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type", "X-Navi-Api-Key"],
 )
