@@ -17,6 +17,7 @@ import json
 from tools.fetch import FetchError, fetch_page
 from tools.notes import NoteError, save_note
 from tools.search import SearchError, web_search
+from tools.sources import SourceSaveError, save_source_document
 from tools.telegram_send import TelegramSendError, send_to_telegram
 from tools.workflows import (
     WorkflowToolError,
@@ -96,6 +97,27 @@ TOOL_SCHEMAS = [
                     "content": {"type": "string", "description": "The note content."},
                 },
                 "required": ["filename", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_source",
+            "description": "Save a web page as a real Source document for the user to review "
+                            "later — use this ONLY after you've fetched the page (fetch_page) "
+                            "and judged it genuinely relevant to the search term you were given. "
+                            "Do NOT call this for every search result — only the ones actually "
+                            "worth keeping. Never invent a url or content you haven't fetched.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "term": {"type": "string", "description": "The search term this result answers."},
+                    "title": {"type": "string", "description": "The page's real title."},
+                    "url": {"type": "string", "description": "The exact URL you fetched."},
+                    "content": {"type": "string", "description": "The relevant extracted content — trim to what actually matters, not the whole raw page."},
+                },
+                "required": ["term", "title", "url", "content"],
             },
         },
     },
@@ -300,10 +322,33 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
             query = arguments["query"]
             max_results = int(arguments.get("max_results", 5))
             results = web_search(query, max_results=max_results)
+            # Trusted-site enforcement lives HERE, not in a prompt asking
+            # the model to "only search trusted-sites.com" — the model
+            # never even sees a result outside the registry it was
+            # given. Only the source-fetch batch loop (dispatcher/
+            # source_fetch.py) threads "trusted_sites" into context;
+            # every other caller (plain chat, /research) leaves it unset
+            # and web_search behaves exactly as it always has.
+            trusted_sites = context.get("trusted_sites")
+            if trusted_sites:
+                from storage.sources import domain_of
+                def _normalize(site: str) -> str:
+                    s = site.strip().lower()
+                    return s[4:] if s.startswith("www.") else s
+                allowed = {_normalize(s) for s in trusted_sites}
+                results = [r for r in results if any(domain_of(r["url"]) == d or domain_of(r["url"]).endswith(f".{d}") for d in allowed)]
             if not results:
-                return "No results found."
+                return "No results found." if not trusted_sites else "No results found on any trusted site for this term."
             lines = [f"- {r['title']} ({r['url']}): {r['snippet']}" for r in results]
             return "\n".join(lines)
+
+        if name == "save_source":
+            doc_id = save_source_document(
+                batch_id=context["batch_id"],
+                term=arguments["term"], title=arguments["title"],
+                url=arguments["url"], content=arguments["content"],
+            )
+            return f"Saved source document {doc_id} for review."
 
         if name == "fetch_page":
             return fetch_page(arguments["url"])
@@ -339,7 +384,7 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
 
         raise ToolExecutionError(f"Unknown tool: {name}")
 
-    except (SearchError, FetchError, NoteError, TelegramSendError, WorkflowToolError) as e:
+    except (SearchError, FetchError, NoteError, SourceSaveError, TelegramSendError, WorkflowToolError) as e:
         # A failed tool call isn't fatal to the step — it's reported back
         # to the model as a tool result, same as a successful one, so the
         # model can decide how to proceed (retry, try another source, note

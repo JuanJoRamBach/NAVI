@@ -271,6 +271,25 @@ DEFAULTS = {
             "primary": {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
             "fallback": [{"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}],
         },
+        # source_fetch: the Sources tab's "Batch Dispatch" — searches each
+        # term against the user's Trusted Sites registry (enforced in
+        # tools/registry.py's dispatch(), not left to the model), fetches
+        # relevant hits, saves one document per real find. JuanJo's own
+        # call on the chain (2026-09-06): OpenRouter primary (same
+        # tool-calling-verified nemotron already backing graph-data/remind),
+        # Cloudflare next, then Mistral, then Ollama Cloud last — a real
+        # 4-deep chain since this can run for a while and a mid-batch
+        # failure shouldn't lose everything found so far (see
+        # dispatcher/source_fetch.py for how a rotation mid-batch is
+        # handled — each attempt/model swap is not started over from zero).
+        "source_fetch": {
+            "primary": {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
+            "fallback": [
+                {"provider": "cloudflare", "model": "@cf/meta/llama-3.1-8b-instruct-fp8-fast"},
+                {"provider": "mistral", "model": "mistral-small-latest"},
+                {"provider": "ollama_cloud", "model": "minimax-m3:cloud"},
+            ],
+        },
         # No "brainstorm" entry — retired as a standalone command (2026-08-27):
         # Brainstorm mode's own conversational chat (dispatcher/modes/
         # BRAINSTORM.md) does its job better, since the command was a
@@ -730,6 +749,29 @@ def _migrate_remove_retired_commands():
 
 
 _migrate_remove_retired_commands()
+
+
+def _migrate_add_source_fetch_routing():
+    """One-time addition (2026-09-06) for instances whose config.json
+    already existed before source_fetch was added to DEFAULTS — same
+    reasoning as every other _migrate_add_* function above. Backs the
+    Sources tab's Batch Dispatch (dispatcher/source_fetch.py)."""
+    if config.get("migrated_add_source_fetch_routing"):
+        return
+    if not config.get_task_routing("source_fetch"):
+        config.set_task_routing(
+            "source_fetch",
+            {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
+            fallback=[
+                {"provider": "cloudflare", "model": "@cf/meta/llama-3.1-8b-instruct-fp8-fast"},
+                {"provider": "mistral", "model": "mistral-small-latest"},
+                {"provider": "ollama_cloud", "model": "minimax-m3:cloud"},
+            ],
+        )
+    config.set("migrated_add_source_fetch_routing", True)
+
+
+_migrate_add_source_fetch_routing()
 
 
 def _migrate_widen_chat_fallbacks_2026_09_04():

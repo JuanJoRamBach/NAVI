@@ -80,6 +80,8 @@ from storage.agent_work import (
     get_run, get_run_steps, get_workflow, list_runs, list_workflows,
 )
 from storage.agents import create_agent, delete_agent, get_agent, get_agent_by_workflow_id, list_agents, update_agent
+from storage.sources import latest_batch as latest_source_batch, list_documents as list_source_documents, set_document_status as set_source_document_status
+from dispatcher.source_fetch import start_source_fetch_batch
 from tools.devslate_tools import new_tool_call_id
 
 PORT = int(os.environ.get("PORT", "10000"))
@@ -542,6 +544,60 @@ def usage_mistral() -> dict:
         return {"usage": None, "credit_usd": MISTRAL_MONTHLY_CREDIT_USD}
     from providers.mistral import get_admin_usage
     return {"usage": get_admin_usage(key), "credit_usd": MISTRAL_MONTHLY_CREDIT_USD}
+
+
+@app.post("/sources/batch")
+async def sources_batch_start(request: Request) -> JSONResponse:
+    """Kicks off the Sources tab's Batch Dispatch in the background —
+    acks immediately, same reasoning as /research (a multi-term batch of
+    real web fetches is too slow to hold the HTTP request open for).
+    `trusted_sites` is sent by the caller on every request rather than
+    read from server-side state, because the registry itself currently
+    only lives in the PWA's own localStorage (navi-pwa/src/
+    trustedSources.ts) — there's no backend copy of it yet."""
+    payload = await request.json()
+    terms = payload.get("terms") or []
+    trusted_sites = payload.get("trusted_sites") or []
+    if not terms:
+        return JSONResponse({"error": "'terms' must be a non-empty list"}, status_code=400)
+    if not trusted_sites:
+        return JSONResponse({"error": "No trusted sites configured — add at least one before dispatching."}, status_code=400)
+    start_source_fetch_batch(terms, trusted_sites)
+    return JSONResponse({"started": True})
+
+
+@app.get("/sources/status")
+def sources_status() -> dict:
+    """Polled by the PWA while a batch runs. `batch` is None if nothing's
+    ever been dispatched; otherwise the most recent one regardless of
+    whether it's still running — see storage.sources.latest_batch."""
+    return {"batch": latest_source_batch()}
+
+
+@app.get("/sources")
+def sources_list(status: str | None = None) -> list[dict]:
+    """Every saved document, newest first, across all batches — Sources
+    is app-wide, not scoped to one conversation (see storage/sources.py).
+    `?status=accepted` is the query a future context-building consumer
+    needs — everything a human has actually reviewed and approved."""
+    return list_source_documents(status=status)
+
+
+@app.post("/sources/{doc_id}/review")
+async def sources_review(doc_id: str, request: Request) -> JSONResponse:
+    """The actual review gate — a document is 'pending_review' until a
+    human explicitly accepts or rejects it here. Nothing else in this
+    codebase currently reads source_documents.status to decide what's
+    usable as chat context — that's the next piece, not built yet;
+    this route is what a future consumer would filter on."""
+    payload = await request.json()
+    status = payload.get("status")
+    if status not in ("accepted", "rejected"):
+        return JSONResponse({"error": "status must be 'accepted' or 'rejected'"}, status_code=400)
+    ok = set_source_document_status(doc_id, status)
+    if not ok:
+        return JSONResponse({"error": "Document not found"}, status_code=404)
+    return JSONResponse({"ok": True})
 
 
 @app.get("/research/status")
