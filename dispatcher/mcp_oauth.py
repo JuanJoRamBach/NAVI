@@ -60,6 +60,24 @@ _HTTP_TIMEOUT_SECONDS = 15
 # docstring).
 KNOWN_MINIMAL_SCOPES: dict[str, str] = {
     "github": "repo read:org read:user",
+    # Gmail/Calendar/Drive real scopes confirmed 2026-09-06 by fetching
+    # each server's own resource metadata directly (gmailmcp/calendarmcp/
+    # drivemcp.googleapis.com's .well-known/oauth-protected-resource/
+    # <tool> endpoints), not copied from generic Google API docs.
+    # gmail.compose covers draft creation (confirmed tool: "Creates a new
+    # draft email") — NOT gmail.send, which isn't in this server's own
+    # scopes_supported list at all, so real sending may need widening to
+    # gmail.modify once a real send-capable tool is confirmed to need it.
+    "gmail": "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose",
+    # calendar.events (not the broader bare "calendar" scope) — covers
+    # read/create/modify events without full calendar-list admin rights.
+    "calendar": "https://www.googleapis.com/auth/calendar.events",
+    # drive.file (Google's own documented least-privilege pattern for a
+    # third-party app) covers files NAVI creates/opens — NOT arbitrary
+    # pre-existing files the user never opened through NAVI. Real
+    # tradeoff, not an oversight: widen to add drive.readonly if reading
+    # arbitrary existing Drive files turns out to be a real need.
+    "drive": "https://www.googleapis.com/auth/drive.file",
 }
 
 
@@ -84,30 +102,76 @@ def _fetch_json(url: str) -> dict:
         raise MCPOAuthError(f"{url} didn't return JSON")
 
 
+def _mcp_call(mcp_url: str, method: str, params: dict) -> requests.Response:
+    return requests.post(
+        mcp_url,
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+        timeout=_HTTP_TIMEOUT_SECONDS,
+    )
+
+
+def _extract_resource_metadata_url(resp: requests.Response) -> str | None:
+    match = re.search(r'resource_metadata="([^"]+)"', resp.headers.get("WWW-Authenticate", ""))
+    return match.group(1) if match else None
+
+
 def _discover_resource_metadata_url(mcp_url: str) -> str:
-    """A minimal, unauthenticated MCP initialize call — a compliant
-    OAuth-protected server answers 401 with a WWW-Authenticate header
-    naming its protected-resource metadata (RFC9728)."""
+    """Finds the server's OAuth-protected-resource metadata URL (RFC9728)
+    by provoking a 401. Two real, DIFFERENT challenge points exist in the
+    wild, both verified by hand (2026-09-06) rather than assumed from the
+    spec text — GitHub's own docstring note above only covered the first:
+
+    1. GitHub: the bare `initialize` handshake itself is gated — a plain
+       unauthenticated initialize call gets 401 immediately.
+    2. Google's Gmail/Calendar/Drive/etc. MCP servers: `initialize` AND
+       `tools/list` both answer 200 with real, full data, completely
+       unauthenticated — only an actual `tools/call` invocation is
+       gated. Confirmed live against gmailmcp/calendarmcp/drivemcp.
+       googleapis.com: 200 on initialize and tools/list, 401 (with a
+       real resource_metadata) only once called with a REAL tool name
+       from that server's own tools/list response — an invented/wrong
+       tool name still returns 200 (looks like an unauthenticated pass
+       but is actually just "no such tool"), so the probe below reuses
+       a name the server itself just told us about, not a guess."""
     try:
-        resp = requests.post(
-            mcp_url,
-            json={
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "navi", "version": "1"}},
-            },
-            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
-            timeout=_HTTP_TIMEOUT_SECONDS,
-        )
+        resp = _mcp_call(mcp_url, "initialize", {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "navi", "version": "1"},
+        })
     except requests.RequestException as e:
         raise MCPOAuthError(f"couldn't reach the server: {e}")
-    if resp.status_code != 401:
-        raise MCPOAuthError(
-            f"server didn't challenge for auth (got {resp.status_code}) — it may not support OAuth here"
-        )
-    match = re.search(r'resource_metadata="([^"]+)"', resp.headers.get("WWW-Authenticate", ""))
-    if not match:
+
+    if resp.status_code == 401:
+        url = _extract_resource_metadata_url(resp)
+        if url:
+            return url
         raise MCPOAuthError("server returned 401 but no resource_metadata in WWW-Authenticate — can't discover its OAuth setup")
-    return match.group(1)
+
+    # Not gated at the handshake (Google-style) — find a real tool name
+    # and provoke the challenge on an actual tool call instead.
+    try:
+        tools_resp = _mcp_call(mcp_url, "tools/list", {})
+        tools = (tools_resp.json().get("result") or {}).get("tools") or []
+    except (requests.RequestException, ValueError):
+        tools = []
+    if not tools:
+        raise MCPOAuthError(
+            f"server didn't challenge for auth on initialize (got {resp.status_code}) and tools/list "
+            "returned no tools to probe with — it may not support OAuth here"
+        )
+    probe_name = tools[0]["name"]
+    try:
+        call_resp = _mcp_call(mcp_url, "tools/call", {"name": probe_name, "arguments": {}})
+    except requests.RequestException as e:
+        raise MCPOAuthError(f"couldn't reach the server: {e}")
+    if call_resp.status_code != 401:
+        raise MCPOAuthError(
+            f"server didn't challenge for auth on a real tool call (got {call_resp.status_code}) — it may not support OAuth here"
+        )
+    url = _extract_resource_metadata_url(call_resp)
+    if not url:
+        raise MCPOAuthError("server returned 401 but no resource_metadata in WWW-Authenticate — can't discover its OAuth setup")
+    return url
 
 
 def _discover_authorization_server_metadata(issuer: str) -> dict:
