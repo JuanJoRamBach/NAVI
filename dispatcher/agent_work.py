@@ -20,6 +20,7 @@ storage layer, since aiosqlite connections aren't loop-agnostic.
 """
 
 import asyncio
+import re
 import tempfile
 import threading
 import time
@@ -38,9 +39,34 @@ from storage.agent_work import (
     set_step_input, update_run_status, update_workflow_trigger,
 )
 from tools.documents import DocumentRenderError, render_pdf
+from tools.gmail_send import GmailSendError, send_gmail_message
 from tools.notes import NoteError, save_note
 from tools.registry import schemas_for
 from tools.telegram_send import TelegramSendError, send_file_to_telegram, send_to_telegram
+
+# Real prior art (2026-09-06): LangGraph's whole graph operates on ONE
+# typed state object — every node returns a partial update, any later
+# node can reference any earlier one's output by name, not just its
+# immediate predecessor's raw string. _execute_run's own `outputs` dict
+# (keyed by node id, or "node_id#item_index" inside a fan-out — see
+# below) already IS that shared state; this just exposes it to a node's
+# OWN config fields too; instead of collapsing everything into one
+# joined prior_context string, a field can name exactly which earlier
+# node it wants: "to": "{{state.n2}}" pulls n2's real output directly,
+# independent of whichever nodes happen to be direct predecessors.
+# Whole-value only, not embedded string templating — a field's value
+# either IS a state reference or is a literal, no templating engine.
+_STATE_REF_RE = re.compile(r"^\{\{state\.([A-Za-z0-9_-]+)\}\}$")
+
+
+def _resolve_state_refs(node: dict, outputs: dict[str, str]) -> dict:
+    resolved = dict(node)
+    for key, value in node.items():
+        if isinstance(value, str):
+            m = _STATE_REF_RE.match(value)
+            if m:
+                resolved[key] = outputs.get(m.group(1), "")
+    return resolved
 
 # Marks a node's string output as a reference to a real file on disk
 # rather than literal text to send/save as-is — currently only produced
@@ -270,6 +296,34 @@ def _run_save_note_node(prompt: str, prior_context: str | None) -> str:
         raise WorkflowError(str(e))
 
 
+def _run_send_email_node(node: dict, prior_context: str | None) -> str:
+    """No LLM call, ever — same reasoning as _run_send_telegram_node/
+    _run_save_note_node (2026-09-06: "the dispatcher is the one that
+    reads it, never an LLM" — this is that same principle, extended to
+    sending). `to` and `body` are the node's own configured fields
+    (each independently resolved against the shared run state via
+    {{state.<node_id>}} in _execute_run before this ever runs), not
+    something invented at run time. A bulk/dataset recipient list is
+    real, designed scope, NOT built here yet — this handles a single
+    address or a literal comma-separated list only; the dispatcher-only,
+    never-an-LLM constraint for reading a real client database applies
+    regardless of which real data source that ends up being. Bypasses
+    the connected Gmail MCP server (confirmed no send capability at all)
+    via tools/gmail_send.py's direct REST call."""
+    to = node.get("to")
+    body = node.get("body") or prior_context
+    if not to:
+        raise WorkflowError("Send Email step has no 'to' recipient configured.")
+    if not body:
+        raise WorkflowError("Send Email step has no body (no literal value, no prior step output).")
+    subject = node.get("subject") or "Message from NAVI"
+    try:
+        message_id = send_gmail_message(to, subject, body, html=True)
+    except GmailSendError as e:
+        raise WorkflowError(str(e))
+    return f"Sent to {to} (message {message_id})"
+
+
 def _run_input_node(prompt: str, prior_context: str | None) -> str:
     """No LLM call, ever (2026-09-03, JuanJo: "whatever instruction has
     the Input and Output nodes, are deterministic, unless they want an
@@ -453,6 +507,27 @@ def _run_node(node: dict, prior_context: str | None = None, outgoing_labels: lis
     field, so nothing exercised it before either. Worth restoring, keyed
     per node function, if a future caller (the visual graph builder)
     actually wants it."""
+    # Real `kind` discriminator (2026-09-06) — checked first. A node kind
+    # with fields beyond plain prompt/prior_context (send_email's to/body,
+    # output's output_type) is looked up directly rather than overloading
+    # the `tools` list as the selector; a plain kind with no extra fields
+    # still just wraps the existing SINGLE_TOOL_NODE_HANDLERS entry, so
+    # nothing about their own logic changes, only how they get selected.
+    kind = node.get("kind")
+    if kind == "send_email":
+        return _run_send_email_node(node, prior_context)
+    if kind == "output":
+        return _run_output_node(node.get("prompt", ""), prior_context, node.get("output_type"))
+    if kind == "choose_path":
+        return _run_choose_path_node(node.get("prompt", ""), prior_context, outgoing_labels or [])
+    if kind == "text":
+        return _run_text_node(node.get("prompt", ""), prior_context)
+    if kind in SINGLE_TOOL_NODE_HANDLERS:
+        return SINGLE_TOOL_NODE_HANDLERS[kind](node.get("prompt", ""), prior_context)
+
+    # Legacy path — no `kind` field at all (a workflow saved before this
+    # existed, or built through a caller that hasn't been updated to set
+    # it yet): dispatch off `tools` exactly as this router always has.
     prompt = node.get("prompt", "")
     tool_names = node.get("tools") or []
 
@@ -576,16 +651,25 @@ async def _execute_run(run_id: str, graph: dict) -> None:
             prior_context = "\n\n".join(prior_context_parts) or None
 
             run_node = dict(node) if item is None else {**node, "prompt": _substitute_item(node.get("prompt"), item)}
+            run_node = _resolve_state_refs(run_node, outputs)
             step_label = node["id"] if item is None else f"{node['id']} (item {item_index + 1}/{len(items)})"
 
             step_id = await create_step(run_id, node["id"], seq)
             seq += 1
-            step_input = {"prompt": run_node.get("prompt"), "role": run_node.get("role"), "tools": run_node.get("tools")}
+            step_input = {
+                "prompt": run_node.get("prompt"), "role": run_node.get("role"), "tools": run_node.get("tools"),
+                # Real values used THIS run, already resolved through
+                # _resolve_state_refs — a run's history should show what
+                # actually got sent, not the unresolved "{{state.n1}}"
+                # placeholder, same transparency principle as everything
+                # else this file records.
+                **{k: run_node[k] for k in ("kind", "to", "body", "subject", "output_type") if run_node.get(k) is not None},
+            }
             if item is not None:
                 step_input["item"] = item
             await set_step_input(step_id, step_input)
             try:
-                is_choose_path = run_node.get("tools") == ["choose_path"]
+                is_choose_path = run_node.get("kind") == "choose_path" or run_node.get("tools") == ["choose_path"]
                 output = await asyncio.to_thread(
                     _run_node, run_node, prior_context,
                     outgoing_labels_by_node.get(node["id"]) if is_choose_path else None,

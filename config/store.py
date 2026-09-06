@@ -450,11 +450,44 @@ class ConfigStore:
         """Decrypts auth_header for actual use (dispatcher/mcp_client.py's
         live handshake) — list_mcp_connections below stays encrypted since
         nothing reads auth_header off it (the REST list route never echoes
-        it to the client either way)."""
+        it to the client either way). oauth_refresh_token/oauth_client_secret
+        decrypt the same way, for the same reason — dispatcher/mcp_oauth.py's
+        ensure_fresh_access_token is the one real reader of either."""
         conn = self._data.get("mcp_connections", {}).get(name)
         if conn is None:
             return None
-        return {**conn, "auth_header": _decrypt_secret(conn.get("auth_header"))}
+        return {
+            **conn,
+            "auth_header": _decrypt_secret(conn.get("auth_header")),
+            "oauth_refresh_token": _decrypt_secret(conn.get("oauth_refresh_token")),
+            "oauth_client_secret": _decrypt_secret(conn.get("oauth_client_secret")),
+        }
+
+    def set_mcp_oauth_tokens(
+        self, name: str, *, access_token: str, refresh_token: str | None, expires_at: float | None,
+        token_endpoint: str, client_id: str, client_secret: str | None,
+    ):
+        """Persists everything dispatcher/mcp_oauth.py's ensure_fresh_
+        access_token needs to silently refresh later, without the user
+        ever re-authorizing (2026-09-06, JuanJo: "having to refresh the
+        token all the time is a huge pain point that we must not make the
+        users go through"). Called both right after the initial OAuth
+        exchange (server.py's /mcp/oauth/callback) and after every
+        successful refresh — refresh_token is passed through unchanged on
+        a refresh call since Google doesn't issue a new one each time.
+        Merges into whatever set_mcp_connection already stored (url,
+        transport, etc.), same **existing pattern that method uses."""
+        existing = self._data.setdefault("mcp_connections", {}).get(name, {})
+        self._data["mcp_connections"][name] = {
+            **existing,
+            "auth_header": _encrypt_secret(f"Bearer {access_token}"),
+            "oauth_refresh_token": _encrypt_secret(refresh_token) if refresh_token else existing.get("oauth_refresh_token"),
+            "oauth_expires_at": expires_at,
+            "oauth_token_endpoint": token_endpoint,
+            "oauth_client_id": client_id,
+            "oauth_client_secret": _encrypt_secret(client_secret) if client_secret else existing.get("oauth_client_secret"),
+        }
+        self._save()
 
     def list_mcp_connections(self) -> dict[str, dict]:
         return self._data.get("mcp_connections", {})

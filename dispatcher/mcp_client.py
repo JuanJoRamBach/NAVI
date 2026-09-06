@@ -154,8 +154,9 @@ class _Session:
     connection so callers don't need to branch on stdio vs. http
     themselves — the one place that distinction actually matters."""
 
-    def __init__(self, conn: dict):
+    def __init__(self, conn: dict, server_name: str):
         self._conn = conn
+        self._server_name = server_name
         self._transport_cm = None
         self._session_cm = None
 
@@ -170,9 +171,19 @@ class _Session:
             # streamable_http_client itself has no headers param — auth
             # goes through an httpx client instance instead (checked
             # against the installed SDK's real signature, not assumed).
+            # Proactively refreshes an about-to-expire OAuth token before
+            # this session even opens (2026-09-06) — the alternative
+            # (opening with a stale token, catching the resulting 401,
+            # retrying) means every caller of _Session would need its own
+            # retry logic; this way none of them do. A no-op for a
+            # connection with no refresh_token on file (a pasted static
+            # token, or a provider like GitHub that never issues one) —
+            # returns the existing auth_header unchanged in that case.
+            from dispatcher.mcp_oauth import ensure_fresh_access_token
+            auth_header = ensure_fresh_access_token(self._server_name) if self._conn.get("auth_header") else None
             http_client = (
-                httpx.AsyncClient(headers={"Authorization": self._conn["auth_header"]})
-                if self._conn.get("auth_header") else None
+                httpx.AsyncClient(headers={"Authorization": auth_header})
+                if auth_header else None
             )
             self._transport_cm = streamable_http_client(self._conn["url"], http_client=http_client)
             # The installed mcp SDK's streamable_http_client yields a
@@ -212,7 +223,7 @@ async def _async_discover_tools(server_name: str) -> list[dict]:
         raise MCPConnectionError(f"No connection configured for '{server_name}'.")
 
     results = []
-    async with _Session(conn) as session:
+    async with _Session(conn, server_name) as session:
         listing = await session.list_tools()
         for tool in listing.tools:
             description = sanitize_content(tool.description or "")
@@ -285,7 +296,7 @@ async def _async_call_tool(server_name: str, tool_name: str, arguments: dict) ->
     if baseline is None:
         raise MCPError(f"'{tool_name}' on '{server_name}' has never been approved — nothing to call.")
 
-    async with _Session(conn) as session:
+    async with _Session(conn, server_name) as session:
         # Re-verify against the pinned baseline on every single call, not
         # just at connect time — this is the actual rug-pull check, not
         # just discovery-time bookkeeping. A server that behaved at

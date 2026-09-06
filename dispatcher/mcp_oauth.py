@@ -48,6 +48,7 @@ import hashlib
 import os
 import re
 import secrets
+import time
 from urllib.parse import urlencode, urlsplit
 
 import requests
@@ -262,6 +263,20 @@ def start_authorization(server_name: str, mcp_url: str, redirect_uri: str) -> di
     scope = KNOWN_MINIMAL_SCOPES.get(server_name)
     if scope:
         params["scope"] = scope
+    # Real gap found and fixed 2026-09-06: without this, Google issues a
+    # plain ~1-hour access token and NO refresh token at all, silently
+    # breaking the connection an hour after every single reconnect —
+    # confirmed this is Google-specific (their own docs: "access_type=
+    # offline" is required to get a refresh token; "prompt=consent"
+    # ensures one is issued even on a repeat authorization, since Google
+    # otherwise only grants it the very first time a user ever consents).
+    # GitHub's own OAuth app flow neither needs nor documents these
+    # params — scoped to Google's issuer specifically rather than sent
+    # unconditionally to every provider, since an unfamiliar authorization
+    # server's handling of unrecognized params isn't something to assume.
+    if "accounts.google.com" in issuer:
+        params["access_type"] = "offline"
+        params["prompt"] = "consent"
 
     return {
         "authorize_url": f"{authorization_endpoint}?{urlencode(params)}",
@@ -273,7 +288,12 @@ def start_authorization(server_name: str, mcp_url: str, redirect_uri: str) -> di
 def exchange_code_for_token(
     token_endpoint: str, code: str, code_verifier: str,
     client_id: str, client_secret: str | None, redirect_uri: str,
-) -> str:
+) -> dict:
+    """Returns {"access_token", "refresh_token" (None if the server didn't
+    issue one), "expires_in" (seconds, None if the server didn't say)} —
+    widened 2026-09-06 from a bare access_token string so a caller can
+    actually persist enough to refresh later (see refresh_access_token
+    below and config.set_mcp_oauth_tokens)."""
     data = {
         "grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri,
         "client_id": client_id, "code_verifier": code_verifier,
@@ -293,4 +313,68 @@ def exchange_code_for_token(
     access_token = payload.get("access_token")
     if not access_token:
         raise MCPOAuthError(f"token exchange response had no access_token: {payload}")
-    return access_token
+    return {
+        "access_token": access_token,
+        "refresh_token": payload.get("refresh_token"),
+        "expires_in": payload.get("expires_in"),
+    }
+
+
+def refresh_access_token(token_endpoint: str, refresh_token: str, client_id: str, client_secret: str | None) -> dict:
+    """Returns {"access_token", "expires_in"} — a refresh grant, unlike
+    the initial authorization_code exchange, never returns a NEW refresh
+    token from Google (the original one stays valid and reusable), so
+    there's nothing else to persist here."""
+    data = {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": client_id}
+    if client_secret:
+        data["client_secret"] = client_secret
+    try:
+        resp = requests.post(token_endpoint, data=data, headers={"Accept": "application/json"}, timeout=_HTTP_TIMEOUT_SECONDS)
+    except requests.RequestException as e:
+        raise MCPOAuthError(f"token refresh failed: {e}")
+    if resp.status_code >= 400:
+        raise MCPOAuthError(f"token refresh returned {resp.status_code}: {resp.text[:200]}")
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise MCPOAuthError("token refresh response wasn't JSON")
+    access_token = payload.get("access_token")
+    if not access_token:
+        raise MCPOAuthError(f"token refresh response had no access_token: {payload}")
+    return {"access_token": access_token, "expires_in": payload.get("expires_in")}
+
+
+def ensure_fresh_access_token(server_name: str) -> str | None:
+    """The one place anything that's about to actually USE a connection's
+    token should call first — proactively refreshes if the stored token
+    is expired or about to be (60s buffer for clock skew/request latency)
+    and a refresh_token is on file, persists the new token, and returns
+    the real bearer auth_header to use. Returns the connection's existing
+    auth_header unchanged if there's nothing to refresh (no expiry known,
+    not close to expiring, or no refresh_token stored — e.g. GitHub's
+    connection, which never gets one at all). Never raises — a refresh
+    failure here shouldn't crash the caller; it just returns the
+    (possibly stale) existing auth_header and lets the real API call
+    fail with its own real 401 if the token truly is dead."""
+    from config.store import config
+    conn = config.get_mcp_connection(server_name)
+    if conn is None:
+        return None
+    expires_at = conn.get("oauth_expires_at")
+    refresh_token = conn.get("oauth_refresh_token")
+    if not refresh_token or not expires_at or time.time() < expires_at - 60:
+        return conn.get("auth_header")
+    try:
+        result = refresh_access_token(
+            conn["oauth_token_endpoint"], refresh_token, conn["oauth_client_id"], conn.get("oauth_client_secret"),
+        )
+    except MCPOAuthError as e:
+        print(f"[ensure_fresh_access_token] refresh failed for '{server_name}': {e}")
+        return conn.get("auth_header")
+    new_expires_at = time.time() + result["expires_in"] if result.get("expires_in") else None
+    config.set_mcp_oauth_tokens(
+        server_name, access_token=result["access_token"], refresh_token=refresh_token,
+        expires_at=new_expires_at, token_endpoint=conn["oauth_token_endpoint"],
+        client_id=conn["oauth_client_id"], client_secret=conn.get("oauth_client_secret"),
+    )
+    return f"Bearer {result['access_token']}"

@@ -129,7 +129,10 @@ TOOL_SCHEMAS = [
                             "its own model call, run manually or on a schedule. You decide how "
                             "many steps the task needs and what each one's prompt says; the "
                             "dispatcher wires them into a chain itself — don't invent node ids "
-                            "or edges. A single-item list is a one-step workflow.",
+                            "or edges. A single-item list is a one-step workflow. Use `kind` to "
+                            "pick a step's real behavior — a step of a DETERMINISTIC kind (e.g. "
+                            "send_email) never calls you again at run time to compose anything; "
+                            "its fields must already be the complete, real content.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -140,12 +143,25 @@ TOOL_SCHEMAS = [
                         "description": "Ordered — step 1 runs first, then step 2, etc. Each "
                                         "step's prompt must stand alone (no 'as discussed above' "
                                         "or references to this conversation) since the step's "
-                                        "model call never sees this chat.",
+                                        "model call never sees this chat. To use an EARLIER step's "
+                                        "real output as a later step's field value (not just the "
+                                        "immediately-preceding one), set that field to exactly "
+                                        "\"{{state.n1}}\" (n1/n2/... matching that earlier step's "
+                                        "position, 1-indexed) instead of writing prose.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "prompt": {"type": "string", "description": "Complete, self-contained instruction for this step."},
-                                "tools": {"type": "array", "items": {"type": "string"}, "description": "Tool names this step may call, if any."},
+                                "prompt": {"type": "string", "description": "Complete, self-contained instruction for this step. For a deterministic kind (send_email, save_note, send_to_telegram) with no prior step feeding it, this is the literal content itself, not an instruction."},
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["text", "send_email", "output", "choose_path", "web_search", "fetch_page", "save_note", "send_to_telegram"],
+                                    "description": "The step's real behavior. 'text' (default if omitted) generates text with a model call. 'send_email' SENDS A REAL EMAIL — no LLM call, requires 'to' and 'body' below. 'output' returns a value (optionally 'output_type': 'pdf'). The rest match the tool of the same name.",
+                                },
+                                "to": {"type": "string", "description": "send_email only, REQUIRED for it: recipient address, or comma-separated for multiple. Can be \"{{state.n1}}\" to reuse an earlier step's output."},
+                                "body": {"type": "string", "description": "send_email only, REQUIRED for it: the complete real HTML (or plain text) email body — links and buttons are real HTML anchor/button markup, not described in prose. Can be \"{{state.n1}}\" to reuse an earlier step's output."},
+                                "subject": {"type": "string", "description": "send_email only, optional: the email subject line."},
+                                "output_type": {"type": "string", "enum": ["pdf", "chat", "markdown"], "description": "output kind only, optional: 'pdf' renders the value into a real file; omit for plain text/markdown pass-through."},
+                                "tools": {"type": "array", "items": {"type": "string"}, "description": "Legacy — prefer 'kind' above. Tool names this step may call, if any."},
                             },
                             "required": ["prompt"],
                         },

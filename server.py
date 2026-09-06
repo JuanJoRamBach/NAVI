@@ -1123,7 +1123,7 @@ async def mcp_oauth_callback(request: Request) -> RedirectResponse:
         return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=error")
 
     try:
-        access_token = await asyncio.to_thread(
+        token = await asyncio.to_thread(
             exchange_code_for_token, pending["token_endpoint"], code, pending["code_verifier"],
             pending["client_id"], pending["client_secret"], pending["redirect_uri"],
         )
@@ -1136,11 +1136,18 @@ async def mcp_oauth_callback(request: Request) -> RedirectResponse:
     if conn is None:
         print(f"[mcp_oauth_callback] connection '{server_name}' vanished between /oauth/start and this callback")
         return RedirectResponse(f"{PWA_ORIGIN}/?mcp_oauth=error")
-    # Stores the token exactly like a pasted one — encrypted at rest via
-    # config.set_mcp_connection's existing auth_header handling, same
-    # code path a manual paste already goes through.
-    config.set_mcp_connection(server_name, conn["transport"], url=conn["url"], auth_header=f"Bearer {access_token}")
-    print(f"[mcp_oauth_callback] token exchange succeeded for '{server_name}', discovering tools next")
+    # Persists everything needed to silently refresh later (2026-09-06) —
+    # not just the access token, the way this used to work. A server that
+    # never issues a refresh_token (GitHub) just stores None for it;
+    # ensure_fresh_access_token treats that as "nothing to refresh,"
+    # not an error.
+    expires_at = time.time() + token["expires_in"] if token.get("expires_in") else None
+    config.set_mcp_oauth_tokens(
+        server_name, access_token=token["access_token"], refresh_token=token.get("refresh_token"),
+        expires_at=expires_at, token_endpoint=pending["token_endpoint"],
+        client_id=pending["client_id"], client_secret=pending["client_secret"],
+    )
+    print(f"[mcp_oauth_callback] token exchange succeeded for '{server_name}' (refresh_token={'yes' if token.get('refresh_token') else 'no'}), discovering tools next")
 
     try:
         discovered = await asyncio.to_thread(discover_tools, server_name)
