@@ -448,19 +448,21 @@ class ConfigStore:
     # hitting the same wall again. JuanJo: "if it's an error about HARD
     # LIMITS on an LLM, it changes the routing" — this is that mechanism.
     #
-    # Real incident history in this file (see the 2026-08-28 comment
-    # above, "ordinary free-tier rate-limiting: 30 RPM / 1,000 RPD") shows
-    # every actual failure here has been daily-cap exhaustion (RPD/TPD),
-    # not a short burst — so a same-UTC-day cooldown is an evidence-based
-    # default, not a guess. Providers don't uniformly expose a real
-    # retry-after value on their free tiers, so this doesn't try to
-    # distinguish "burst, retry in 10s" from "quota gone until tomorrow"
-    # any more precisely than that.
+    # Cooldown length revised same day it shipped: originally a same-UTC-
+    # day cooldown, reasoned from this file's own 2026-08-28 Groq incident
+    # (a real RPD/TPD exhaustion). That reasoning didn't hold for every
+    # provider — LLM7 returned a 429 that JuanJo confirmed wasn't real
+    # usage exhaustion, and a full-day cooldown on a SPURIOUS 429 silently
+    # sidelines a role's primary for hours over one bad response. A short,
+    # fixed cooldown is the safer default absent a real per-provider
+    # retry-after value (which free tiers don't uniformly expose): long
+    # enough to stop immediately re-hitting a burst limit, short enough
+    # that a wrong guess costs minutes, not most of a day.
+    RATE_LIMIT_COOLDOWN_SECONDS = 300
+
     def mark_rate_limited(self, provider: str, model: str):
-        now = time.time()
-        next_utc_midnight = (int(now // 86400) + 1) * 86400
         key = f"{provider}:{model}"
-        self._data.setdefault("rate_limit_cooldowns", {})[key] = next_utc_midnight
+        self._data.setdefault("rate_limit_cooldowns", {})[key] = time.time() + self.RATE_LIMIT_COOLDOWN_SECONDS
         self._save()
 
     def get_attempts(self, candidates: list[dict]) -> list[dict]:

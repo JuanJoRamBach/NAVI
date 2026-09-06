@@ -2,34 +2,31 @@
 providers/cloudflare.py
 
 Cloudflare Workers AI transport, via the plain REST API (no SDK — same
-"plain requests" rule as every other provider here). Currently backing
-/code via @cf/qwen/qwen2.5-coder-32b-instruct, verified directly against
-the real account before wiring in (real call cost 2.7 Neurons out of the
-10,000/day free allowance).
+"plain requests" rule as every other provider here).
 
-Prompt caching (2026-09-01 research pass, cross-provider): automatic
-baseline — Cloudflare's own docs say prefix caching is "enabled by default
-for select models," no code change required to get some benefit. Hit rate
-improves further by sending an x-session-affinity header with a stable
-per-session identifier, routing repeat requests to the same model instance
-— not wired here yet, worth adding if this transport sees enough repeat-
-prefix traffic to matter. See providers/groq.py (fully automatic, no lever
-needed) and providers/openrouter.py (mostly automatic, a few exceptions)
-for how this differs elsewhere — behavior is NOT uniform across providers.
+Migrated 2026-09-06 from Cloudflare's native /ai/run/{model} endpoint to
+their OpenAI-compatible /ai/v1/chat/completions one — a real bug, not a
+model problem: JuanJo hit gpt-oss-120b (the SAME failure already
+documented for gemma-4-26b) calling web_search/fetch_page in a loop,
+never synthesizing an answer, hitting MAX_TOOL_ITERATIONS every time.
+Cloudflare's own changelog explains why: the native endpoint used to
+regenerate tool_call ids instead of preserving the model's real ones,
+"which broke multi-turn tool calling because clients could not match
+tool results to their original calls" — exactly this symptom, and not
+specific to any one model, since it's the endpoint doing it. Their
+OpenAI-compatible endpoint preserves real ids. This also lets response
+parsing follow the exact same shape as every other OpenAI-compatible
+provider here (see providers/groq.py) instead of guessing between two
+different envelope shapes, which the old native-endpoint code had to do.
 
-Unlike every other provider, the endpoint URL itself needs a Cloudflare
-account ID, not just the API token. Account ID isn't a secret the way an
-API key is, so rather than extend config/store.py's schema for one
-provider-specific value, it's read straight from CLOUDFLARE_ACCOUNT_ID at
-call time — a deliberate, small inconsistency, not an oversight.
-
-Response shape is Cloudflare's own, not OpenAI's: {"result": {"response":
-..., "tool_calls": [...]}, "success": bool, "errors": [...]} — so this
-provider has its own parsing rather than reusing the choices[0].message
-shape the OpenAI-compatible providers share. Tool-call parsing here is
-best-effort and untested against a real populated example (the
-verification call didn't trigger one) — /code doesn't currently use the
-tool belt, so this isn't load-bearing yet.
+UNVERIFIED, disclosed rather than assumed: whether this endpoint's
+`usage` object still reports a Cloudflare-specific `neurons` field the
+way the native endpoint's response did (needed for the Usage Counters
+panel's real per-call cost). No Cloudflare credentials are available to
+test this from here — falls back to a token-count usage_note (same
+shape as Groq/Mistral) if `neurons` isn't present, so a real call either
+way still gets a real usage_note, just possibly not Neuron-denominated
+until this is confirmed live.
 """
 
 import os
@@ -38,7 +35,7 @@ import requests
 
 from providers.base import ChatMessage, ChatResponse, Provider, ProviderError, ToolCall
 
-BASE_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
+BASE_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
 
 
 def _serialize_message(m: ChatMessage) -> dict:
@@ -66,24 +63,31 @@ class CloudflareProvider(Provider):
         if not account_id:
             raise ProviderError("CLOUDFLARE_ACCOUNT_ID not set")
 
-        # Cloudflare's own default max_tokens is 256 (their changelog) — far
-        # too little for a "thinking mode" model (qwen3.8-27b, gpt-oss's
-        # harmony reasoning channel, etc.), which spends tokens on hidden
-        # reasoning BEFORE any visible answer or tool call. Real incident
-        # (2026-09-02): three unrelated reasoning-capable models all
-        # returned a "successful" response with both text and tool_calls
-        # completely empty — the model was cut off mid-thought before ever
-        # reaching visible output. 8192 gives real headroom; billing is by
-        # tokens actually generated, not this ceiling, so raising it costs
-        # nothing unless a call genuinely needs it.
-        payload = {"messages": [_serialize_message(m) for m in messages], "max_tokens": 8192}
+        payload = {
+            "model": model,
+            "messages": [_serialize_message(m) for m in messages],
+            # Cloudflare's own default max_tokens is 256 (their changelog) —
+            # far too little for a "thinking mode" model (qwen3.8-27b,
+            # gpt-oss's harmony reasoning channel, etc.), which spends
+            # tokens on hidden reasoning BEFORE any visible answer or tool
+            # call. Real incident (2026-09-02): three unrelated reasoning-
+            # capable models all returned a "successful" response with both
+            # text and tool_calls completely empty — the model was cut off
+            # mid-thought before ever reaching visible output. 8192 gives
+            # real headroom; billing is by tokens actually generated, not
+            # this ceiling, so raising it costs nothing unless a call
+            # genuinely needs it. Still true on this endpoint — nothing
+            # about the max_tokens-starves-reasoning-models issue was
+            # specific to the old native endpoint.
+            "max_tokens": 8192,
+        }
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice or "auto"
 
         try:
             resp = requests.post(
-                BASE_URL.format(account_id=account_id, model=model),
+                BASE_URL.format(account_id=account_id),
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
@@ -100,52 +104,46 @@ class CloudflareProvider(Provider):
             raise ProviderError(f"Cloudflare error {resp.status_code}: {resp.text[:300]}")
 
         data = resp.json()
-        if not data.get("success"):
-            raise ProviderError(f"Cloudflare error: {data.get('errors')}")
+        choices = data.get("choices") or []
+        if not choices or not choices[0].get("message"):
+            raise ProviderError(f"Cloudflare returned a malformed response (no message): {str(data)[:300]}")
+        choice = choices[0]["message"]
 
-        result = data.get("result", {})
-
-        # Two response shapes exist depending on the model (2026-09-02,
-        # found via a real Filen-logged "empty response" failure — see
-        # dispatcher/provider_debug.py). Older/simpler Workers AI models
-        # return {"result": {"response": "...", "tool_calls": [...]}}, but
-        # several newer chat-completions-compatible models (gemma-4-26b,
-        # gpt-oss, qwen3.8-27b) return an OpenAI-style {"result": {
-        # "choices": [{"message": {"content": ..., "tool_calls": [...]}}]}}
-        # envelope instead. Every "the model returned nothing" incident
-        # today across three different models was actually this: a real,
-        # complete answer sitting in choices[0].message.content, silently
-        # read as empty because only the first shape was ever checked.
-        choices_message = (result.get("choices") or [{}])[0].get("message", {})
-        text = result.get("response")
-        if text is None:
-            text = choices_message.get("content")
-
-        raw_tool_calls = result.get("tool_calls") or choices_message.get("tool_calls") or []
         tool_calls = []
-        for tc in raw_tool_calls:
+        for tc in choice.get("tool_calls") or []:
             tool_calls.append(ToolCall(
-                id=tc.get("id", ""),
-                name=tc.get("name") or tc.get("function", {}).get("name", ""),
-                arguments=tc.get("arguments") or tc.get("function", {}).get("arguments", {}),
+                id=tc["id"],
+                name=tc["function"]["name"],
+                arguments=tc["function"]["arguments"],
             ))
 
-        neurons = result.get("usage", {}).get("neurons")
-        usage_note = f"{neurons:.2f} Neurons" if neurons is not None else None
+        usage = data.get("usage") or {}
+        # See module docstring — real Neuron cost if this OpenAI-compatible
+        # endpoint still exposes it (unverified), a token-count usage_note
+        # (same shape as Groq/Mistral) otherwise. Records SOMETHING either
+        # way — falling all the way through to recording nothing would
+        # silently starve the Usage Counters panel's Cloudflare card of
+        # every call made through this endpoint, not just show a less
+        # precise number.
+        neurons = usage.get("neurons")
+        total_tokens = usage.get("total_tokens")
         if neurons is not None:
-            # Real per-call Neuron cost, straight from Cloudflare's own
-            # response — no estimation. Usage counters panel sums today's
-            # (UTC) total against the confirmed 10,000/day free allowance.
+            usage_note = f"{neurons:.2f} Neurons"
+        elif total_tokens is not None:
+            usage_note = f"{usage.get('prompt_tokens', '?')} in / {usage.get('completion_tokens', '?')} out / {total_tokens} total tokens"
+        else:
+            usage_note = None
+        if neurons is not None or total_tokens is not None:
             try:
                 from storage.usage import record_usage
-                record_usage("cloudflare", model, neurons=neurons)
+                record_usage("cloudflare", model, neurons=neurons or 0.0, tokens=total_tokens or 0)
             except Exception:
                 pass
 
         return ChatResponse(
-            text=text,
+            text=choice.get("content"),
             tool_calls=tool_calls,
-            model_used=model,
+            model_used=data.get("model", model),
             raw=data,
             usage_note=usage_note,
         )
