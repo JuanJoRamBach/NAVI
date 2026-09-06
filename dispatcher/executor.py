@@ -406,7 +406,7 @@ def _run_research_gather_phase(step: Step, prior_context: str | None) -> tuple[s
     gathering_brief = get_phase_brief("GATHERING.md")
     gathering_tools = schemas_for(gathering_brief.tools)
 
-    attempts = [routing["primary"]] + routing.get("fallback", [])
+    attempts = config.get_attempts([routing["primary"]] + routing.get("fallback", []))
     last_error = None
 
     for i, attempt in enumerate(attempts):
@@ -453,6 +453,8 @@ def _run_research_gather_phase(step: Step, prior_context: str | None) -> tuple[s
             return doc, response.text or "", (i > 0), (attempt if i > 0 else None), None, i + 1 + iterations
         except ProviderError as e:
             last_error = str(e)
+            if e.is_rate_limit:
+                config.mark_rate_limited(attempt["provider"], model)
             continue
 
     return "", "", False, None, last_error or "All research providers failed during gathering", len(attempts)
@@ -592,7 +594,7 @@ def _run_text_transform_step(
     if not routing:
         return StepResult(step=step, text="", error=f"No routing configured for /{command}")
 
-    attempts = [routing["primary"]] + routing.get("fallback", [])
+    attempts = config.get_attempts([routing["primary"]] + routing.get("fallback", []))
     last_error = None
 
     for i, attempt in enumerate(attempts):
@@ -631,6 +633,8 @@ def _run_text_transform_step(
             )
         except ProviderError as e:
             last_error = str(e)
+            if e.is_rate_limit:
+                config.mark_rate_limited(attempt["provider"], model)
             continue
 
     return StepResult(step=step, text="", error=last_error or f"All {command} providers failed")
@@ -683,7 +687,7 @@ def _run_remind_step(step: Step, prior_context: str | None) -> StepResult:
         "with that plus a short message describing what to remind them about."
     )
 
-    attempts = [routing["primary"]] + routing.get("fallback", [])
+    attempts = config.get_attempts([routing["primary"]] + routing.get("fallback", []))
     last_error = None
 
     for i, attempt in enumerate(attempts):
@@ -722,6 +726,8 @@ def _run_remind_step(step: Step, prior_context: str | None) -> StepResult:
             )
         except (ProviderError, KeyError, ValueError) as e:
             last_error = str(e)
+            if isinstance(e, ProviderError) and e.is_rate_limit:
+                config.mark_rate_limited(attempt["provider"], model)
             continue
 
     return StepResult(step=step, text="", error=last_error or "Couldn't set the reminder — all providers failed")
@@ -764,7 +770,7 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
     if not routing:
         return StepResult(step=step, text="", error=f"No routing configured for /{step.command}")
 
-    attempts = [routing["primary"]] + routing.get("fallback", [])
+    attempts = config.get_attempts([routing["primary"]] + routing.get("fallback", []))
     last_error = None
 
     for i, attempt in enumerate(attempts):
@@ -811,6 +817,8 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
             )
         except (ProviderError, ChartError) as e:
             last_error = str(e)
+            if isinstance(e, ProviderError) and e.is_rate_limit:
+                config.mark_rate_limited(attempt["provider"], model)
             continue
 
     return StepResult(step=step, text="", error=last_error or "All providers failed")

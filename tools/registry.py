@@ -13,6 +13,7 @@ model as the tool result.
 """
 
 import json
+from urllib.parse import urlparse as _urlparse
 
 from tools.fetch import FetchError, fetch_page
 from tools.notes import NoteError, save_note
@@ -337,7 +338,6 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
         if name == "web_search":
             query = arguments["query"]
             max_results = int(arguments.get("max_results", 5))
-            results = web_search(query, max_results=max_results)
             # Trusted-site enforcement lives HERE, not in a prompt asking
             # the model to "only search trusted-sites.com" — the model
             # never even sees a result outside the registry it was
@@ -347,14 +347,54 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
             # and web_search behaves exactly as it always has.
             trusted_sites = context.get("trusted_sites")
             if trusted_sites:
+                # Rewritten 2026-09-06 after a real batch searched
+                # generically then filtered the top max_results down to
+                # trusted domains AFTER the fact — a trusted domain
+                # ranked outside the top 5 of a generic query (verified:
+                # anthropic.com was position 7 for "AI agent harness
+                # design") was never even fetched, so the filter had
+                # nothing to keep. Fixed per-entry instead of post-hoc
+                # (JuanJo: "it should use the url directly to do web
+                # search there, that's the point of the trusted sites"):
                 from storage.sources import domain_of
-                def _normalize(site: str) -> str:
-                    s = site.strip().lower()
-                    return s[4:] if s.startswith("www.") else s
-                allowed = {_normalize(s) for s in trusted_sites}
-                results = [r for r in results if any(domain_of(r["url"]) == d or domain_of(r["url"]).endswith(f".{d}") for d in allowed)]
+
+                def _as_url(site: str) -> str:
+                    s = site.strip()
+                    return s if "://" in s else f"https://{s}"
+
+                results = []
+                for site in trusted_sites:
+                    if not site.strip():
+                        continue
+                    full_url = _as_url(site)
+                    path = _urlparse(full_url).path
+                    if path and path != "/":
+                        # An exact page, not just a domain — the caller
+                        # already knows the page it wants, so there's
+                        # nothing to search for. Handed straight back as
+                        # a pre-known candidate; the model still fetches
+                        # and judges it like any other result, just
+                        # without a wasted search step.
+                        results.append({
+                            "title": full_url, "url": full_url,
+                            "snippet": "(trusted page — already known, fetch it directly to judge relevance)",
+                        })
+                    else:
+                        # A bare domain has no single page yet — scope
+                        # the search itself to this domain (DuckDuckGo's
+                        # own site: operator) instead of searching the
+                        # whole web and hoping this domain happens to
+                        # rank in the top max_results generically.
+                        domain = domain_of(full_url)
+                        results.extend(web_search(f"site:{domain} {query}", max_results=max_results))
+                if not results:
+                    return "No results found on any trusted site for this term."
+                lines = [f"- {r['title']} ({r['url']}): {r['snippet']}" for r in results]
+                return "\n".join(lines)
+
+            results = web_search(query, max_results=max_results)
             if not results:
-                return "No results found." if not trusted_sites else "No results found on any trusted site for this term."
+                return "No results found."
             lines = [f"- {r['title']} ({r['url']}): {r['snippet']}" for r in results]
             return "\n".join(lines)
 

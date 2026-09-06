@@ -25,6 +25,7 @@ import asyncio
 import re
 from datetime import datetime, timezone
 
+from config.store import config
 from dispatcher.executor import CITATION_STYLE_PROMPT, _extract_tool_results, _parse_tool_args, run_tool_loop
 from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.provider_debug import save_failed_exchange
@@ -85,7 +86,7 @@ def run_mode_chat(mode: str, text: str) -> str:
     # "Groq rate limited" hard failure) — try the primary, then each
     # configured fallback in order, same pattern as /research's gathering
     # phase (executor.py). Any one succeeding returns immediately.
-    attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
+    attempts = config.get_attempts([{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", []))
     last_error = None
     for i, attempt in enumerate(attempts):
         try:
@@ -112,6 +113,8 @@ def run_mode_chat(mode: str, text: str) -> str:
             return reply
         except ProviderError as e:
             last_error = str(e)
+            if e.is_rate_limit:
+                config.mark_rate_limited(attempt["provider"], attempt["model"])
             continue
 
     return f"⚠️ normal_chat failed on every configured provider: {last_error}"
@@ -241,7 +244,7 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
     # via append_message) is untouched — only this outgoing copy changes.
     messages[-1].content = f"{messages[-1].content}\n\n[Current UTC time: {datetime.now(timezone.utc).isoformat()}]"
 
-    attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
+    attempts = config.get_attempts([{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", []))
     attempt_labels = [f"{a['provider']}/{a['model']}" for a in attempts]
     print(f"[run_stored_mode_chat] mode={mode} conversation={conversation_id} attempts={attempt_labels}")
     last_error = None
@@ -356,6 +359,8 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
         except ProviderError as e:
             last_error = str(e)
             print(f"[run_stored_mode_chat] attempt {i}: DECISION = retry next fallback (ProviderError: {last_error})")
+            if e.is_rate_limit:
+                config.mark_rate_limited(attempt["provider"], attempt["model"])
             await asyncio.to_thread(
                 save_failed_exchange, role_context, attempt["provider"], attempt["model"], messages, last_error,
             )

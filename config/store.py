@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -274,20 +275,29 @@ DEFAULTS = {
         # source_fetch: the Sources tab's "Batch Dispatch" — searches each
         # term against the user's Trusted Sites registry (enforced in
         # tools/registry.py's dispatch(), not left to the model), fetches
-        # relevant hits, saves one document per real find. JuanJo's own
-        # call on the chain (2026-09-06): OpenRouter primary (same
-        # tool-calling-verified nemotron already backing graph-data/remind),
-        # Cloudflare next, then Mistral, then Ollama Cloud last — a real
-        # 4-deep chain since this can run for a while and a mid-batch
-        # failure shouldn't lose everything found so far (see
-        # dispatcher/source_fetch.py for how a rotation mid-batch is
-        # handled — each attempt/model swap is not started over from zero).
+        # relevant hits, saves one document per real find.
+        #
+        # Chain revised 2026-09-06 after a real batch burned 6 OpenRouter
+        # requests finding zero documents (JuanJo caught it live) — a
+        # multi-term batch with several tool-loop round-trips per term
+        # eats OpenRouter's scarce daily request cap fast, so it's out of
+        # this role entirely (JuanJo: "openrouter shouldn't be used in
+        # sources, it uses too many requests"). Cloudflare's
+        # llama-3.1-8b-instruct-fp8-fast (proven tool-caller, already
+        # backing normal_chat/agent_work's fallback) is primary; Mistral's
+        # ministral-8b-latest (same size class, agent_work's own fallback)
+        # is second. Groq's gpt-oss-20b is a deliberate LAST resort only,
+        # not primary/second — its free tier caps at 8K tokens/minute
+        # (see normal_chat's own comment above), and this role's tool
+        # loop can pull in full fetched-page content across several
+        # round-trips, the same growing-context shape that already ruled
+        # Groq out of normal_chat/dev_slate_chat. As a rarely-hit third
+        # door it's fine; as primary it'd hit that cap constantly.
         "source_fetch": {
-            "primary": {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
+            "primary": {"provider": "cloudflare", "model": "@cf/meta/llama-3.1-8b-instruct-fp8-fast"},
             "fallback": [
-                {"provider": "cloudflare", "model": "@cf/meta/llama-3.1-8b-instruct-fp8-fast"},
-                {"provider": "mistral", "model": "mistral-small-latest"},
-                {"provider": "ollama_cloud", "model": "minimax-m3:cloud"},
+                {"provider": "mistral", "model": "ministral-8b-latest"},
+                {"provider": "groq", "model": "openai/gpt-oss-20b"},
             ],
         },
         # No "brainstorm" entry — retired as a standalone command (2026-08-27):
@@ -417,6 +427,48 @@ class ConfigStore:
             "primary": primary, "fallback": fallback,
         }
         self._save()
+
+    # ---- Rate-limit cooldowns (2026-09-06) ----
+    #
+    # Every provider already raises ProviderError(is_rate_limit=True) on a
+    # 429 (providers/*.py) — but until now nothing acted on that signal
+    # differently from any other failure: every caller's fallback loop
+    # just rotated to the next static entry in its own chain for that one
+    # call, and the next call started right back at the same primary,
+    # hitting the same wall again. JuanJo: "if it's an error about HARD
+    # LIMITS on an LLM, it changes the routing" — this is that mechanism.
+    #
+    # Real incident history in this file (see the 2026-08-28 comment
+    # above, "ordinary free-tier rate-limiting: 30 RPM / 1,000 RPD") shows
+    # every actual failure here has been daily-cap exhaustion (RPD/TPD),
+    # not a short burst — so a same-UTC-day cooldown is an evidence-based
+    # default, not a guess. Providers don't uniformly expose a real
+    # retry-after value on their free tiers, so this doesn't try to
+    # distinguish "burst, retry in 10s" from "quota gone until tomorrow"
+    # any more precisely than that.
+    def mark_rate_limited(self, provider: str, model: str):
+        now = time.time()
+        next_utc_midnight = (int(now // 86400) + 1) * 86400
+        key = f"{provider}:{model}"
+        self._data.setdefault("rate_limit_cooldowns", {})[key] = next_utc_midnight
+        self._save()
+
+    def get_attempts(self, candidates: list[dict]) -> list[dict]:
+        """Reorders a primary+fallback attempt list (each {"provider",
+        "model", ...}) so any entry currently cooling down from a prior
+        mark_rate_limited() call sorts AFTER everything that isn't —
+        demoted, not dropped, so a chain where every entry happens to be
+        cooling down still gets tried in its original order rather than
+        failing outright. Callers build the flat attempts list exactly as
+        before and pass it through this before looping it."""
+        now = time.time()
+        cooldowns = self._data.get("rate_limit_cooldowns", {})
+
+        def is_cooling(candidate: dict) -> bool:
+            until = cooldowns.get(f"{candidate.get('provider')}:{candidate.get('model')}")
+            return bool(until and until > now)
+
+        return sorted(candidates, key=is_cooling)
 
     def remove_task_routing(self, command: str):
         self._data.get("task_routing", {}).pop(command, None)
@@ -837,3 +889,30 @@ def _migrate_widen_chat_fallbacks_2026_09_04():
 
 
 _migrate_widen_chat_fallbacks_2026_09_04()
+
+
+def _migrate_source_fetch_off_openrouter_2026_09_06():
+    """One-time correction for an already-materialized config.json (this
+    server's live one included) — a real batch burned 6 OpenRouter
+    requests to save zero documents (JuanJo caught it live testing
+    Sources), and OpenRouter's daily request cap is scarce enough that
+    using it as source_fetch's primary isn't sustainable for a role that
+    can run several tool-loop round-trips per search term. Force-
+    overwrites the existing routing (not a fill-in-if-missing migration),
+    same pattern as _migrate_widen_chat_fallbacks_2026_09_04 — see
+    source_fetch's DEFAULTS comment above for the full reasoning on why
+    Cloudflare/Mistral are primary/second and Groq is last-resort only."""
+    if config.get("migrated_source_fetch_off_openrouter_2026_09_06"):
+        return
+    config.set_task_routing(
+        "source_fetch",
+        {"provider": "cloudflare", "model": "@cf/meta/llama-3.1-8b-instruct-fp8-fast"},
+        [
+            {"provider": "mistral", "model": "ministral-8b-latest"},
+            {"provider": "groq", "model": "openai/gpt-oss-20b"},
+        ],
+    )
+    config.set("migrated_source_fetch_off_openrouter_2026_09_06", True)
+
+
+_migrate_source_fetch_off_openrouter_2026_09_06()
