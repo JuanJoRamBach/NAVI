@@ -789,7 +789,16 @@ def config_models(task: str = Query(...)) -> dict:
     return {
         "task": task,
         "current": current,
-        "candidates": [{"provider": c["provider"], "model": c["id"], "context_length": c.get("context_length")} for c in candidates],
+        # quality/speed (2026-09-06) are the same real numbers
+        # list_candidates ranks by, not new computation here — lets the
+        # picker UI show/group by real signal instead of a flat list.
+        # quality is 0 for a model with no matching AA benchmark entry
+        # (no signal, not "bad") — the frontend should treat 0 as
+        # "unranked," not the lowest real score.
+        "candidates": [
+            {"provider": c["provider"], "model": c["id"], "context_length": c.get("context_length"), "quality": c.get("_quality", 0), "speed": c.get("_speed", 0)}
+            for c in candidates
+        ],
     }
 
 

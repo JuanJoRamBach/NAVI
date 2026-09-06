@@ -126,6 +126,24 @@ class Provider(ABC):
             record_usage(self.name, model, requests=1)
         except Exception:
             pass  # usage tracking must never break a real chat request
+
+        # Defense in depth (2026-09-06) — jobs/model_ranking.py's own
+        # BANNED_FOR_TOOLS already keeps a known-unreliable-with-tools
+        # model from ever being RANKED/SELECTED for a tools-requiring
+        # task, but this is the one place every call funnels through
+        # regardless of how a model got chosen (a stale manual pin, a
+        # role config edited by hand, a future caller that bypasses
+        # ranking entirely) — so this is the real backstop, not the
+        # primary fix. Strips tools rather than raising: a banned-for-
+        # tools model can still answer in plain text, which is strictly
+        # better than a hard failure for whatever turn this is.
+        if tools:
+            from jobs.model_ranking import BANNED_FOR_TOOLS
+            if model in BANNED_FOR_TOOLS:
+                print(f"[Provider.chat] refusing to send tools to banned-for-tools model '{model}' — stripping tools/tool_choice for this call")
+                tools = None
+                tool_choice = None
+
         return self._do_chat(model, messages, tools=tools, tool_choice=tool_choice)
 
     @abstractmethod

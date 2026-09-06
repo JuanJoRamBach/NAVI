@@ -96,6 +96,20 @@ TASK_REQUIREMENTS = {
     "normal_chat": {"tools": True, "min_context": 16000, "tier": "large"},
 }
 
+# Confirmed unreliable at tool-calling despite the catalog's own "tools"
+# flag claiming support — real production evidence (2026-09-03, see
+# NAVI/IDEAS.md's "Deferred fix" entry): this model reliably calls a
+# tool, gets a real result back, then never writes any follow-up text —
+# it just loops (repeat create_workflow with varying arguments, repeat
+# web_search) until MAX_TOOL_ITERATIONS is hit, never producing a final
+# answer. gpt-oss-120b handled the identical request cleanly the same
+# night. Scoped to tool-requiring tasks specifically (checked in
+# _qualifying_candidates below) — nothing here says this model is bad
+# at NON-tool-calling tasks, only that it can't be trusted with tools.
+# Keyed on the catalog's raw id (pre-normalize_name), matching how every
+# candidate dict's "id" field is actually shaped.
+BANNED_FOR_TOOLS = {"@cf/google/gemma-4-26b-a4b-it"}
+
 SMALL_TIER_MAX_PARAMS_B = 30  # matches the 20b/27b models already used for "small" tasks
 
 _SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)b(?!it)\b", re.IGNORECASE)
@@ -494,15 +508,31 @@ def _score_candidate(m: dict, aa_index: dict, tier: str, quality_dim: str) -> tu
     return (_tier_fit(m, tier), quality, speed)
 
 
-def rank_for_task(task: str, catalog: list[dict], aa_index: dict) -> dict:
+def _qualifying_candidates(task: str, catalog: list[dict]) -> tuple[list[dict], dict]:
+    """The one real filter — shared by rank_for_task (automatic routing)
+    and list_candidates (the manual picker) below, which used to
+    duplicate this exact block and could silently drift out of sync.
+    Returns (candidates, reqs) since both callers need reqs afterward
+    for tier/quality_dim.
+
+    The BANNED_FOR_TOOLS check only applies when this task actually
+    needs tools — a model banned from tool-calling specifically isn't
+    disqualified from a task that never sends it any tools at all."""
     reqs = TASK_REQUIREMENTS.get(task, {})
+    needs_tools = reqs.get("tools")
     candidates = [
         m for m in catalog
         if m.get("free")
-        and (not reqs.get("tools") or m.get("tools"))
+        and (not needs_tools or m.get("tools"))
+        and not (needs_tools and m["id"] in BANNED_FOR_TOOLS)
         and (not reqs.get("vision") or m.get("vision"))
         and (m.get("context_length") or 0) >= reqs.get("min_context", 0)
     ]
+    return candidates, reqs
+
+
+def rank_for_task(task: str, catalog: list[dict], aa_index: dict) -> dict:
+    candidates, reqs = _qualifying_candidates(task, catalog)
     if not candidates:
         return {"primary": None, "fallback": [], "candidate_count": 0}
 
@@ -522,18 +552,19 @@ def list_candidates(task: str, catalog: list[dict], aa_index: dict) -> list[dict
     model-switch picker (GET /config/models) rather than automatic
     routing, where showing only 3 options would hide real alternatives
     the user might specifically want (e.g. a known-slower but higher-
-    quality model)."""
-    reqs = TASK_REQUIREMENTS.get(task, {})
-    candidates = [
-        m for m in catalog
-        if m.get("free")
-        and (not reqs.get("tools") or m.get("tools"))
-        and (not reqs.get("vision") or m.get("vision"))
-        and (m.get("context_length") or 0) >= reqs.get("min_context", 0)
-    ]
+    quality model). Each candidate carries its own real quality/speed
+    score (2026-09-06) — the same numbers _score_candidate ranks by, not
+    a display-only afterthought — so the picker UI has real signal to
+    group/sort by instead of an undifferentiated flat list."""
+    candidates, reqs = _qualifying_candidates(task, catalog)
     tier = reqs.get("tier", "large")
     quality_dim = TASK_QUALITY_DIMENSION.get(task, "intelligence_index")
-    return sorted(candidates, key=lambda m: _score_candidate(m, aa_index, tier, quality_dim), reverse=True)
+    ranked = sorted(candidates, key=lambda m: _score_candidate(m, aa_index, tier, quality_dim), reverse=True)
+    for m in ranked:
+        _tier_fit_score, quality, speed = _score_candidate(m, aa_index, tier, quality_dim)
+        m["_quality"] = quality
+        m["_speed"] = speed
+    return ranked
 
 
 def load_snapshot() -> dict | None:
