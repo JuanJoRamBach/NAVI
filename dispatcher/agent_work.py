@@ -20,8 +20,10 @@ storage layer, since aiosqlite connections aren't loop-agnostic.
 """
 
 import asyncio
+import json
 import random
 import re
+import secrets
 import tempfile
 import threading
 import time
@@ -37,7 +39,7 @@ from providers.base import ChatMessage, ChatResponse, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
 from storage.agent_work import (
     complete_step, create_step, create_run, due_workflows, get_workflow,
-    set_step_input, update_run_status, update_workflow_trigger,
+    get_workflow_by_webhook_token, set_step_input, update_run_status, update_workflow_trigger,
 )
 from tools.documents import DocumentRenderError, render_pdf
 from tools.gmail_send import GmailSendError, send_gmail_message
@@ -631,7 +633,7 @@ def _substitute_item(text: str | None, item: str) -> str | None:
     return text if text is None else text.replace("{{item}}", item)
 
 
-async def _execute_run(run_id: str, graph: dict) -> None:
+async def _execute_run(run_id: str, graph: dict, initial_outputs: dict[str, str] | None = None) -> None:
     try:
         order = _topological_order(graph)
     except WorkflowError as e:
@@ -692,7 +694,12 @@ async def _execute_run(run_id: str, graph: dict) -> None:
     # unchanged from before this feature existed. A node INSIDE a fan-out
     # group keys each iteration's output under "<node_id>#<item_index>",
     # since it genuinely produces one output per item, not one overall.
-    outputs: dict[str, str] = {}
+    # Pre-seeded from outside the graph entirely — currently only a
+    # webhook trigger's incoming payload (2026-09-07), set before this
+    # function is even called (see start_webhook_run). Copied, not
+    # aliased, so mutating `outputs` below never reaches back into the
+    # caller's dict.
+    outputs: dict[str, str] = dict(initial_outputs or {})
     seq = 0
 
     await update_run_status(run_id, "running")
@@ -707,6 +714,20 @@ async def _execute_run(run_id: str, graph: dict) -> None:
             seq += 1
             await set_step_input(step_id, {"prompt": node.get("prompt"), "role": node.get("role"), "tools": node.get("tools")})
             await complete_step(step_id, "skipped", output="Skipped — branch not taken.")
+            continue
+
+        if node["id"] in outputs:
+            # Pre-seeded (a webhook trigger node, whose "output" IS the
+            # payload the call arrived with, not something to compute) —
+            # recorded as a real, already-completed step for the same run-
+            # history transparency every other node gets, but _run_node is
+            # never called on it: there's nothing to run, and no handler
+            # for a trigger-only kind exists (deliberately — see
+            # find_webhook_trigger_node_id's own docstring).
+            step_id = await create_step(run_id, node["id"], seq)
+            seq += 1
+            await set_step_input(step_id, {"prompt": node.get("prompt"), "role": node.get("role"), "tools": node.get("tools")})
+            await complete_step(step_id, "completed", output=outputs[node["id"]])
             continue
 
         group = node_group.get(node["id"])
@@ -779,26 +800,85 @@ async def _execute_run(run_id: str, graph: dict) -> None:
     await update_run_status(run_id, "completed")
 
 
-def _execute_run_thread(run_id: str, graph: dict) -> None:
-    asyncio.run(_execute_run(run_id, graph))
+def _execute_run_thread(run_id: str, graph: dict, initial_outputs: dict[str, str] | None = None) -> None:
+    asyncio.run(_execute_run(run_id, graph, initial_outputs))
 
 
-async def start_run(graph: dict, workflow_id: str | None = None, trigger_source: str = "manual") -> str:
+async def start_run(
+    graph: dict, workflow_id: str | None = None, trigger_source: str = "manual",
+    initial_outputs: dict[str, str] | None = None,
+) -> str:
     """Creates the run row synchronously (so the caller — a FastAPI route —
     can return run_id immediately) then executes the graph in a background
     thread. Matches server.py's existing async-kickoff pattern for
     /research (threading.Thread + a pollable status), just with real
     per-run persistence instead of one global status string."""
     run_id = await create_run(workflow_id, trigger_source)
-    threading.Thread(target=_execute_run_thread, args=(run_id, graph), daemon=True).start()
+    threading.Thread(target=_execute_run_thread, args=(run_id, graph, initial_outputs), daemon=True).start()
     return run_id
 
 
-async def start_workflow_run(workflow_id: str, trigger_source: str = "manual") -> str:
+async def start_workflow_run(
+    workflow_id: str, trigger_source: str = "manual", initial_outputs: dict[str, str] | None = None,
+) -> str:
     workflow = await get_workflow(workflow_id)
     if not workflow:
         raise WorkflowError(f"no workflow with id {workflow_id}")
-    return await start_run(workflow["graph"], workflow_id=workflow_id, trigger_source=trigger_source)
+    return await start_run(
+        workflow["graph"], workflow_id=workflow_id, trigger_source=trigger_source, initial_outputs=initial_outputs,
+    )
+
+
+def find_webhook_trigger_node_id(graph: dict) -> str | None:
+    """The graph-entry node a webhook payload gets seeded into (see
+    _execute_run's pre-seeded-output branch) — first node whose backend
+    `kind` is "webhookTrigger" (navi-pwa's agentWorkGraphConvert.ts sets
+    this via BACKEND_KIND_FOR_NODE_KIND, same mechanism send_email
+    already uses for its own kind discriminator). No dedicated
+    _run_node handler exists for this kind, deliberately: this node is
+    never executed in the normal sense, its "output" already IS the
+    payload the call arrived with by the time the topological walk
+    reaches it. A graph with none returns None — the webhook still
+    legitimately means "run this now," the payload is just unused."""
+    for node in graph.get("nodes", []):
+        if node.get("kind") == "webhookTrigger":
+            return node["id"]
+    return None
+
+
+async def start_webhook_run(workflow: dict, payload: dict | list | str) -> str:
+    """Fires a workflow whose trigger is `{"type": "webhook", ...}` —
+    called from server.py's public /agent/webhooks/{token} route, already
+    past the token check by the time this runs."""
+    graph = workflow["graph"]
+    trigger_node_id = find_webhook_trigger_node_id(graph)
+    initial_outputs = {}
+    if trigger_node_id is not None:
+        initial_outputs[trigger_node_id] = payload if isinstance(payload, str) else json.dumps(payload)
+    return await start_run(
+        graph, workflow_id=workflow["id"], trigger_source="webhook", initial_outputs=initial_outputs,
+    )
+
+
+def generate_webhook_token() -> str:
+    return secrets.token_urlsafe(24)
+
+
+async def set_webhook_trigger(workflow_id: str) -> str:
+    """Idempotent by design: returns the EXISTING token if this workflow's
+    trigger is already a webhook, rather than rotating it — a fresh token
+    every time this is called would silently invalidate whatever URL the
+    user already pasted into Stripe/GitHub/wherever. Raises WorkflowError
+    for an unknown workflow_id, same convention as start_workflow_run."""
+    workflow = await get_workflow(workflow_id)
+    if not workflow:
+        raise WorkflowError(f"no workflow with id {workflow_id}")
+    trigger = workflow["trigger"]
+    if trigger.get("type") == "webhook" and trigger.get("token"):
+        return trigger["token"]
+    token = generate_webhook_token()
+    await update_workflow_trigger(workflow_id, {"type": "webhook", "token": token})
+    return token
 
 
 RESOLVE_SCHEDULE_TOOL_NAME = "set_schedule"

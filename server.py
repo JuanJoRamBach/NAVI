@@ -50,7 +50,9 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 
-from dispatcher.agent_work import WorkflowError, check_due_workflows, start_workflow_run
+from dispatcher.agent_work import (
+    WorkflowError, check_due_workflows, set_webhook_trigger, start_webhook_run, start_workflow_run,
+)
 from dispatcher.mcp_client import MCPError, approve_tools, discover_tools
 from dispatcher.mcp_oauth import MCPOAuthError, exchange_code_for_token, start_authorization
 from tools.mcp_marketplace import MCPMarketplaceError, search as search_mcp_marketplace
@@ -76,7 +78,7 @@ from storage.agent_work import (
     create_workflow as create_workflow_definition,
     delete_all_runs, delete_run,
     delete_workflow as delete_workflow_definition,
-    get_run, get_run_steps, get_workflow, list_runs, list_workflows,
+    get_run, get_run_steps, get_workflow, get_workflow_by_webhook_token, list_runs, list_workflows,
 )
 from storage.agents import create_agent, delete_agent, get_agent, get_agent_by_workflow_id, list_agents, update_agent
 from storage.sources import delete_document as delete_source_document, get_document as get_source_document, latest_batch as latest_source_batch, list_documents as list_source_documents, set_document_status as set_source_document_status
@@ -202,6 +204,13 @@ async def _require_api_key(request: Request, call_next):
         request.method == "OPTIONS"  # let CORSMiddleware answer preflights
         or request.url.path in _PUBLIC_PATHS
         or request.url.path.startswith("/files/")
+        # Agent Work's webhook trigger (2026-09-07) — an external caller
+        # (Stripe, GitHub, a cron service, your brother's always-connected
+        # API) can't send NAVI's own header. The token itself, unguessable
+        # in the path, IS the credential — same trust model as
+        # TELEGRAM_WEBHOOK_SECRET, verified inside the route itself against
+        # get_workflow_by_webhook_token, not here.
+        or request.url.path.startswith("/agent/webhooks/")
     ):
         return await call_next(request)
     if not NAVI_API_KEY:
@@ -989,6 +998,41 @@ async def agent_run_workflow(workflow_id: str) -> JSONResponse:
     except WorkflowError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
     return JSONResponse({"run_id": run_id})
+
+
+@app.post("/agent/workflows/{workflow_id}/webhook")
+async def agent_set_webhook_trigger(workflow_id: str) -> JSONResponse:
+    """Idempotently attaches (or returns the already-attached) webhook
+    trigger for this workflow — an authenticated call, normal REST under
+    the shared API key, unlike the public route below it actually
+    triggers. See set_webhook_trigger's own docstring for why this never
+    rotates an existing token."""
+    try:
+        token = await set_webhook_trigger(workflow_id)
+    except WorkflowError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    return JSONResponse({"url": f"{NAVI_BASE_URL}/agent/webhooks/{token}"})
+
+
+@app.post("/agent/webhooks/{token}")
+async def agent_webhook_trigger(token: str, request: Request) -> JSONResponse:
+    """The actual externally-called endpoint — exempt from the shared
+    NAVI_API_KEY gate (see _PUBLIC_PATHS's startswith check above); the
+    unguessable token in the path is the real credential here, checked
+    against get_workflow_by_webhook_token before anything else happens.
+    Always acks immediately and runs the workflow async — Stripe-style —
+    same pattern /research already uses; a "Respond" node that computes a
+    real synchronous body back isn't built yet, not needed until a
+    specific integration requires it (see NAVI/HANDOFF.md)."""
+    workflow = await get_workflow_by_webhook_token(token)
+    if not workflow:
+        return JSONResponse({"error": "unknown webhook"}, status_code=404)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = (await request.body()).decode("utf-8", errors="replace")
+    run_id = await start_webhook_run(workflow, payload)
+    return JSONResponse({"ok": True, "run_id": run_id})
 
 
 @app.get("/agent/runs")

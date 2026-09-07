@@ -21,10 +21,14 @@ schema migration — a straight line is just a degenerate graph. The executor
 (dispatcher/agent_work.py) topologically sorts `nodes`/`edges` the same way
 regardless of whether that graph is linear or branching.
 
-`trigger` is `{"type": "manual"}` or `{"type": "scheduled", "interval_seconds",
+`trigger` is `{"type": "manual"}`, `{"type": "scheduled", "interval_seconds",
 "next_run_at"}` — epoch seconds, no cron-expression parsing (no dependency
 for it anywhere in this codebase yet, and dispatcher/reminders.py already
-sets the precedent of plain fire_at timestamps over cron syntax).
+sets the precedent of plain fire_at timestamps over cron syntax) — or
+`{"type": "webhook", "token"}` (2026-09-07): a random, unguessable token
+that IS the credential (see server.py's /agent/webhooks/{token}), same
+trust model as TELEGRAM_WEBHOOK_SECRET, no signature/HMAC scheme built
+yet since nothing has needed one so far.
 
 Every `agent_run_step` row's `node_id` ties it back to the specific graph
 node that produced it — the hook a future visual canvas needs to color a
@@ -178,6 +182,19 @@ async def update_workflow_trigger(workflow_id: str, trigger: dict) -> None:
             (json.dumps(trigger), time.time(), workflow_id),
         )
         await db.commit()
+
+
+async def get_workflow_by_webhook_token(token: str) -> dict | None:
+    """Webhook trigger lookup (2026-09-07) — `trigger` is a flat JSON blob
+    (see module docstring), not a queryable column, so this scans
+    workflow_definitions the same way due_workflows() below already scans
+    for `scheduled` triggers. Fine at Agent Work's real scale; revisit
+    only if workflow count ever grows enough for that to matter."""
+    for wf in await list_workflows():
+        trigger = wf["trigger"]
+        if trigger.get("type") == "webhook" and trigger.get("token") == token:
+            return wf
+    return None
 
 
 async def due_workflows() -> list[dict]:
