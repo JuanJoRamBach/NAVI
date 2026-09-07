@@ -59,7 +59,48 @@ from tools.telegram_send import TelegramSendError, send_file_to_telegram, send_t
 # independent of whichever nodes happen to be direct predecessors.
 # Whole-value only, not embedded string templating — a field's value
 # either IS a state reference or is a literal, no templating engine.
-_STATE_REF_RE = re.compile(r"^\{\{state\.([A-Za-z0-9_-]+)\}\}$")
+#
+# Optional dot-path suffix (2026-09-07): "{{state.n2.customer.email}}"
+# pulls one field out of n2's output instead of the whole thing — real
+# need, not speculative: a webhook trigger's output is the raw JSON
+# payload it was called with, and "get one field out of an API payload"
+# is n8n/Zapier's single most common real use case for this exact
+# mechanism (checked directly against both — this isn't a guess). Only
+# meaningful when the referenced node's output actually IS JSON; see
+# _resolve_json_path's own docstring for what happens when it isn't.
+_STATE_REF_RE = re.compile(r"^\{\{state\.([A-Za-z0-9_-]+)((?:\.[A-Za-z0-9_-]+)*)\}\}$")
+
+
+def _resolve_json_path(raw_value: str, path_parts: list[str]) -> str:
+    """Walks a dot-path into a node's output, parsed as JSON. Raises
+    WorkflowError on any failure (not JSON, missing key, indexing into
+    something that isn't a dict/list) rather than silently falling back
+    to an empty string — a wrong path is a real, catchable mistake;
+    "found the field" and "resolved to nothing" must never look the
+    same here, unlike the plain whole-value reference above (which keeps
+    its existing empty-string-on-miss behavior, unchanged, for every
+    workflow already relying on that)."""
+    path = ".".join(path_parts)
+    try:
+        current = json.loads(raw_value)
+    except (TypeError, ValueError):
+        raise WorkflowError(f"Can't look up '{path}' — the referenced step's output isn't JSON.")
+    for part in path_parts:
+        if isinstance(current, dict):
+            if part not in current:
+                raise WorkflowError(f"'{part}' isn't a field in the referenced step's output (looking up '{path}').")
+            current = current[part]
+        elif isinstance(current, list):
+            try:
+                index = int(part)
+            except ValueError:
+                raise WorkflowError(f"'{part}' isn't a valid list index (looking up '{path}').")
+            if not (0 <= index < len(current)):
+                raise WorkflowError(f"Index {part} is out of range (looking up '{path}').")
+            current = current[index]
+        else:
+            raise WorkflowError(f"Can't look up '{part}' — that part of the referenced output isn't an object or list (looking up '{path}').")
+    return current if isinstance(current, str) else json.dumps(current)
 
 
 def _resolve_state_refs(node: dict, outputs: dict[str, str]) -> dict:
@@ -68,7 +109,10 @@ def _resolve_state_refs(node: dict, outputs: dict[str, str]) -> dict:
         if isinstance(value, str):
             m = _STATE_REF_RE.match(value)
             if m:
-                resolved[key] = outputs.get(m.group(1), "")
+                node_id, path_suffix = m.group(1), m.group(2)
+                base = outputs.get(node_id, "")
+                path_parts = [p for p in path_suffix.split(".") if p]
+                resolved[key] = _resolve_json_path(base, path_parts) if path_parts else base
     return resolved
 
 # Marks a node's string output as a reference to a real file on disk
@@ -797,8 +841,23 @@ async def _execute_run(run_id: str, graph: dict, initial_outputs: dict[str, str]
             prior_context = "\n\n".join(prior_context_parts) or None
 
             run_node = dict(node) if item is None else {**node, "prompt": _substitute_item(node.get("prompt"), item)}
-            run_node = _resolve_state_refs(run_node, outputs)
             step_label = node["id"] if item is None else f"{node['id']} (item {item_index + 1}/{len(items)})"
+            try:
+                run_node = _resolve_state_refs(run_node, outputs)
+            except WorkflowError as e:
+                # A bad {{state...}} path (typo'd field, wrong node,
+                # non-JSON output) is a real, reportable failure — same
+                # "fail the run cleanly with a real error" treatment as
+                # every other node failure below, not an uncaught
+                # exception that would silently kill this whole
+                # background thread with the run stuck at "running"
+                # forever and nothing to show for why.
+                step_id = await create_step(run_id, node["id"], seq)
+                seq += 1
+                await set_step_input(step_id, {"prompt": node.get("prompt"), "role": node.get("role"), "tools": node.get("tools")})
+                await complete_step(step_id, "failed", error=str(e))
+                await update_run_status(run_id, "failed", error=f"node '{step_label}' failed: {e}")
+                return
 
             step_id = await create_step(run_id, node["id"], seq)
             seq += 1

@@ -78,7 +78,7 @@ from storage.agent_work import (
     create_workflow as create_workflow_definition,
     delete_all_runs, delete_run,
     delete_workflow as delete_workflow_definition,
-    get_run, get_run_steps, get_workflow, get_workflow_by_webhook_token, list_runs, list_workflows,
+    get_latest_node_output, get_run, get_run_steps, get_workflow, get_workflow_by_webhook_token, list_runs, list_workflows,
 )
 from storage.agents import create_agent, delete_agent, get_agent, get_agent_by_workflow_id, list_agents, update_agent
 from storage.sources import delete_document as delete_source_document, get_document as get_source_document, latest_batch as latest_source_batch, list_documents as list_source_documents, set_document_status as set_source_document_status
@@ -975,6 +975,20 @@ async def agent_get_workflow(workflow_id: str) -> dict:
     if not workflow:
         raise HTTPException(status_code=404, detail="not found")
     return workflow
+
+
+@app.get("/agent/workflows/{workflow_id}/nodes/{node_id}/sample")
+async def agent_node_sample_output(workflow_id: str, node_id: str) -> JSONResponse:
+    """Real, read-only convenience for the canvas's "insert reference"
+    picker (2026-09-07) — the most recent actual output this node
+    produced, so a field referencing it (e.g. a Send Email node's "To")
+    can browse real JSON keys instead of guessing a webhook payload's
+    shape blind. `output` is None when this node has never completed a
+    run yet — the picker falls back to a plain whole-value reference in
+    that case, same "test it once, then map real fields" flow Zapier's
+    own product requires."""
+    output = await get_latest_node_output(workflow_id, node_id)
+    return JSONResponse({"output": output})
 
 
 @app.delete("/agent/workflows/{workflow_id}")

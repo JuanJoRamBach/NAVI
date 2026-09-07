@@ -352,6 +352,29 @@ async def complete_step(step_id: str, status: str, output: str | None = None, er
         await db.commit()
 
 
+async def get_latest_node_output(workflow_id: str, node_id: str) -> str | None:
+    """The most recent real output a given node produced, across any past
+    run of this workflow (2026-09-07) — what the frontend's reference
+    picker uses to let someone browse an upstream node's actual JSON
+    shape (a webhook payload, most commonly) instead of guessing field
+    names blind, the same "test it once, then map real fields" flow
+    Zapier's own product requires. Read-only convenience for the UI;
+    _resolve_state_refs (dispatcher/agent_work.py) never reads history —
+    it only ever reads the live run's own in-memory outputs dict."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT s.output FROM agent_run_steps s "
+            "JOIN agent_runs r ON r.id = s.run_id "
+            "WHERE r.workflow_id = ? AND s.node_id = ? AND s.status = 'completed' "
+            "ORDER BY s.started_at DESC LIMIT 1",
+            (workflow_id, node_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+    return row["output"] if row else None
+
+
 async def get_run_steps(run_id: str) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_schema(db)
