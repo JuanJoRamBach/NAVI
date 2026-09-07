@@ -20,6 +20,7 @@ storage layer, since aiosqlite connections aren't loop-agnostic.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import random
 import re
@@ -399,6 +400,90 @@ def _run_delay_node(node: dict, prior_context: str | None) -> str:
     return prior_context or ""
 
 
+# Cross-thread signaling for Respond to Webhook (2026-09-07) — a run
+# executes on its own background thread with its own asyncio.run() loop
+# (see this module's own docstring), separate from FastAPI's event loop
+# that's holding the original HTTP request open. concurrent.futures.Future
+# is the plain thread-safe primitive for exactly this (unlike
+# asyncio.Future, which is bound to one loop) — the run's thread calls
+# set_result(), the HTTP route awaits it via asyncio.wrap_future(), which
+# is itself thread-safe. Keyed by run_id, one entry per in-flight webhook
+# call that's actually waiting on a Respond node; a workflow with no such
+# node never gets an entry at all (see has_respond_webhook_node) so a
+# plain webhook-triggered run's response time is completely unaffected.
+_webhook_waiters: dict[str, "concurrent.futures.Future[dict]"] = {}
+
+
+def has_respond_webhook_node(graph: dict) -> bool:
+    return any(n.get("kind") == "respond_webhook" for n in graph.get("nodes", []))
+
+
+def register_webhook_waiter(run_id: str) -> "concurrent.futures.Future[dict]":
+    fut: "concurrent.futures.Future[dict]" = concurrent.futures.Future()
+    _webhook_waiters[run_id] = fut
+    return fut
+
+
+def peek_webhook_waiter(run_id: str) -> "concurrent.futures.Future[dict] | None":
+    return _webhook_waiters.get(run_id)
+
+
+def discard_webhook_waiter(run_id: str) -> None:
+    """Called by the HTTP route after its own wait times out — the run
+    keeps executing regardless, but a Respond node reaching resolve_
+    webhook_waiter after this point should see "nobody's listening"
+    rather than crashing on a future the route already gave up on."""
+    _webhook_waiters.pop(run_id, None)
+
+
+def resolve_webhook_waiter(run_id: str, status_code: int, body: str) -> bool:
+    """Returns False (not a WorkflowError) when nothing's actually
+    waiting — a Respond node reached but the route already timed out, or
+    the SAME workflow was run manually/on schedule rather than via a
+    webhook. Neither is a failure of the node itself; it just had no one
+    to answer."""
+    fut = _webhook_waiters.pop(run_id, None)
+    if fut is None or fut.done():
+        return False
+    fut.set_result({"status_code": status_code, "body": body})
+    return True
+
+
+# Real prior art, not guessed: Stripe's own webhook docs warn endpoints
+# should respond within a few seconds and hard-cut at 20s; GitHub App
+# webhooks around 10s. 15s here sits inside that range with margin for
+# NAVI's own response to actually arrive before the CALLER's timeout
+# fires, rather than racing it — if the workflow's real work takes
+# longer than this, the caller should be designed to poll a status
+# endpoint instead of blocking on the webhook response, same guidance
+# those providers themselves give integrators.
+WEBHOOK_RESPONSE_TIMEOUT_SECONDS = 15.0
+
+
+def _run_respond_webhook_node(node: dict, prior_context: str | None, run_id: str) -> str:
+    """Answers the HTTP call that triggered this run — n8n's "Respond to
+    Webhook" node, the one piece start_webhook_run's own docstring
+    flagged as "not built yet, not needed until a specific integration
+    requires it" back on 2026-09-07 (now built). `body` follows the same
+    literal-or-{{state.node_id}}-reference convention every other node's
+    fields already use (resolved by _resolve_state_refs before this ever
+    runs); falls back to prior_context, then to an empty body, same
+    "text already exists by the time this runs" shape as
+    _run_send_telegram_node. No WorkflowError on "nobody was waiting" —
+    see resolve_webhook_waiter's own docstring for why that's a
+    legitimate, non-failing outcome."""
+    body = node.get("body")
+    if body is None:
+        body = prior_context or ""
+    try:
+        status_code = int(node.get("status_code") or 200)
+    except (TypeError, ValueError):
+        status_code = 200
+    if resolve_webhook_waiter(run_id, status_code, body):
+        return f"Responded to the webhook caller (status {status_code})."
+    return "No webhook caller was waiting (already timed out, or this run wasn't started by a webhook) — nothing sent."
+
+
 def _run_input_node(prompt: str, prior_context: str | None) -> str:
     """No LLM call, ever (2026-09-03, JuanJo: "whatever instruction has
     the Input and Output nodes, are deterministic, unless they want an
@@ -558,7 +643,10 @@ def _topological_order(graph: dict) -> list[dict]:
     return order
 
 
-def _run_node(node: dict, prior_context: str | None = None, outgoing_labels: list[str] | None = None) -> str:
+def _run_node(
+    node: dict, prior_context: str | None = None, outgoing_labels: list[str] | None = None,
+    run_id: str | None = None,
+) -> str:
     """Router, not an executor — picks the node function whose fixed
     logic matches this node's declared tool(s), and calls it. See the
     "Node functions" section above for what each one actually does.
@@ -593,6 +681,9 @@ def _run_node(node: dict, prior_context: str | None = None, outgoing_labels: lis
         return _run_send_email_node(node, prior_context)
     if kind == "delay":
         return _run_delay_node(node, prior_context)
+    if kind == "respond_webhook":
+        assert run_id is not None, "respond_webhook node executed without a run_id"
+        return _run_respond_webhook_node(node, prior_context, run_id)
     if kind == "output":
         return _run_output_node(node.get("prompt", ""), prior_context, node.get("output_type"))
     if kind == "choose_path":
@@ -686,7 +777,7 @@ def _timeout_for_node(run_node: dict) -> float:
 
 
 async def _run_node_with_resilience(
-    run_node: dict, prior_context: str | None, outgoing_labels: list[str] | None,
+    run_node: dict, prior_context: str | None, outgoing_labels: list[str] | None, run_id: str,
 ) -> str:
     """Wraps a single node's execution in a wall-clock timeout (every node
     kind) plus a bounded exponential-backoff retry (deterministic action
@@ -701,7 +792,7 @@ async def _run_node_with_resilience(
     for attempt in range(attempts):
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(_run_node, run_node, prior_context, outgoing_labels),
+                asyncio.to_thread(_run_node, run_node, prior_context, outgoing_labels, run_id),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
@@ -749,6 +840,22 @@ async def _execute_run(run_id: str, graph: dict, initial_outputs: dict[str, str]
         label = edge.get("label")
         if label:
             outgoing_labels_by_node.setdefault(edge["from"], []).append(label)
+
+    # Error edges (2026-09-07) — n8n's per-node error output pin /
+    # LangGraph's error_handler, expressed the same way a choose_path
+    # branch already is: an edge tagged {"on": "error"}. Symmetric to
+    # choose_path's own labeled-branch pruning below, just binary
+    # (succeeded/failed) instead of N-way: a node with at least one error
+    # edge that FAILS gets its normal (non-error) outgoing edges pruned
+    # and its error edge(s) left live instead of failing the whole run; a
+    # node with error edges that SUCCEEDS prunes its error edge(s)
+    # instead. A node with no error edges at all keeps the original
+    # all-or-nothing behavior unchanged — existing workflows are
+    # unaffected by this feature's existence.
+    error_edges_by_node: dict[str, list[str]] = {}
+    for edge in graph.get("edges", []):
+        if edge.get("on") == "error":
+            error_edges_by_node.setdefault(edge["from"], []).append(edge["to"])
 
     # choose_path pruning (2026-09-04): a node is skipped iff EVERY edge
     # feeding it is dead — either its source was itself skipped, or the
@@ -878,6 +985,7 @@ async def _execute_run(run_id: str, graph: dict, initial_outputs: dict[str, str]
                 output = await _run_node_with_resilience(
                     run_node, prior_context,
                     outgoing_labels_by_node.get(node["id"]) if is_choose_path else None,
+                    run_id,
                 )
                 await complete_step(step_id, "completed", output=output)
                 if is_choose_path:
@@ -887,6 +995,13 @@ async def _execute_run(run_id: str, graph: dict, initial_outputs: dict[str, str]
                     # through a pruned edge, on each later node's own turn.
                     for e in graph.get("edges", []):
                         if e["from"] == node["id"] and e.get("label") and e["label"] != output:
+                            pruned_edges.add((e["from"], e["to"]))
+                if node["id"] in error_edges_by_node:
+                    # Succeeded — the error branch(es) off this node
+                    # weren't taken, prune them the same way a choose_path
+                    # branch that wasn't picked gets pruned above.
+                    for e in graph.get("edges", []):
+                        if e["from"] == node["id"] and e.get("on") == "error":
                             pruned_edges.add((e["from"], e["to"]))
                 if item is not None:
                     outputs[f"{node['id']}#{item_index}"] = output
@@ -901,6 +1016,24 @@ async def _execute_run(run_id: str, graph: dict, initial_outputs: dict[str, str]
                 outputs[node["id"]] = output
             except WorkflowError as e:
                 await complete_step(step_id, "failed", error=str(e))
+                error_targets = error_edges_by_node.get(node["id"])
+                if error_targets:
+                    # A handled failure, not a run failure: prune this
+                    # node's normal (non-error) outgoing edges — the
+                    # success path wasn't taken — and seed its output with
+                    # the error text so whatever's wired to the error edge
+                    # can actually see what went wrong (predecessors[] was
+                    # built from ALL edges regardless of "on", so the error
+                    # target already treats this node as a real
+                    # predecessor and will pick this up as prior_context).
+                    error_text = f"Error: {e}"
+                    for edge in graph.get("edges", []):
+                        if edge["from"] == node["id"] and edge.get("on") != "error":
+                            pruned_edges.add((edge["from"], edge["to"]))
+                    outputs[node["id"]] = error_text
+                    if item is not None:
+                        outputs[f"{node['id']}#{item_index}"] = error_text
+                    break  # stop remaining items for this node; move to the next graph node
                 await update_run_status(run_id, "failed", error=f"node '{step_label}' failed: {e}")
                 return
 
@@ -913,14 +1046,22 @@ def _execute_run_thread(run_id: str, graph: dict, initial_outputs: dict[str, str
 
 async def start_run(
     graph: dict, workflow_id: str | None = None, trigger_source: str = "manual",
-    initial_outputs: dict[str, str] | None = None,
+    initial_outputs: dict[str, str] | None = None, register_response_waiter: bool = False,
 ) -> str:
     """Creates the run row synchronously (so the caller — a FastAPI route —
     can return run_id immediately) then executes the graph in a background
     thread. Matches server.py's existing async-kickoff pattern for
     /research (threading.Thread + a pollable status), just with real
-    per-run persistence instead of one global status string."""
+    per-run persistence instead of one global status string.
+
+    register_response_waiter (2026-09-07): registers this run_id's
+    Respond-to-Webhook waiter BEFORE the thread starts — not after —
+    since a fast workflow (Respond node with nothing before it) could
+    otherwise reach resolve_webhook_waiter before the caller ever
+    registers it, silently dropping the response."""
     run_id = await create_run(workflow_id, trigger_source)
+    if register_response_waiter:
+        register_webhook_waiter(run_id)
     threading.Thread(target=_execute_run_thread, args=(run_id, graph, initial_outputs), daemon=True).start()
     return run_id
 
@@ -964,6 +1105,7 @@ async def start_webhook_run(workflow: dict, payload: dict | list | str) -> str:
         initial_outputs[trigger_node_id] = payload if isinstance(payload, str) else json.dumps(payload)
     return await start_run(
         graph, workflow_id=workflow["id"], trigger_source="webhook", initial_outputs=initial_outputs,
+        register_response_waiter=has_respond_webhook_node(graph),
     )
 
 

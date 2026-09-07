@@ -41,6 +41,7 @@ call site rewritten as async.
 """
 
 import asyncio
+import json
 import mimetypes
 import os
 import threading
@@ -51,7 +52,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 
 from dispatcher.agent_work import (
-    WorkflowError, check_due_workflows, set_webhook_trigger, start_webhook_run, start_workflow_run,
+    WEBHOOK_RESPONSE_TIMEOUT_SECONDS, WorkflowError, check_due_workflows, discard_webhook_waiter,
+    peek_webhook_waiter, set_webhook_trigger, start_webhook_run, start_workflow_run,
 )
 from dispatcher.mcp_client import MCPError, approve_tools, discover_tools
 from dispatcher.mcp_oauth import MCPOAuthError, exchange_code_for_token, start_authorization
@@ -1055,10 +1057,18 @@ async def agent_webhook_trigger(token: str, request: Request) -> JSONResponse:
     NAVI_API_KEY gate (see _PUBLIC_PATHS's startswith check above); the
     unguessable token in the path is the real credential here, checked
     against get_workflow_by_webhook_token before anything else happens.
-    Always acks immediately and runs the workflow async — Stripe-style —
-    same pattern /research already uses; a "Respond" node that computes a
-    real synchronous body back isn't built yet, not needed until a
-    specific integration requires it (see NAVI/HANDOFF.md)."""
+
+    Acks immediately and runs the workflow async — Stripe-style, same
+    pattern /research already uses — UNLESS the graph contains a Respond
+    to Webhook node (2026-09-07), in which case this holds the HTTP
+    connection open and waits for that node to actually run
+    (start_webhook_run only registers the wait in that case — see its
+    own call to register_response_waiter; a workflow with no such node
+    is completely unaffected, same immediate-ack behavior as before).
+    asyncio.wrap_future bridges the run's own background thread (a
+    concurrent.futures.Future, not an asyncio one — see
+    dispatcher/agent_work.py's _webhook_waiters docstring) back onto
+    this request's event loop."""
     workflow = await get_workflow_by_webhook_token(token)
     if not workflow:
         return JSONResponse({"error": "unknown webhook"}, status_code=404)
@@ -1067,7 +1077,25 @@ async def agent_webhook_trigger(token: str, request: Request) -> JSONResponse:
     except Exception:
         payload = (await request.body()).decode("utf-8", errors="replace")
     run_id = await start_webhook_run(workflow, payload)
-    return JSONResponse({"ok": True, "run_id": run_id})
+
+    waiter = peek_webhook_waiter(run_id)
+    if waiter is None:
+        return JSONResponse({"ok": True, "run_id": run_id})
+
+    try:
+        result = await asyncio.wait_for(asyncio.wrap_future(waiter), timeout=WEBHOOK_RESPONSE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        discard_webhook_waiter(run_id)
+        return JSONResponse(
+            {"ok": True, "run_id": run_id, "note": "still running past the response timeout — the workflow keeps executing"},
+            status_code=202,
+        )
+    body = result["body"]
+    try:
+        content = json.loads(body)
+    except (TypeError, ValueError):
+        content = body
+    return JSONResponse(content, status_code=result["status_code"])
 
 
 @app.get("/agent/runs")
