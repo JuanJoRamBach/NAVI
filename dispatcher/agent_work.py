@@ -327,6 +327,34 @@ def _run_send_email_node(node: dict, prior_context: str | None) -> str:
     return f"Sent to {to} (message {message_id})"
 
 
+# A workflow node blocking for longer than this ties up its own
+# background thread indefinitely with no way to persist and resume later
+# — real for arbitrarily long delays would need a "resume at this
+# timestamp" mechanism this codebase doesn't have (same family of gap as
+# scheduled workflows before dispatcher/scheduler.py existed). 1 hour
+# covers every real "space these out" / "wait for X to catch up" use
+# case without risking a run silently pinned in memory for a full day.
+_MAX_DELAY_SECONDS = 3600.0
+
+
+def _run_delay_node(node: dict, prior_context: str | None) -> str:
+    """Pauses this run for a fixed duration, then passes whatever fed
+    into it straight through unchanged — the plain "wait N seconds"
+    primitive every automation tool has (n8n's Wait, Zapier's Delay,
+    Make's Sleep). time.sleep, not asyncio.sleep, is correct here: this
+    always runs inside asyncio.to_thread's own worker thread (see
+    _run_node_with_resilience's timeout wrapper), never on the event loop
+    itself, so blocking it doesn't stall anything else in the process."""
+    try:
+        seconds = float(node.get("seconds"))
+    except (TypeError, ValueError):
+        raise WorkflowError("Delay step has no valid number of seconds set.")
+    if seconds < 0:
+        raise WorkflowError("Delay step's seconds can't be negative.")
+    time.sleep(min(seconds, _MAX_DELAY_SECONDS))
+    return prior_context or ""
+
+
 def _run_input_node(prompt: str, prior_context: str | None) -> str:
     """No LLM call, ever (2026-09-03, JuanJo: "whatever instruction has
     the Input and Output nodes, are deterministic, unless they want an
@@ -519,6 +547,8 @@ def _run_node(node: dict, prior_context: str | None = None, outgoing_labels: lis
     kind = node.get("kind")
     if kind == "send_email":
         return _run_send_email_node(node, prior_context)
+    if kind == "delay":
+        return _run_delay_node(node, prior_context)
     if kind == "output":
         return _run_output_node(node.get("prompt", ""), prior_context, node.get("output_type"))
     if kind == "choose_path":
@@ -594,6 +624,23 @@ def _is_retryable_node(run_node: dict) -> bool:
     return len(tools) == 1 and tools[0] in _RETRYABLE_KINDS
 
 
+def _timeout_for_node(run_node: dict) -> float:
+    """A delay node's own configured wait is an intentional, expected
+    duration, not a hang to guard against — the fixed _NODE_TIMEOUT_SECONDS
+    would otherwise kill any delay longer than 60s and misreport it as a
+    timeout. +5s buffer over the delay itself (capped the same way
+    _run_delay_node caps its own time.sleep) covers normal scheduling
+    jitter without weakening the timeout's real purpose for every other
+    node kind, which still gets the plain fixed default."""
+    if run_node.get("kind") == "delay":
+        try:
+            seconds = float(run_node.get("seconds"))
+        except (TypeError, ValueError):
+            seconds = 0.0
+        return min(max(seconds, 0.0), _MAX_DELAY_SECONDS) + 5.0
+    return _NODE_TIMEOUT_SECONDS
+
+
 async def _run_node_with_resilience(
     run_node: dict, prior_context: str | None, outgoing_labels: list[str] | None,
 ) -> str:
@@ -605,15 +652,16 @@ async def _run_node_with_resilience(
     to _execute_run's own all-or-nothing run-failure semantics (that's a
     separate, later step: continue-on-error/error edges)."""
     attempts = _MAX_NODE_ATTEMPTS if _is_retryable_node(run_node) else 1
+    timeout = _timeout_for_node(run_node)
     last_error: BaseException = WorkflowError("node never ran")
     for attempt in range(attempts):
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(_run_node, run_node, prior_context, outgoing_labels),
-                timeout=_NODE_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
-            last_error = WorkflowError(f"timed out after {_NODE_TIMEOUT_SECONDS}s")
+            last_error = WorkflowError(f"timed out after {timeout:g}s")
         except WorkflowError as e:
             last_error = e
         if attempt + 1 >= attempts:
