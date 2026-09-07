@@ -123,6 +123,27 @@ async def create_workflow(
     return workflow_id
 
 
+async def update_workflow(workflow_id: str, name: str, description: str | None, graph: dict, trigger: dict) -> bool:
+    """Real update-in-place (2026-09-07) — until now the only way to
+    change a saved workflow was create_workflow, which always makes a
+    NEW row. That meant editing an existing workflow (e.g. to add a
+    {{state...}} reference discovered via a real test run) silently
+    forked a duplicate instead of changing the one you meant to — worse
+    for a webhook-triggered workflow specifically, since the duplicate
+    gets its own new token, orphaning whatever external service already
+    has the original URL configured. Returns whether a row actually
+    existed to update, same "did this really happen" convention
+    delete_workflow below already uses."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        cursor = await db.execute(
+            "UPDATE workflow_definitions SET name = ?, description = ?, graph = ?, trigger_json = ?, updated_at = ? WHERE id = ?",
+            (name, description, json.dumps(graph), json.dumps(trigger), time.time(), workflow_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
 def _row_to_workflow(row: dict) -> dict:
     row = dict(row)
     row["graph"] = json.loads(row.pop("graph"))

@@ -79,6 +79,7 @@ from storage.agent_work import (
     delete_all_runs, delete_run,
     delete_workflow as delete_workflow_definition,
     get_latest_node_output, get_run, get_run_steps, get_workflow, get_workflow_by_webhook_token, list_runs, list_workflows,
+    update_workflow as update_workflow_definition,
 )
 from storage.agents import create_agent, delete_agent, get_agent, get_agent_by_workflow_id, list_agents, update_agent
 from storage.sources import delete_document as delete_source_document, get_document as get_source_document, latest_batch as latest_source_batch, list_documents as list_source_documents, set_document_status as set_source_document_status
@@ -943,6 +944,26 @@ async def agent_create_workflow(request: Request) -> JSONResponse:
         return JSONResponse({"error": "missing 'name' or 'graph'"}, status_code=400)
     trigger = payload.get("trigger") or {"type": "manual"}
     workflow_id = await create_workflow_definition(name, payload.get("description"), graph, trigger)
+    return JSONResponse(await get_workflow(workflow_id))
+
+
+@app.put("/agent/workflows/{workflow_id}")
+async def agent_update_workflow(workflow_id: str, request: Request) -> JSONResponse:
+    """Real update-in-place (2026-09-07) — "Save Edits" on an already-
+    loaded workflow, as opposed to POST above which always creates a new
+    one. See update_workflow's own docstring in storage/agent_work.py for
+    why this exists: without it, editing a workflow silently forked a
+    duplicate instead of changing the one you meant to, orphaning a
+    webhook-triggered workflow's real URL in the process."""
+    payload = await request.json()
+    name = payload.get("name")
+    graph = payload.get("graph")
+    if not name or not graph:
+        return JSONResponse({"error": "missing 'name' or 'graph'"}, status_code=400)
+    trigger = payload.get("trigger") or {"type": "manual"}
+    updated = await update_workflow_definition(workflow_id, name, payload.get("description"), graph, trigger)
+    if not updated:
+        return JSONResponse({"error": "not found"}, status_code=404)
     return JSONResponse(await get_workflow(workflow_id))
 
 
