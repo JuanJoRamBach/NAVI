@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     trigger_source TEXT NOT NULL,
     started_at REAL NOT NULL,
     finished_at REAL,
-    error TEXT
+    error TEXT,
+    graph_snapshot TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_workflow ON agent_runs(workflow_id, started_at);
 CREATE TABLE IF NOT EXISTS agent_run_steps (
@@ -95,6 +96,23 @@ async def _ensure_schema(db: aiosqlite.Connection) -> None:
         cols = {row[1] for row in await cursor.fetchall()}
     if "creation_transcript" not in cols:
         await db.execute("ALTER TABLE workflow_definitions ADD COLUMN creation_transcript TEXT")
+    # Same idempotent pattern for agent_runs.graph_snapshot (2026-09-08) — a
+    # run's own frozen copy of the graph it actually started with, so a
+    # workflow edit made after a run starts can never retroactively change
+    # what that run executes against (the version-skew failure mode Azure
+    # Durable Functions' own docs warn about for exactly this shape of
+    # problem: an in-flight orchestration replaying against source that
+    # changed underneath it). Not read by _execute_run today — it already
+    # gets `graph` as a plain in-memory value at start, which is already
+    # safe for a run that's actively executing start-to-finish. This
+    # column is what makes a FUTURE pause/resume (the human-in-the-loop
+    # approval node) safe too, once a run can be suspended for real time
+    # and needs its own durable snapshot to resume against instead of
+    # re-fetching the (by then possibly-edited) live definition.
+    async with db.execute("PRAGMA table_info(agent_runs)") as cursor:
+        run_cols = {row[1] for row in await cursor.fetchall()}
+    if "graph_snapshot" not in run_cols:
+        await db.execute("ALTER TABLE agent_runs ADD COLUMN graph_snapshot TEXT")
     await db.commit()
     _initialized = True
 
@@ -237,22 +255,31 @@ async def due_workflows() -> list[dict]:
 
 # ---- agent_runs ----
 
-async def create_run(workflow_id: str | None, trigger_source: str) -> str:
+async def create_run(workflow_id: str | None, trigger_source: str, graph: dict | None = None) -> str:
+    """`graph` (2026-09-08) is this run's own frozen snapshot, stored once
+    at creation and never touched again — see _ensure_schema's own
+    docstring on graph_snapshot for why. Optional (defaults to None/absent)
+    only so any caller that genuinely has no graph handy at creation time
+    doesn't break; every real caller in dispatcher/agent_work.py passes it."""
     run_id = str(uuid.uuid4())
     now = time.time()
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_schema(db)
         await db.execute(
-            "INSERT INTO agent_runs (id, workflow_id, status, trigger_source, started_at, finished_at, error) "
-            "VALUES (?, ?, 'queued', ?, ?, NULL, NULL)",
-            (run_id, workflow_id, trigger_source, now),
+            "INSERT INTO agent_runs (id, workflow_id, status, trigger_source, started_at, finished_at, error, graph_snapshot) "
+            "VALUES (?, ?, 'queued', ?, ?, NULL, NULL, ?)",
+            (run_id, workflow_id, trigger_source, now, json.dumps(graph) if graph is not None else None),
         )
         await db.commit()
     return run_id
 
 
 async def update_run_status(run_id: str, status: str, error: str | None = None) -> None:
-    terminal = status in ("completed", "failed")
+    # "cancelled" (2026-09-08) is a real terminal status alongside
+    # completed/failed — a run that stopped because a user asked it to,
+    # not because it broke; finished_at gets set the same way so it stops
+    # showing as still-running.
+    terminal = status in ("completed", "failed", "cancelled")
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_schema(db)
         if terminal:

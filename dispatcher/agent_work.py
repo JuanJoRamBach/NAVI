@@ -400,6 +400,29 @@ def _run_delay_node(node: dict, prior_context: str | None) -> str:
     return prior_context or ""
 
 
+# Safe run cancellation (2026-09-08) — a plain in-memory set, same
+# cross-thread-signaling shape as _webhook_waiters below: the HTTP route
+# (FastAPI's event loop) adds a run_id here, and the run's OWN background
+# thread (see this module's own docstring) checks it between nodes — see
+# _execute_run's own comment on why "between nodes" is the only safe
+# checkpoint, not mid-node. A plain set works fine here (unlike the
+# webhook waiter, nothing needs to wait ON this — the route just flips a
+# flag and returns immediately; the run notices it on its own schedule).
+_cancel_requested: set[str] = set()
+
+
+def request_run_cancellation(run_id: str) -> None:
+    _cancel_requested.add(run_id)
+
+
+def _is_cancel_requested(run_id: str) -> bool:
+    return run_id in _cancel_requested
+
+
+def _clear_cancel_flag(run_id: str) -> None:
+    _cancel_requested.discard(run_id)
+
+
 # Cross-thread signaling for Respond to Webhook (2026-09-07) — a run
 # executes on its own background thread with its own asyncio.run() loop
 # (see this module's own docstring), separate from FastAPI's event loop
@@ -903,6 +926,19 @@ async def _execute_run(run_id: str, graph: dict, initial_outputs: dict[str, str]
 
     await update_run_status(run_id, "running")
     for node in order:
+        if _is_cancel_requested(run_id):
+            # Checked at the top of every iteration — a safe checkpoint
+            # BETWEEN nodes, never mid-node. Same reasoning Azure Durable
+            # Functions' own cancellation guidance follows: interrupting a
+            # node mid-flight risks leaving a real side effect (a sent
+            # email, a written file) half-done, which is worse than
+            # letting the current node finish and stopping before the
+            # next one starts. This does mean cancellation isn't instant —
+            # a slow node, or a Delay node's own wait, runs to completion
+            # first — that's the deliberate tradeoff for safety over speed.
+            _clear_cancel_flag(run_id)
+            await update_run_status(run_id, "cancelled", error="Cancelled by user.")
+            return
         if _is_skipped(node["id"]):
             # A branch choose_path didn't take, or something only
             # reachable through one — recorded as a real step (not
@@ -1059,7 +1095,7 @@ async def start_run(
     since a fast workflow (Respond node with nothing before it) could
     otherwise reach resolve_webhook_waiter before the caller ever
     registers it, silently dropping the response."""
-    run_id = await create_run(workflow_id, trigger_source)
+    run_id = await create_run(workflow_id, trigger_source, graph)
     if register_response_waiter:
         register_webhook_waiter(run_id)
     threading.Thread(target=_execute_run_thread, args=(run_id, graph, initial_outputs), daemon=True).start()

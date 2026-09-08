@@ -53,7 +53,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse,
 
 from dispatcher.agent_work import (
     WEBHOOK_RESPONSE_TIMEOUT_SECONDS, WorkflowError, check_due_workflows, discard_webhook_waiter,
-    peek_webhook_waiter, set_webhook_trigger, start_webhook_run, start_workflow_run,
+    peek_webhook_waiter, request_run_cancellation, set_webhook_trigger, start_webhook_run, start_workflow_run,
 )
 from dispatcher.mcp_client import MCPError, approve_tools, discover_tools
 from dispatcher.mcp_oauth import MCPOAuthError, exchange_code_for_token, start_authorization
@@ -1120,6 +1120,23 @@ async def agent_get_run(run_id: str) -> dict:
     if not run:
         raise HTTPException(status_code=404, detail="not found")
     return run
+
+
+@app.post("/agent/runs/{run_id}/cancel")
+async def agent_cancel_run(run_id: str) -> JSONResponse:
+    """Safe cancellation (2026-09-08) — flips an in-memory flag the run's
+    own background thread checks between nodes (see dispatcher/agent_work.py's
+    request_run_cancellation/_execute_run for why "between nodes," not
+    mid-node). Returns immediately; the run stops at its own next safe
+    checkpoint, not instantly — a currently-executing node (or a Delay
+    node's own wait) finishes first. 404s only if the run genuinely
+    doesn't exist; requesting cancellation on an already-finished run is a
+    harmless no-op (the flag is simply never checked again)."""
+    run = await get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="not found")
+    request_run_cancellation(run_id)
+    return JSONResponse({"ok": True})
 
 
 @app.delete("/agent/runs/{run_id}")
