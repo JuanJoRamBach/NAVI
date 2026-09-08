@@ -53,8 +53,21 @@ CREATE TABLE IF NOT EXISTS workflow_definitions (
     trigger_json TEXT NOT NULL,
     creation_transcript TEXT,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    deleted_at REAL
 );
+CREATE TABLE IF NOT EXISTS workflow_definition_versions (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    version_number INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    graph TEXT NOT NULL,
+    trigger_json TEXT NOT NULL,
+    edited_by TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_versions_workflow ON workflow_definition_versions(workflow_id, version_number);
 CREATE TABLE IF NOT EXISTS agent_runs (
     id TEXT PRIMARY KEY,
     workflow_id TEXT,
@@ -96,6 +109,14 @@ async def _ensure_schema(db: aiosqlite.Connection) -> None:
         cols = {row[1] for row in await cursor.fetchall()}
     if "creation_transcript" not in cols:
         await db.execute("ALTER TABLE workflow_definitions ADD COLUMN creation_transcript TEXT")
+    # Same idempotent pattern for deleted_at (2026-09-08) — soft delete.
+    # NULL = active. A real timestamp means "hidden from the normal
+    # Workflows list (list_workflows filters it out by default) but not
+    # actually gone" — see delete_workflow's own docstring for the full
+    # reasoning (recoverable via restore_workflow, real permanent erasure
+    # is the separate, more severe purge_workflow).
+    if "deleted_at" not in cols:
+        await db.execute("ALTER TABLE workflow_definitions ADD COLUMN deleted_at REAL")
     # Same idempotent pattern for agent_runs.graph_snapshot (2026-09-08) — a
     # run's own frozen copy of the graph it actually started with, so a
     # workflow edit made after a run starts can never retroactively change
@@ -141,7 +162,9 @@ async def create_workflow(
     return workflow_id
 
 
-async def update_workflow(workflow_id: str, name: str, description: str | None, graph: dict, trigger: dict) -> bool:
+async def update_workflow(
+    workflow_id: str, name: str, description: str | None, graph: dict, trigger: dict, edited_by: str | None = None,
+) -> bool:
     """Real update-in-place (2026-09-07) — until now the only way to
     change a saved workflow was create_workflow, which always makes a
     NEW row. That meant editing an existing workflow (e.g. to add a
@@ -151,15 +174,95 @@ async def update_workflow(workflow_id: str, name: str, description: str | None, 
     gets its own new token, orphaning whatever external service already
     has the original URL configured. Returns whether a row actually
     existed to update, same "did this really happen" convention
-    delete_workflow below already uses."""
+    delete_workflow below already uses.
+
+    Version history (2026-09-08): the row's state is archived into
+    workflow_definition_versions BEFORE being overwritten — every real
+    "Save Edits" becomes a real, permanent, browsable version, for the
+    same audit/legitimacy reasoning delete_workflow's soft-delete below
+    follows. `edited_by` is real, plumbed all the way through, but stays
+    None/unpopulated until real per-user accounts exist — same honest
+    gap as everywhere else in this codebase that would otherwise need to
+    fake an identity. revert_workflow_to_version below is just this same
+    function called with an old version's fields — which means reverting
+    ALSO archives whatever was live right before the revert as its own
+    new version; reverting away from a version never destroys it, same
+    principle `git revert` follows (a new commit, not erased history)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_schema(db)
+        async with db.execute(
+            "SELECT name, description, graph, trigger_json FROM workflow_definitions WHERE id = ?",
+            (workflow_id,),
+        ) as cursor:
+            current = await cursor.fetchone()
+        if current is None:
+            return False
+        async with db.execute(
+            "SELECT COALESCE(MAX(version_number), 0) FROM workflow_definition_versions WHERE workflow_id = ?",
+            (workflow_id,),
+        ) as cursor:
+            (max_version,) = await cursor.fetchone()
+        await db.execute(
+            "INSERT INTO workflow_definition_versions "
+            "(id, workflow_id, version_number, name, description, graph, trigger_json, edited_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), workflow_id, max_version + 1, current[0], current[1], current[2], current[3], edited_by, time.time()),
+        )
         cursor = await db.execute(
             "UPDATE workflow_definitions SET name = ?, description = ?, graph = ?, trigger_json = ?, updated_at = ? WHERE id = ?",
             (name, description, json.dumps(graph), json.dumps(trigger), time.time(), workflow_id),
         )
         await db.commit()
         return cursor.rowcount > 0
+
+
+def _row_to_version(row: dict) -> dict:
+    row = dict(row)
+    row["graph"] = json.loads(row.pop("graph"))
+    row["trigger"] = json.loads(row.pop("trigger_json"))
+    return row
+
+
+async def list_workflow_versions(workflow_id: str) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, workflow_id, version_number, name, description, graph, trigger_json, edited_by, created_at "
+            "FROM workflow_definition_versions WHERE workflow_id = ? ORDER BY version_number DESC",
+            (workflow_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+    return [_row_to_version(dict(r)) for r in rows]
+
+
+async def revert_workflow_to_version(workflow_id: str, version_id: str, edited_by: str | None = None) -> bool:
+    """Restores an old version's name/description/graph as the new live
+    definition — deliberately NOT its trigger. A revert must never
+    silently change a workflow's webhook token or schedule out from
+    under whatever's currently configured, same "never regenerate a
+    token a real external service already has" rule Save Edits itself
+    already follows for ordinary edits. Delegates to update_workflow, so
+    this also gets the same automatic version-archiving (reverting away
+    from a version doesn't destroy it) for free."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT name, description, graph FROM workflow_definition_versions WHERE id = ? AND workflow_id = ?",
+            (version_id, workflow_id),
+        ) as cursor:
+            version_row = await cursor.fetchone()
+        if version_row is None:
+            return False
+        async with db.execute("SELECT trigger_json FROM workflow_definitions WHERE id = ?", (workflow_id,)) as cursor:
+            current_row = await cursor.fetchone()
+        if current_row is None:
+            return False
+    return await update_workflow(
+        workflow_id, version_row["name"], version_row["description"],
+        json.loads(version_row["graph"]), json.loads(current_row["trigger_json"]), edited_by,
+    )
 
 
 def _row_to_workflow(row: dict) -> dict:
@@ -170,11 +273,17 @@ def _row_to_workflow(row: dict) -> dict:
 
 
 async def get_workflow(workflow_id: str) -> dict | None:
+    # Deliberately unfiltered by deleted_at — a direct by-ID lookup is
+    # used internally (starting a run, resolving a webhook token via
+    # list_workflows below, an admin viewing one specific deleted
+    # workflow later) where "does this row exist at all" is the right
+    # question, not "is it in the normal active list." Filtering belongs
+    # specifically to list_workflows, the general browsing view.
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_schema(db)
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT id, name, description, graph, trigger_json, creation_transcript, created_at, updated_at "
+            "SELECT id, name, description, graph, trigger_json, creation_transcript, created_at, updated_at, deleted_at "
             "FROM workflow_definitions WHERE id = ?",
             (workflow_id,),
         ) as cursor:
@@ -182,30 +291,85 @@ async def get_workflow(workflow_id: str) -> dict | None:
     return _row_to_workflow(row) if row else None
 
 
-async def list_workflows() -> list[dict]:
+async def list_workflows(include_deleted: bool = False) -> list[dict]:
+    query = (
+        "SELECT id, name, description, graph, trigger_json, creation_transcript, created_at, updated_at, deleted_at "
+        "FROM workflow_definitions"
+    )
+    if not include_deleted:
+        query += " WHERE deleted_at IS NULL"
+    query += " ORDER BY created_at DESC"
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_schema(db)
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT id, name, description, graph, trigger_json, creation_transcript, created_at, updated_at "
-            "FROM workflow_definitions ORDER BY created_at DESC"
-        ) as cursor:
+        async with db.execute(query) as cursor:
             rows = await cursor.fetchall()
     return [_row_to_workflow(r) for r in rows]
 
 
 async def delete_workflow(workflow_id: str) -> bool:
-    """Deletes the workflow definition. Past agent_runs/agent_run_steps for
-    it are left alone — a real audit trail of what already happened, not
-    something an accidental double-click should be able to erase. Deleting
-    the definition is also the entire "cancel its schedule" mechanism —
-    there's no separate in-memory job to stop (dispatcher/scheduler.py's
-    only registered job is the periodic check_due_workflows() poll itself);
-    due_workflows() reads straight from this table, so a deleted workflow
-    simply stops being returned by it, on the very next poll.
-    Returns whether a row was actually deleted."""
+    """Soft delete (2026-09-08) — sets deleted_at instead of actually
+    removing the row. The workflow disappears from the normal Workflows
+    list (list_workflows filters it out by default) but the row and all
+    its history (runs, versions) stay fully intact — recoverable via
+    restore_workflow, or visible to an admin/owner-tier view via
+    list_workflows(include_deleted=True) once real roles exist (today,
+    that view sits behind the same single shared API key everyone has —
+    an honest, known stopgap, not real access control yet). Real,
+    permanent erasure is the separate, deliberately more severe
+    purge_workflow below.
+
+    Still the entire "cancel its schedule/webhook" mechanism, same as
+    the old hard-delete was: due_workflows() and
+    get_workflow_by_webhook_token() both read through list_workflows()'s
+    default (filtered) behavior, so a soft-deleted workflow correctly
+    stops firing on the very next poll — same real-world effect as
+    before, just reversible now. Returns whether an active row was
+    actually soft-deleted (a no-op, returning False, if it was already
+    deleted or never existed)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_schema(db)
+        cursor = await db.execute(
+            "UPDATE workflow_definitions SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+            (time.time(), workflow_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def restore_workflow(workflow_id: str) -> bool:
+    """Undoes delete_workflow — clears deleted_at, making the workflow
+    reappear in the normal list and, if it has a schedule/webhook
+    trigger, eligible to fire again on the next poll. Returns whether a
+    soft-deleted row was actually restored."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        cursor = await db.execute(
+            "UPDATE workflow_definitions SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL",
+            (workflow_id,),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def purge_workflow(workflow_id: str) -> bool:
+    """The real, permanent erasure — unlike delete_workflow (soft,
+    reversible, audit-preserving), this actually removes the row AND its
+    full history (runs, steps, versions), since the whole point of a
+    purge is complete removal, not "hidden but still auditable." A
+    deliberately separate, more severe action — see IDEAS.md's
+    permission-catalog thread: `workflows.delete` (soft) vs
+    `workflows.purge` (this), the latter meant to be grantable to
+    Owner-tier only once real roles exist. Returns whether a row was
+    actually removed."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        await db.execute(
+            "DELETE FROM agent_run_steps WHERE run_id IN (SELECT id FROM agent_runs WHERE workflow_id = ?)",
+            (workflow_id,),
+        )
+        await db.execute("DELETE FROM agent_runs WHERE workflow_id = ?", (workflow_id,))
+        await db.execute("DELETE FROM workflow_definition_versions WHERE workflow_id = ?", (workflow_id,))
         cursor = await db.execute("DELETE FROM workflow_definitions WHERE id = ?", (workflow_id,))
         await db.commit()
         return cursor.rowcount > 0

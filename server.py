@@ -80,7 +80,9 @@ from storage.agent_work import (
     create_workflow as create_workflow_definition,
     delete_all_runs, delete_run,
     delete_workflow as delete_workflow_definition,
-    get_latest_node_output, get_run, get_run_steps, get_workflow, get_workflow_by_webhook_token, list_runs, list_workflows,
+    get_latest_node_output, get_run, get_run_steps, get_workflow, get_workflow_by_webhook_token,
+    list_runs, list_workflow_versions, list_workflows,
+    purge_workflow, restore_workflow, revert_workflow_to_version,
     update_workflow as update_workflow_definition,
 )
 from storage.agents import create_agent, delete_agent, get_agent, get_agent_by_workflow_id, list_agents, update_agent
@@ -963,15 +965,48 @@ async def agent_update_workflow(workflow_id: str, request: Request) -> JSONRespo
     if not name or not graph:
         return JSONResponse({"error": "missing 'name' or 'graph'"}, status_code=400)
     trigger = payload.get("trigger") or {"type": "manual"}
-    updated = await update_workflow_definition(workflow_id, name, payload.get("description"), graph, trigger)
+    # edited_by (2026-09-08) — real audit trail field, but there are no
+    # real user accounts anywhere in NAVI yet (one shared NAVI_API_KEY for
+    # the whole API), so this stays whatever the caller sends, usually
+    # None today. Not enforced/validated — the honest gap, not silently
+    # faked. See storage/agent_work.py's update_workflow docstring.
+    edited_by = payload.get("edited_by")
+    updated = await update_workflow_definition(workflow_id, name, payload.get("description"), graph, trigger, edited_by)
     if not updated:
         return JSONResponse({"error": "not found"}, status_code=404)
     return JSONResponse(await get_workflow(workflow_id))
 
 
 @app.get("/agent/workflows")
-async def agent_list_workflows() -> list[dict]:
-    return await list_workflows()
+async def agent_list_workflows(include_deleted: bool = False) -> list[dict]:
+    return await list_workflows(include_deleted=include_deleted)
+
+
+@app.get("/agent/workflows/{workflow_id}/versions")
+async def agent_list_workflow_versions(workflow_id: str) -> list[dict]:
+    """Past versions of this workflow's graph/name/description, most
+    recent first — archived automatically on every Save Edits or revert.
+    See storage/agent_work.py's update_workflow docstring: a version is
+    the row's content immediately BEFORE the update that just happened,
+    not a snapshot of the update itself."""
+    return await list_workflow_versions(workflow_id)
+
+
+@app.post("/agent/workflows/{workflow_id}/versions/{version_id}/revert")
+async def agent_revert_workflow(workflow_id: str, version_id: str, request: Request) -> JSONResponse:
+    """Restores an old version's name/description/graph as the workflow's
+    new live state — deliberately does NOT touch the workflow's current
+    trigger (a webhook's token/URL, or a schedule), so reverting a graph
+    edit can never silently break an already-configured integration. Like
+    any other update, this itself archives what it's overwriting, so a
+    revert is never a dead end — see revert_workflow_to_version's
+    docstring in storage/agent_work.py."""
+    payload = await request.json() if await request.body() else {}
+    edited_by = payload.get("edited_by")
+    reverted = await revert_workflow_to_version(workflow_id, version_id, edited_by)
+    if not reverted:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse(await get_workflow(workflow_id))
 
 
 @app.get("/agent/workflows/due")
@@ -1016,14 +1051,50 @@ async def agent_node_sample_output(workflow_id: str, node_id: str) -> JSONRespon
 
 @app.delete("/agent/workflows/{workflow_id}")
 async def agent_delete_workflow(workflow_id: str) -> JSONResponse:
-    """Deletes the workflow definition. This is also the entire "cancel its
-    schedule" operation — see delete_workflow's docstring in
+    """Soft-deletes the workflow definition (2026-09-08) — recoverable via
+    the /restore route below, not gone. This is also the entire "cancel
+    its schedule/webhook" operation — see delete_workflow's docstring in
     storage/agent_work.py for why nothing else needs to be touched. Past
-    runs/steps for it are kept, not cascade-deleted (real audit trail)."""
+    runs/steps/versions for it are kept, not cascade-deleted (real audit
+    trail) — permanent removal is the separate, more severe /purge route."""
     deleted = await delete_workflow_definition(workflow_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="not found")
     return JSONResponse({"deleted": True})
+
+
+@app.post("/agent/workflows/{workflow_id}/restore")
+async def agent_restore_workflow(workflow_id: str) -> JSONResponse:
+    """Undoes a soft-delete — the workflow reappears in the normal list
+    and, if it has a schedule/webhook trigger, becomes eligible to fire
+    again on the next poll."""
+    restored = await restore_workflow(workflow_id)
+    if not restored:
+        raise HTTPException(status_code=404, detail="not found or not deleted")
+    return JSONResponse({"restored": True})
+
+
+@app.delete("/agent/workflows/{workflow_id}/purge")
+async def agent_purge_workflow(workflow_id: str) -> JSONResponse:
+    """Real, permanent erasure — unlike the soft DELETE above, this
+    actually removes the row and its full history (runs, steps,
+    versions). Meant for an Owner-tier admin view once real roles exist
+    (today, gated by nothing beyond the single shared API key everyone
+    already has — an honest, known stopgap, not real access control).
+    Best-effort also removes any Agent Vault entry starred against this
+    workflow — a separate DB file (agents.db), so this can't be one
+    atomic transaction with the purge itself; a leftover saved_agents row
+    pointing at a now-gone workflow_id is a harmless dangling reference
+    the UI already has to treat as "instructions only," not a correctness
+    bug, so this cleanup step failing silently is an acceptable trade-off
+    here rather than blocking the purge on it."""
+    agent = await get_agent_by_workflow_id(workflow_id)
+    if agent:
+        await delete_agent(agent["id"])
+    purged = await purge_workflow(workflow_id)
+    if not purged:
+        raise HTTPException(status_code=404, detail="not found")
+    return JSONResponse({"purged": True})
 
 
 @app.post("/agent/workflows/{workflow_id}/run")

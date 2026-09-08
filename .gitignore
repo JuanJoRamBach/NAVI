@@ -31,6 +31,11 @@ usage.db
 # status) — same reasoning.
 sources.db
 
+# storage/agents.py's SQLite store (Agent Vault's starred/saved agents) —
+# same reasoning. Missed when the others above were added; only surfaced
+# once local testing actually created the file (2026-09-08).
+agents.db
+
 # Local-only running notes across Claude Code sessions — scratch
 # continuity, not project documentation, not meant to be committed.
 # Auto-loaded via CLAUDE.md's @IDEAS.md import.
