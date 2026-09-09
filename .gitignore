@@ -36,6 +36,11 @@ sources.db
 # once local testing actually created the file (2026-09-08).
 agents.db
 
+# storage/auth.py's SQLite store (real user accounts/sessions, 2026-09-10)
+# — same reasoning as the other *.db files above, PLUS this one actually
+# holds real password hashes/session tokens, not just app state.
+auth.db
+
 # Local-only running notes across Claude Code sessions — scratch
 # continuity, not project documentation, not meant to be committed.
 # Auto-loaded via CLAUDE.md's @IDEAS.md import.

@@ -86,6 +86,10 @@ from storage.agent_work import (
     update_workflow as update_workflow_definition,
 )
 from storage.agents import create_agent, delete_agent, get_agent, get_agent_by_workflow_id, list_agents, update_agent
+from storage.auth import (
+    count_users, create_session, create_user, delete_session, get_session_user,
+    get_user_by_email, get_user_by_id, list_users, set_user_active, update_user_role, verify_password,
+)
 from storage.sources import delete_document as delete_source_document, get_document as get_source_document, latest_batch as latest_source_batch, list_documents as list_source_documents, set_document_status as set_source_document_status
 from dispatcher.source_fetch import start_source_fetch_batch
 from tools.devslate_tools import new_tool_call_id
@@ -225,6 +229,174 @@ async def _require_api_key(request: Request, call_next):
     if request.headers.get("X-Navi-Api-Key") != NAVI_API_KEY:
         return JSONResponse({"error": "missing or invalid API key"}, status_code=401)
     return await call_next(request)
+
+
+# Real per-user identity (2026-09-10), layered ON TOP of the shared-key
+# middleware above, not replacing it — see storage/auth.py's own module
+# docstring for the full reasoning. The shared key stays the outer "is
+# this a legitimate caller at all" boundary every route still needs
+# (nothing below removes that gate); these two helpers are an ADDITIONAL,
+# opt-in-per-route check for the specific routes that need to know WHO,
+# not just "some caller with the key." Manual checks inside each route
+# body, matching this file's existing style, rather than introducing
+# FastAPI's Depends() as a new pattern for just this one feature.
+async def _current_user(request: Request) -> dict | None:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    return await get_session_user(auth_header[len("Bearer "):])
+
+
+async def _require_role(request: Request, *roles: str) -> dict:
+    """Raises 401 if there's no valid session at all, 403 if there is one
+    but its role isn't in `roles`. Callers that need "just tell me who
+    this is, if anyone" (e.g. capturing edited_by best-effort) should call
+    _current_user directly instead — this is specifically for routes that
+    refuse to proceed without an authorized role."""
+    user = await _current_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="login required")
+    if user["role"] not in roles:
+        raise HTTPException(status_code=403, detail=f"requires role: {' or '.join(roles)}")
+    return user
+
+
+@app.post("/auth/register")
+async def auth_register(request: Request) -> JSONResponse:
+    """Bootstraps the very first account as Owner — there's no one yet to
+    grant that role, same problem every real multi-user system has to
+    solve once. Refuses once a single account exists: every account after
+    the first is created by an Owner/Admin via POST /auth/users below, not
+    self-registered — NAVI isn't a public signup product."""
+    if await count_users() > 0:
+        return JSONResponse({"error": "an account already exists — ask an Owner/Admin to create yours"}, status_code=403)
+    payload = await request.json()
+    email = (payload.get("email") or "").strip()
+    password = payload.get("password") or ""
+    if not email or len(password) < 8:
+        return JSONResponse({"error": "email and a password of at least 8 characters are required"}, status_code=400)
+    # create_user's own password hashing is genuinely CPU-bound (~80ms,
+    # measured) but stays a plain in-line call rather than
+    # asyncio.to_thread — that would need a SEPARATE event loop for
+    # create_user's own aiosqlite I/O, which asyncio can't run from a
+    # worker thread. Register/login are rare, bursty, human-paced actions
+    # (not a hot path under load), so blocking the loop for ~80ms here is
+    # a real but genuinely small cost — same "acceptable, not free"
+    # tradeoff this file already makes elsewhere for occasional sync work.
+    user = await create_user(email, password, payload.get("name"), "owner")
+    if user is None:
+        return JSONResponse({"error": "that email is already registered"}, status_code=409)
+    token = await create_session(user["id"])
+    return JSONResponse({"token": token, "user": user})
+
+
+@app.post("/auth/login")
+async def auth_login(request: Request) -> JSONResponse:
+    payload = await request.json()
+    email = (payload.get("email") or "").strip()
+    password = payload.get("password") or ""
+    user = await get_user_by_email(email)
+    if user is None or not user["is_active"]:
+        return JSONResponse({"error": "invalid email or password"}, status_code=401)
+    if not verify_password(password, user["password_hash"]):
+        return JSONResponse({"error": "invalid email or password"}, status_code=401)
+    token = await create_session(user["id"])
+    # Re-fetched via get_user_by_id rather than hand-stripping the raw
+    # get_user_by_email row above — that raw row is straight from SQLite
+    # (is_active as 0/1, no password_hash filtering applied), while
+    # get_user_by_id goes through _row_to_user's normalization (real bool,
+    # password_hash stripped) — the same shape /auth/me and /auth/users
+    # already return, so a caller sees one consistent user shape everywhere.
+    return JSONResponse({"token": token, "user": await get_user_by_id(user["id"])})
+
+
+@app.post("/auth/logout")
+async def auth_logout(request: Request) -> JSONResponse:
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        await delete_session(auth_header[len("Bearer "):])
+    return JSONResponse({"ok": True})
+
+
+@app.get("/auth/me")
+async def auth_me(request: Request) -> JSONResponse:
+    user = await _current_user(request)
+    if user is None:
+        return JSONResponse({"error": "not logged in"}, status_code=401)
+    return JSONResponse(user)
+
+
+@app.get("/auth/users")
+async def auth_list_users(request: Request) -> JSONResponse:
+    """Owner/Admin only — Member has no reason to see the company roster,
+    same as no UI anywhere else in NAVI exposes other users' accounts."""
+    await _require_role(request, "owner", "admin")
+    return JSONResponse(await list_users())
+
+
+@app.post("/auth/users")
+async def auth_create_user(request: Request) -> JSONResponse:
+    """Invite-style creation, not self-registration — there's no
+    transactional-email infrastructure anywhere in NAVI yet to send a real
+    invite link, so an Owner/Admin sets the new account's initial password
+    directly and shares it out-of-band. A real invite-by-email flow is a
+    known, flagged gap, not silently pretended away.
+    An Admin can only create Members (can't hand out Admin/Owner — same
+    "can manage people, can't escalate itself or others past its own
+    tier" boundary real RBAC systems draw); only an Owner can create an
+    Admin or another Owner."""
+    actor = await _require_role(request, "owner", "admin")
+    payload = await request.json()
+    email = (payload.get("email") or "").strip()
+    password = payload.get("password") or ""
+    role = payload.get("role") or "member"
+    if not email or len(password) < 8:
+        return JSONResponse({"error": "email and a password of at least 8 characters are required"}, status_code=400)
+    if role not in ("member", "admin", "owner"):
+        return JSONResponse({"error": "role must be member, admin, or owner"}, status_code=400)
+    if actor["role"] == "admin" and role != "member":
+        return JSONResponse({"error": "an Admin can only create Member accounts"}, status_code=403)
+    user = await create_user(email, password, payload.get("name"), role)
+    if user is None:
+        return JSONResponse({"error": "that email is already registered"}, status_code=409)
+    return JSONResponse(user)
+
+
+@app.put("/auth/users/{user_id}/role")
+async def auth_update_user_role(user_id: str, request: Request) -> JSONResponse:
+    """Owner only — an Admin managing another user's role, including
+    handing out Admin itself, is exactly the escalation boundary
+    auth_create_user's own Admin restriction above exists to prevent."""
+    await _require_role(request, "owner")
+    payload = await request.json()
+    role = payload.get("role")
+    if role not in ("member", "admin", "owner"):
+        return JSONResponse({"error": "role must be member, admin, or owner"}, status_code=400)
+    updated = await update_user_role(user_id, role)
+    if not updated:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"updated": True})
+
+
+@app.put("/auth/users/{user_id}/active")
+async def auth_set_user_active(user_id: str, request: Request) -> JSONResponse:
+    """Owner only — deactivate (or reactivate) an account. Soft, same
+    philosophy as storage/agent_work.py's workflow delete/restore: the
+    user row and everything it ever authored/edited/approved stays intact
+    for audit purposes, it just can no longer log in or use an existing
+    session (storage/auth.py's get_session_user checks is_active on every
+    lookup, not just at login)."""
+    actor = await _require_role(request, "owner")
+    payload = await request.json()
+    is_active = payload.get("is_active")
+    if not isinstance(is_active, bool):
+        return JSONResponse({"error": "is_active must be a boolean"}, status_code=400)
+    if user_id == actor["id"] and not is_active:
+        return JSONResponse({"error": "can't deactivate your own account"}, status_code=400)
+    updated = await set_user_active(user_id, is_active)
+    if not updated:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"updated": True})
 
 
 async def _refresh_model_ranking_snapshot() -> None:
@@ -965,12 +1137,15 @@ async def agent_update_workflow(workflow_id: str, request: Request) -> JSONRespo
     if not name or not graph:
         return JSONResponse({"error": "missing 'name' or 'graph'"}, status_code=400)
     trigger = payload.get("trigger") or {"type": "manual"}
-    # edited_by (2026-09-08) — real audit trail field, but there are no
-    # real user accounts anywhere in NAVI yet (one shared NAVI_API_KEY for
-    # the whole API), so this stays whatever the caller sends, usually
-    # None today. Not enforced/validated — the honest gap, not silently
-    # faked. See storage/agent_work.py's update_workflow docstring.
-    edited_by = payload.get("edited_by")
+    # edited_by (2026-09-10) — now real: a logged-in caller's audit
+    # attribution is their own authenticated identity, never a
+    # client-supplied claim. Falls back to a client-supplied `edited_by`
+    # (or None) only when there's no session at all — the frontend hasn't
+    # been migrated off the shared API key to real login yet (see
+    # navi-pwa's ApiKeyGate.tsx), so this stays optional rather than
+    # requiring login on every save today.
+    user = await _current_user(request)
+    edited_by = user["email"] if user else payload.get("edited_by")
     updated = await update_workflow_definition(workflow_id, name, payload.get("description"), graph, trigger, edited_by)
     if not updated:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -978,7 +1153,15 @@ async def agent_update_workflow(workflow_id: str, request: Request) -> JSONRespo
 
 
 @app.get("/agent/workflows")
-async def agent_list_workflows(include_deleted: bool = False) -> list[dict]:
+async def agent_list_workflows(request: Request, include_deleted: bool = False) -> list[dict]:
+    # Seeing soft-deleted workflows is the one part of this route that's
+    # role-gated (2026-09-10) — normal browsing (include_deleted's default
+    # False) stays open to any caller with the shared API key, same as
+    # before. Owner/Admin matches the "admin/owner level access should
+    # still be able to see deleted workflows" design from when soft-delete
+    # itself was built (AGENT_WORK_RELIABILITY.md).
+    if include_deleted:
+        await _require_role(request, "owner", "admin")
     return await list_workflows(include_deleted=include_deleted)
 
 
@@ -1002,7 +1185,8 @@ async def agent_revert_workflow(workflow_id: str, version_id: str, request: Requ
     revert is never a dead end — see revert_workflow_to_version's
     docstring in storage/agent_work.py."""
     payload = await request.json() if await request.body() else {}
-    edited_by = payload.get("edited_by")
+    user = await _current_user(request)
+    edited_by = user["email"] if user else payload.get("edited_by")
     reverted = await revert_workflow_to_version(workflow_id, version_id, edited_by)
     if not reverted:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -1064,10 +1248,12 @@ async def agent_delete_workflow(workflow_id: str) -> JSONResponse:
 
 
 @app.post("/agent/workflows/{workflow_id}/restore")
-async def agent_restore_workflow(workflow_id: str) -> JSONResponse:
+async def agent_restore_workflow(workflow_id: str, request: Request) -> JSONResponse:
     """Undoes a soft-delete — the workflow reappears in the normal list
     and, if it has a schedule/webhook trigger, becomes eligible to fire
-    again on the next poll."""
+    again on the next poll. Owner/Admin only (2026-09-10) — same tier as
+    seeing deleted workflows in the first place, above."""
+    await _require_role(request, "owner", "admin")
     restored = await restore_workflow(workflow_id)
     if not restored:
         raise HTTPException(status_code=404, detail="not found or not deleted")
@@ -1075,12 +1261,13 @@ async def agent_restore_workflow(workflow_id: str) -> JSONResponse:
 
 
 @app.delete("/agent/workflows/{workflow_id}/purge")
-async def agent_purge_workflow(workflow_id: str) -> JSONResponse:
+async def agent_purge_workflow(workflow_id: str, request: Request) -> JSONResponse:
     """Real, permanent erasure — unlike the soft DELETE above, this
     actually removes the row and its full history (runs, steps,
-    versions). Meant for an Owner-tier admin view once real roles exist
-    (today, gated by nothing beyond the single shared API key everyone
-    already has — an honest, known stopgap, not real access control).
+    versions). Owner ONLY (2026-09-10) — stricter than restore/seeing
+    deleted workflows (Owner+Admin): this is irreversible, so it gets the
+    narrower tier, same reasoning auth_update_user_role uses for
+    escalation-sensitive actions.
     Best-effort also removes any Agent Vault entry starred against this
     workflow — a separate DB file (agents.db), so this can't be one
     atomic transaction with the purge itself; a leftover saved_agents row
@@ -1088,6 +1275,7 @@ async def agent_purge_workflow(workflow_id: str) -> JSONResponse:
     the UI already has to treat as "instructions only," not a correctness
     bug, so this cleanup step failing silently is an acceptable trade-off
     here rather than blocking the purge on it."""
+    await _require_role(request, "owner")
     agent = await get_agent_by_workflow_id(workflow_id)
     if agent:
         await delete_agent(agent["id"])
