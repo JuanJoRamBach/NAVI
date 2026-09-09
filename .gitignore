@@ -60,6 +60,10 @@ MARKET_RESEARCH.md
 # project documentation.
 AGENT_WORK_RELIABILITY.md
 
+# Same reasoning as IDEAS.md above — session audit-trail changelog for
+# real accounts/roles/permissions.
+ACCOUNTS_AND_ROLES.md
+
 # Scratch diagnostic payloads (curl -d @file.json tests) — throwaway, not
 # part of the app, shouldn't be committed.
 *_test_payload.json
