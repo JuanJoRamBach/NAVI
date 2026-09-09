@@ -50,6 +50,11 @@ how_to_handle_context.md
 # (naming/legal/funding-adjacent business continuity, not project docs).
 MARKET_RESEARCH.md
 
+# Same reasoning as IDEAS.md above — session audit-trail changelog for
+# Agent Work reliability features, local continuity notes rather than
+# project documentation.
+AGENT_WORK_RELIABILITY.md
+
 # Scratch diagnostic payloads (curl -d @file.json tests) — throwaway, not
 # part of the app, shouldn't be committed.
 *_test_payload.json
