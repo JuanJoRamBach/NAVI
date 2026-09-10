@@ -299,18 +299,36 @@ def fetch_mistral_models(api_key: str | None) -> list[dict]:
 
 def fetch_gmi_models(api_key: str | None) -> list[dict]:
     """Live-verified 2026-09-01 against a real key. Real gotcha JuanJo
-    caught directly: promotional free models (currently MiniMax M3 AND
-    M2.7, not just M3) appear TWICE in this list — once at normal paid
-    pricing, once as a separate entry with the identical id but
-    `is_free: true` and every pricing field zeroed. The is_free entry is
-    the one that matters; dedupe by id and mark a model free if ANY of
-    its entries carries is_free, rather than pattern-matching a model
-    name (which would have missed M2.7's promo entirely).
+    caught directly: promotional free models appear TWICE in this list
+    — once at normal paid pricing, once as a separate entry with the
+    identical id but `is_free: true` and every pricing field zeroed. The
+    is_free entry is the one that matters; dedupe by id and mark a model
+    free if ANY of its entries carries is_free, rather than pattern-
+    matching a model name (this promo rotates — MiniMax M3/M2.7 through
+    2026-09-06, Qwen3.8 Max 0902 as of 2026-09-10 per JuanJo checking
+    GMI's console directly — pattern-matching a specific name would need
+    updating every time it rotates; checking the live is_free flag never
+    does).
 
     No capability/tool-support field exists anywhere in this response,
     unlike every other provider fetched here — "tools" defaults to False
     rather than assumed true, since there's no live signal to check it
     against.
+
+    Excludes GMI's Batch-mode entries (2026-09-10, JuanJo flagged GMI's
+    console also lists a free "Gemini batch inference" under its
+    separate image/batch model hub, distinct from the llm hub Qwen3.8
+    Max 0902 lives in). Real, confirmed distinction, not a guess: GMI's
+    own docs describe Batch mode as async, offline, large-dataset
+    processing (document classification, bulk labeling) on a completely
+    different workflow than a synchronous chat completion —
+    GMIProvider._do_chat() posts to /v1/chat/completions and blocks for
+    an immediate choices[0].message, which a batch job has no way to
+    return. If this endpoint's /v1/models listing ever includes a batch
+    entry (unconfirmed either way — GMI's docs don't specify), routing a
+    normal chat turn to it would silently fail or hang rather than
+    answer. Filtered defensively by id containing "batch", since no
+    separate mode/type field exists in this response to check instead.
     """
     if not api_key:
         return []
@@ -324,7 +342,7 @@ def fetch_gmi_models(api_key: str | None) -> list[dict]:
     by_id: dict[str, dict] = {}
     for m in data:
         mid = m.get("id", "")
-        if not mid:
+        if not mid or "batch" in mid.lower():
             continue
         is_free = bool(m.get("is_free"))
         if mid not in by_id:

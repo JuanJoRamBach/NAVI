@@ -6,13 +6,18 @@ confirmed via docs.gmicloud.ai/quickstart 2026-09-01: base URL
 https://api.gmi-serving.com/v1, `Authorization: Bearer <key>`, standard
 choices[0].message response shape.
 
-Added specifically for MiniMax M3, which GMI is running free as a
-promotion through 2026-09-06 — a 5-day window from when this was added.
-Not hardcoding the model slug anywhere: the daily model-fetch job pulls
-it live from GET /v1/models like every other provider here, so if the
-promo's exact slug or its free status changes (or the promo ends and the
-model comes back paid/removed), the fetch reflects that automatically
-instead of this transport silently keeping a stale assumption.
+Added specifically for MiniMax M3, which GMI ran free as a promotion
+through 2026-09-06 (that window has since closed — as of 2026-09-10 the
+free slot rotated to Qwen3.8 Max 0902, per JuanJo checking GMI's console
+directly). Not hardcoding the model slug anywhere: the daily model-fetch
+job (jobs/model_ranking.py's fetch_gmi_models) pulls it live from
+GET /v1/models like every other provider here, so a promo rotating to a
+new model, or ending outright, reflects automatically on the next fetch
+instead of this transport silently keeping a stale assumption. That
+fetcher also excludes GMI's separate Batch-mode model hub (its own
+"Gemini batch inference" entry, flagged by JuanJo 2026-09-10) — async/
+offline batch jobs, not something this transport's synchronous
+/v1/chat/completions call could use even if it were free.
 
 Prompt caching: UNKNOWN — no caching documentation found during the
 2026-09-01 research pass, same gap as llm7.py. Don't assume either way.
