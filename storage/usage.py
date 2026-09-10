@@ -26,6 +26,35 @@ remaining/limit/reset comes from response headers Groq returns on every
 call (x-ratelimit-{limit,remaining,reset}-requests), which is strictly
 more authoritative than anything summed locally could be. See
 groq_rate_snapshots below and providers/groq.py's capture of it.
+
+**Real, persisted token counts + a counterfactual baseline (2026-09-10,
+NAVI reliability Stage 0)** — the "get the task done using fewer tokens"
+claim needed an actual provable number behind it, not a description.
+Two real gaps closed here:
+
+1. `record_usage`'s `tokens` argument used to be populated by only 2 of
+   NAVI's 7 providers (cloudflare.py, llm7.py calling it directly from
+   their own _do_chat) — the other 5 (Groq, OpenRouter, Mistral, Ollama
+   Cloud, GMI) never recorded a token count anywhere, despite every one
+   of them returning a real, standard OpenAI-compatible `usage` object
+   on every call. providers/base.py's Provider.chat() now extracts it
+   uniformly, for every provider, in the one place every call already
+   funnels through — closing that gap without touching 7 separate
+   transport files' worth of call sites.
+2. `usage_reference_costs` — what those exact same real prompt/
+   completion token counts would have cost, had this call gone to a
+   fixed, named, publicly-priced reference model instead. NOT a
+   simulation of what that model would have generated (impossible to
+   know) — the same methodology real published LLM-routing savings
+   claims use: price the REAL token volume actually used at the
+   expensive default's real rate, as the "what you'd have paid without
+   routing" baseline. REFERENCE_MODELS below tracks the CURRENT
+   flagship from each of the two most recognizable labs (GPT-6 Astra,
+   Claude Fable 5.1 — both $10/$50 per million input/output tokens as
+   of this writing) rather than just one, specifically so the claim
+   reads as "vs. the current best from either lab," not "vs. one
+   vendor's product." A real side table (not fixed columns) so a third
+   reference model is a data addition, not a schema migration.
 """
 
 import sqlite3
@@ -36,6 +65,24 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).parent.parent / "usage.db"
 
+# See module docstring — real, current (2026-09) pricing, not estimated.
+# {reference_model_id: (input_usd_per_mtok, output_usd_per_mtok)}
+REFERENCE_MODELS: dict[str, tuple[float, float]] = {
+    "gpt-6-astra": (10.0, 50.0),
+    "claude-fable-5.1": (10.0, 50.0),
+}
+
+
+def counterfactual_costs_usd(prompt_tokens: int, completion_tokens: int) -> dict[str, float]:
+    """What this real token volume would have cost at EACH reference
+    model's real published rate — see module docstring for why this
+    (not a simulated response) is the honest, standard methodology."""
+    return {
+        ref: (prompt_tokens / 1_000_000) * in_price + (completion_tokens / 1_000_000) * out_price
+        for ref, (in_price, out_price) in REFERENCE_MODELS.items()
+    }
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS usage_daily (
     provider TEXT NOT NULL,
@@ -44,7 +91,17 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     requests INTEGER NOT NULL DEFAULT 0,
     tokens INTEGER NOT NULL DEFAULT 0,
     neurons REAL NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (provider, model, day_utc)
+);
+CREATE TABLE IF NOT EXISTS usage_reference_costs (
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    day_utc TEXT NOT NULL,
+    reference_model TEXT NOT NULL,
+    usd REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (provider, model, day_utc, reference_model)
 );
 CREATE TABLE IF NOT EXISTS groq_rate_snapshots (
     model TEXT PRIMARY KEY,
@@ -65,6 +122,14 @@ def _connect():
     try:
         if not _initialized:
             conn.executescript(_SCHEMA)
+            # Idempotent migration for the two new columns, same
+            # PRAGMA table_info pattern the aiosqlite stores use —
+            # this file predates them, still worth matching the
+            # convention now that it needs its first migration.
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(usage_daily)").fetchall()}
+            for col in ("prompt_tokens", "completion_tokens"):
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE usage_daily ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
             conn.commit()
             _initialized = True
         yield conn
@@ -76,44 +141,109 @@ def _today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def record_usage(provider: str, model: str, requests: int = 0, tokens: int = 0, neurons: float = 0.0) -> None:
+def record_usage(
+    provider: str, model: str, requests: int = 0, tokens: int = 0, neurons: float = 0.0,
+    prompt_tokens: int = 0, completion_tokens: int = 0,
+) -> None:
     """Adds onto today's (UTC) row for (provider, model), creating it if
     this is the first call of the day — the UPSERT itself IS the daily
     reset: a new UTC day means a new row starting from zero, no separate
-    reset job or cron needed for this table specifically."""
+    reset job or cron needed for this table specifically.
+
+    `prompt_tokens`/`completion_tokens` (2026-09-10) are optional and
+    separate from the older flat `tokens` total — a caller that only has
+    the total (or none at all, an old call site) still works exactly as
+    before. When both are given, this also accumulates a real per-
+    reference-model counterfactual cost (usage_reference_costs, one row
+    per reference model — see counterfactual_costs_usd/module docstring)
+    — computed once, here, from real token counts, not re-derived later
+    from the flat total (which can't be split back into input/output)."""
     day = _today_utc()
     with _connect() as conn:
         conn.execute(
             """
-            INSERT INTO usage_daily (provider, model, day_utc, requests, tokens, neurons)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO usage_daily (provider, model, day_utc, requests, tokens, neurons, prompt_tokens, completion_tokens)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(provider, model, day_utc) DO UPDATE SET
                 requests = requests + excluded.requests,
                 tokens = tokens + excluded.tokens,
-                neurons = neurons + excluded.neurons
+                neurons = neurons + excluded.neurons,
+                prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                completion_tokens = completion_tokens + excluded.completion_tokens
             """,
-            (provider, model, day, requests, tokens, neurons),
+            (provider, model, day, requests, tokens, neurons, prompt_tokens, completion_tokens),
         )
+        if prompt_tokens or completion_tokens:
+            for ref, usd in counterfactual_costs_usd(prompt_tokens, completion_tokens).items():
+                conn.execute(
+                    """
+                    INSERT INTO usage_reference_costs (provider, model, day_utc, reference_model, usd)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(provider, model, day_utc, reference_model) DO UPDATE SET
+                        usd = usd + excluded.usd
+                    """,
+                    (provider, model, day, ref, usd),
+                )
         conn.commit()
 
 
 def get_usage_today(provider: str | None = None) -> list[dict]:
     """Today's (UTC) rows, optionally filtered to one provider. Each row:
-    {provider, model, requests, tokens, neurons}."""
+    {provider, model, requests, tokens, neurons, prompt_tokens, completion_tokens}."""
     day = _today_utc()
+    cols = "provider, model, requests, tokens, neurons, prompt_tokens, completion_tokens"
     with _connect() as conn:
         conn.row_factory = sqlite3.Row
         if provider:
             cur = conn.execute(
-                "SELECT provider, model, requests, tokens, neurons FROM usage_daily WHERE day_utc = ? AND provider = ?",
+                f"SELECT {cols} FROM usage_daily WHERE day_utc = ? AND provider = ?",
                 (day, provider),
             )
         else:
             cur = conn.execute(
-                "SELECT provider, model, requests, tokens, neurons FROM usage_daily WHERE day_utc = ?",
+                f"SELECT {cols} FROM usage_daily WHERE day_utc = ?",
                 (day,),
             )
         return [dict(row) for row in cur.fetchall()]
+
+
+def get_savings_summary(days: int = 30) -> dict:
+    """The real, provable number behind "fewer tokens" — real prompt/
+    completion tokens actually used across the last `days` UTC days, and
+    what that same real token volume would have cost against EACH
+    tracked reference model's real published rate. Returns
+    {days, total_requests, total_prompt_tokens, total_completion_tokens,
+    counterfactual_usd: {reference_model: usd, ...}}. Doesn't attempt a
+    real "actual USD spent" figure — most of NAVI's providers are free/
+    near-free tier, so the honest, defensible claim is about token
+    volume against real reference prices, not a real-vs-real dollar
+    comparison that would need per-provider pricing this file doesn't
+    track (a separate, larger piece of work, not this one)."""
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        totals = dict(conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(requests), 0) AS total_requests,
+                COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens,
+                COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens
+            FROM usage_daily
+            WHERE day_utc >= date('now', ?)
+            """,
+            (f"-{days} days",),
+        ).fetchone())
+        cf_rows = conn.execute(
+            """
+            SELECT reference_model, COALESCE(SUM(usd), 0) AS usd
+            FROM usage_reference_costs
+            WHERE day_utc >= date('now', ?)
+            GROUP BY reference_model
+            """,
+            (f"-{days} days",),
+        ).fetchall()
+    totals["days"] = days
+    totals["counterfactual_usd"] = {row["reference_model"]: row["usd"] for row in cf_rows}
+    return totals
 
 
 def record_groq_snapshot(model: str, limit_requests: int | None, remaining_requests: int | None, reset_requests_seconds: float | None) -> None:

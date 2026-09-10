@@ -111,16 +111,14 @@ class Provider(ABC):
         """
         key = (self.name, model)
         _REQUEST_COUNTS[key] = _REQUEST_COUNTS.get(key, 0) + 1
-        # Generic, provider-agnostic persistence for the Usage counters
-        # panel (storage/usage.py) — every provider gets at least a real
-        # request count for free from this one hook. Providers with a
-        # richer real signal (Groq's rate-limit headers, Cloudflare's
-        # per-call Neuron cost, LLM7's token totals) additionally record
-        # that from inside their own _do_chat(), which base.py has no
-        # access to (headers/usage live on the raw HTTP response, not on
-        # ChatResponse). Import here, not at module level, to avoid a
-        # storage -> providers -> storage import cycle risk as this
-        # module grows.
+        # Counts the ATTEMPT, before _do_chat runs — rate limits are
+        # generally enforced server-side the moment a request arrives,
+        # before the response (or failure) is known, so a failed call
+        # still needs to count here, same reasoning _REQUEST_COUNTS'
+        # own docstring already documents. Real prompt/completion TOKEN
+        # counts can only be known after a real response exists, so
+        # those are recorded separately, below, only on success —
+        # this call intentionally only ever contributes `requests`.
         from storage.usage import record_usage
         try:
             record_usage(self.name, model, requests=1)
@@ -144,7 +142,34 @@ class Provider(ABC):
                 tools = None
                 tool_choice = None
 
-        return self._do_chat(model, messages, tools=tools, tool_choice=tool_choice)
+        response = self._do_chat(model, messages, tools=tools, tool_choice=tool_choice)
+
+        # Generic, provider-agnostic real TOKEN persistence (2026-09-10) —
+        # for the Usage counters panel AND the real savings-summary
+        # baseline (storage/usage.py's get_savings_summary). Extracted
+        # from `usage`, which every OpenAI-compatible response includes
+        # unconditionally (confirmed across all 7 transports) — previously
+        # only 2 of 7 providers (cloudflare.py, llm7.py) recorded a token
+        # count anywhere, each from inside its own _do_chat. Centralizing
+        # here closes that gap for all 7 at once, in the one place every
+        # call already funnels through, instead of duplicating this per
+        # transport. requests=0 here on purpose — the attempt was already
+        # counted above, before _do_chat; this call only ever contributes
+        # tokens. A provider with an extra, richer signal beyond token
+        # counts (Cloudflare's Neurons, Groq's rate-limit headers) still
+        # records THAT separately from inside its own _do_chat.
+        usage = (response.raw or {}).get("usage") or {}
+        try:
+            record_usage(
+                self.name, model,
+                tokens=usage.get("total_tokens") or 0,
+                prompt_tokens=usage.get("prompt_tokens") or 0,
+                completion_tokens=usage.get("completion_tokens") or 0,
+            )
+        except Exception:
+            pass  # usage tracking must never break a real chat request
+
+        return response
 
     @abstractmethod
     def _do_chat(

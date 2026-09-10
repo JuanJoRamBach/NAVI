@@ -120,11 +120,11 @@ class CloudflareProvider(Provider):
         usage = data.get("usage") or {}
         # See module docstring — real Neuron cost if this OpenAI-compatible
         # endpoint still exposes it (unverified), a token-count usage_note
-        # (same shape as Groq/Mistral) otherwise. Records SOMETHING either
-        # way — falling all the way through to recording nothing would
-        # silently starve the Usage Counters panel's Cloudflare card of
-        # every call made through this endpoint, not just show a less
-        # precise number.
+        # (same shape as Groq/Mistral) otherwise, just for the human-
+        # readable note below. Real token PERSISTENCE now happens once,
+        # centrally, in providers/base.py's Provider.chat() (2026-09-10) —
+        # this only still records `neurons` directly, Cloudflare's own
+        # extra signal base.py has no way to know about.
         neurons = usage.get("neurons")
         total_tokens = usage.get("total_tokens")
         if neurons is not None:
@@ -133,10 +133,10 @@ class CloudflareProvider(Provider):
             usage_note = f"{usage.get('prompt_tokens', '?')} in / {usage.get('completion_tokens', '?')} out / {total_tokens} total tokens"
         else:
             usage_note = None
-        if neurons is not None or total_tokens is not None:
+        if neurons is not None:
             try:
                 from storage.usage import record_usage
-                record_usage("cloudflare", model, neurons=neurons or 0.0, tokens=total_tokens or 0)
+                record_usage("cloudflare", model, neurons=neurons)
             except Exception:
                 pass
 

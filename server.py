@@ -730,6 +730,20 @@ def usage_counters() -> dict:
     }
 
 
+@app.get("/usage/savings")
+def usage_savings(days: int = 30) -> dict:
+    """The real, provable number behind "get the task done using fewer
+    tokens" (NAVI reliability Stage 0, 2026-09-10) — real prompt/
+    completion tokens actually used across every provider over the last
+    `days` UTC days, and what that same real token volume would have
+    cost against the current flagship from each of OpenAI and Anthropic
+    (GPT-6 Astra, Claude Fable 5.1 — see storage/usage.py's module
+    docstring for why these two, and why this methodology, not a vendor
+    marketing percentage)."""
+    from storage.usage import get_savings_summary
+    return get_savings_summary(days=days)
+
+
 @app.get("/usage/mistral")
 def usage_mistral() -> dict:
     """Separate route, fetched on-demand when the panel's Mistral card is

@@ -111,17 +111,12 @@ class LLM7Provider(Provider):
                 f"{usage.get('prompt_tokens', '?')} in{cached_part} / "
                 f"{usage.get('completion_tokens', '?')} out / {usage['total_tokens']} total tokens"
             )
-            # Real token total against LLM7's confirmed 1M-tokens/24h keyed
-            # pool (see this file's own docstring). NAVI always sends a key
-            # today (self.api_key required by Provider.__init__), so only
-            # the keyed pool ever accumulates here — the separate 500K/24h
-            # anonymous pool is real but unused by NAVI until traffic is
-            # deliberately split, so it's shown, not tracked, in the panel.
-            try:
-                from storage.usage import record_usage
-                record_usage("llm7", model, tokens=usage["total_tokens"])
-            except Exception:
-                pass
+            # Real token PERSISTENCE now happens once, centrally, in
+            # providers/base.py's Provider.chat() (2026-09-10) — no
+            # longer duplicated here. usage_note above is still real and
+            # LLM7-specific (its confirmed 1M-tokens/24h keyed pool, see
+            # this file's own docstring), just no longer paired with its
+            # own separate storage write.
 
         return ChatResponse(
             text=choice.get("content"),
