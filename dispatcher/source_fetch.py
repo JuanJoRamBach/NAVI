@@ -3,10 +3,9 @@ dispatcher/source_fetch.py
 
 Runs the Sources tab's "Batch Dispatch" — one background job that works
 through every search term the user typed in, judges relevance against
-their Trusted Sites registry, and saves a document per real find. Same
-shape as dispatcher/executor.py's _run_research_gather_phase: try the
-configured primary/fallback chain in order, run the tool-calling loop,
-report what happened.
+their Trusted Sites registry, and saves a document per real find. Tries
+the configured primary/fallback chain in order, runs the tool-calling
+loop, reports what happened.
 
 Key difference from every other tool-calling caller in this codebase:
 save_source's side effect (writing a document + DB row) happens INSIDE
@@ -62,7 +61,7 @@ def run_source_fetch_batch(terms: list[str], trusted_sites: list[str]) -> str:
     """The actual work, run synchronously — call this from a background
     thread (see start_source_fetch_batch below), never from a request
     handler directly; a multi-term batch with real web fetches is too
-    slow to hold an HTTP request open for, same reasoning as /research.
+    slow to hold an HTTP request open for.
     Returns the batch_id immediately... no wait, this IS the blocking
     part; start_source_fetch_batch is what returns immediately."""
     batch_id = create_batch()

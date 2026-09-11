@@ -2,9 +2,9 @@
 tools/registry.py
 
 The callable tool belt exposed to provider chat calls (OpenAI-compatible
-"tools" schema — both Groq and OpenRouter speak this format). Wired in for
-/research at minimum, per the brief; other commands can opt in later by
-passing the same TOOL_SCHEMAS list.
+"tools" schema — both Groq and OpenRouter speak this format). Any
+command or chat mode can opt in by passing the same TOOL_SCHEMAS list
+(or a scoped subset via schemas_for).
 
 dispatch() is the single entry point the executor calls when a model
 response comes back with tool_calls — it maps a tool name + arguments to

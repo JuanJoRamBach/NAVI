@@ -17,7 +17,7 @@ the same output. Three possible results:
 import re
 from dataclasses import dataclass
 
-COMMANDS = ["research", "graph-data", "summarize", "recap", "note", "remind"]
+COMMANDS = ["graph-data", "summarize", "recap", "note", "remind"]
 
 # Max edit distance to flag as a "near miss" worth confirming.
 # Slash-prefixed typos (e.g. "/cade") are a strong command-intent signal,

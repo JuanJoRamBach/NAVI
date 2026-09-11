@@ -244,20 +244,6 @@ DEFAULTS = {
         # command gets a primary (provider, model) and an ordered fallback
         # chain. When one fails, the executor rotates through the fallback
         # list and flags the step as degraded in the final reply.
-        "research": {
-            # Staged trial on Ollama Cloud (2026-08-17): minimax-m3:cloud this
-            # week, then gemma4:31b-cloud — swap the model string below to
-            # rotate. deepseek-v4-flash:cloud was the original third candidate
-            # but returned 403 "requires a subscription" on this account when
-            # tested directly, so it's dropped from the trial entirely, not
-            # just deprioritized. Picking a permanent winner once real usage
-            # (via Ollama's /api/usage) shows which one actually holds up.
-            # No fallback configured on purpose: a failure here IS the signal
-            # we're trying to observe, not something to mask behind an
-            # equally-untested backup.
-            "primary": {"provider": "ollama_cloud", "model": "minimax-m3:cloud"},
-            "fallback": [],
-        },
         "graph-data": {
             # Verified against OpenRouter's live /api/v1/models on 2026-08-17 —
             # free pricing AND supports the "tools" param (required for the
@@ -866,6 +852,20 @@ def _migrate_remove_retired_commands():
 
 
 _migrate_remove_retired_commands()
+
+
+def _migrate_remove_research_command():
+    """One-time cleanup (2026-09-11): the /research command is retired —
+    JuanJo's call, redundant with Research chat mode and repeatedly
+    conflated with it in discussion. Same pattern as
+    _migrate_remove_retired_commands above."""
+    if config.get("migrated_remove_research_command"):
+        return
+    config.remove_task_routing("research")
+    config.set("migrated_remove_research_command", True)
+
+
+_migrate_remove_research_command()
 
 
 def _migrate_add_source_fetch_routing():

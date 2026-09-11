@@ -2,11 +2,8 @@
 dispatcher/mode_briefs.py
 
 Loads system prompt + allowed-tools list from the .md briefs in
-dispatcher/modes/ — both the user-selectable chat modes (get_mode_brief,
-keyed by MODE_FILES) and internal pipeline-phase briefs that aren't a
-chat mode at all, like /research's GATHERING.md and ANALYSIS.md
-(get_phase_brief, loaded directly by filename). Each file starts with a
-small frontmatter block:
+dispatcher/modes/ — the user-selectable chat modes, keyed by MODE_FILES
+(get_mode_brief). Each file starts with a small frontmatter block:
 
     ---
     tools: [web_search, fetch_page]
@@ -86,12 +83,3 @@ def get_mode_brief(mode: str) -> ModeBrief:
     if key not in _cache:
         _cache[key] = _load_brief_file(MODE_FILES[key])
     return _cache[key]
-
-
-def get_phase_brief(filename: str) -> ModeBrief:
-    """Loads a brief file directly by its filename, for internal pipeline
-    phases — currently /research's GATHERING.md and ANALYSIS.md — that
-    aren't user-selectable chat modes and so don't belong in MODE_FILES."""
-    if filename not in _cache:
-        _cache[filename] = _load_brief_file(filename)
-    return _cache[filename]

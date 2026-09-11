@@ -65,7 +65,6 @@ from dispatcher.devslate_chat import run_devslate_turn
 from dispatcher.executor import format_summary, run_chain
 from dispatcher.parser import COMMANDS, ParseResult, parse_message
 from dispatcher.reminders import due_reminders, mark_delivered
-from dispatcher.research_status import get_status, set_status
 from tools.telegram_send import TelegramSendError, send_to_telegram
 from messaging.base import IncomingMessage, MessagingAdapter, MessagingError
 from messaging.discord import DiscordAdapter
@@ -130,8 +129,8 @@ PWA_CORS_ORIGINS = [
 # Gates GET /files/<path> — unlike Telegram (which gets real file
 # attachments via sendDocument) the PWA has no attachment channel of its
 # own, so a saved artifact reaches it as a plain download URL embedded
-# in the reply text. That endpoint serves real document content (research,
-# recaps, tailored CVs), not just reminder text like the other
+# in the reply text. That endpoint serves real document content (recaps,
+# tailored CVs), not just reminder text like the other
 # unauthenticated routes — worth a real credential, not just an
 # unguessable path. Fails closed: if this isn't set, every request 403s
 # rather than silently serving without a check.
@@ -139,8 +138,8 @@ NAVI_FILES_TOKEN = os.environ.get("NAVI_FILES_TOKEN")
 
 # Conservative — Web Push payloads are capped around 4KB total by the
 # push service itself (title + body + JSON overhead + encryption), not
-# something we control. A long /research report gets split across
-# several pushes rather than silently failing to deliver — same idea as
+# something we control. A long report gets split across several pushes
+# rather than silently failing to deliver — same idea as
 # TelegramAdapter's own 4096-char chunking, just a smaller ceiling.
 PUSH_CHUNK_SIZE = 3000
 
@@ -537,10 +536,6 @@ def _handle_parse_result(
             for r in results if r.image_bytes
         ]
         attachments += [
-            (r.text.encode("utf-8"), f"{r.step.command}.md", "")
-            for r in results if r.snippet and r.text
-        ]
-        attachments += [
             (r.rendered_file_bytes, r.rendered_file_name, "")
             for r in results if r.rendered_file_bytes and r.rendered_file_name
         ]
@@ -596,23 +591,6 @@ def _deliver_via_push(title: str, text: str) -> None:
             send_push(chunk_title, chunk)
         except PushError:
             pass
-
-
-def _run_research_async(result: ParseResult) -> None:
-    """Runs a /research command chain in the background — see /chat/send,
-    which acks immediately rather than blocking on this (gathering plus
-    up to 3 minutes of synthesis retries is too long to hold an HTTP
-    request open). Delivers the finished result via push; dispatcher/
-    research_status.py carries live progress in the meantime."""
-    try:
-        results = run_chain(result.steps)
-        text = format_summary(results) + _pwa_download_links(results)
-    except Exception as e:
-        set_status(None)
-        _deliver_via_push("NAVI — research failed", f"Something went wrong: {e}")
-        return
-    set_status(None)
-    _deliver_via_push("NAVI — research ready", text)
 
 
 # ---- Plain routes (behavior identical to the pre-migration stdlib version) ----
@@ -783,8 +761,8 @@ def usage_mistral() -> dict:
 @app.post("/sources/batch")
 async def sources_batch_start(request: Request) -> JSONResponse:
     """Kicks off the Sources tab's Batch Dispatch in the background —
-    acks immediately, same reasoning as /research (a multi-term batch of
-    real web fetches is too slow to hold the HTTP request open for).
+    acks immediately since a multi-term batch of real web fetches is
+    too slow to hold the HTTP request open for.
     `trusted_sites` is sent by the caller on every request rather than
     read from server-side state, because the registry itself currently
     only lives in the PWA's own localStorage (navi-pwa/src/
@@ -874,14 +852,6 @@ def sources_delete(doc_id: str) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
-@app.get("/research/status")
-def research_status() -> dict:
-    """Polled by the PWA while an async /research job runs in the
-    background — see dispatcher/research_status.py. `status` is null
-    when nothing's in flight."""
-    return {"status": get_status()}
-
-
 @app.get("/reminders/check")
 def reminders_check() -> dict:
     """Hit periodically by a GitHub Actions cron (see
@@ -911,8 +881,8 @@ def reminders_check() -> dict:
 @app.get("/files/{relative_path:path}")
 def file_download(relative_path: str, token: str | None = None, render: str | None = None) -> Response:
     """Serves a saved Filen artifact back down — the only way a rendered
-    document or /research report reaches the PWA, which has no real
-    attachment channel the way Telegram's sendDocument does. Fails
+    document reaches the PWA, which has no real attachment channel the
+    way Telegram's sendDocument does. Fails
     closed on a missing/wrong token rather than falling back to open
     access, since this serves real document content.
 
@@ -1002,13 +972,6 @@ async def chat_send(request: Request) -> JSONResponse:
     if not text:
         return JSONResponse({"error": "missing 'text'"}, status_code=400)
     result = parse_message(text)
-
-    if result.kind == "commands" and any(s.command == "research" for s in result.steps):
-        threading.Thread(target=_run_research_async, args=(result,), daemon=True).start()
-        return JSONResponse({
-            "reply": "Researching — I'll ping you when it's ready. Feel free to keep chatting.",
-            "async": True,
-        })
 
     if result.kind == "plain_chat":
         if not conversation_id:
@@ -1360,9 +1323,9 @@ async def agent_webhook_trigger(token: str, request: Request) -> JSONResponse:
     unguessable token in the path is the real credential here, checked
     against get_workflow_by_webhook_token before anything else happens.
 
-    Acks immediately and runs the workflow async — Stripe-style, same
-    pattern /research already uses — UNLESS the graph contains a Respond
-    to Webhook node (2026-09-07), in which case this holds the HTTP
+    Acks immediately and runs the workflow async — Stripe-style — UNLESS
+    the graph contains a Respond to Webhook node (2026-09-07), in which
+    case this holds the HTTP
     connection open and waits for that node to actually run
     (start_webhook_run only registers the wait in that case — see its
     own call to register_response_waiter; a workflow with no such node

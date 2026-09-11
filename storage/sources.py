@@ -16,10 +16,11 @@ meant to ever be used as real chat context — see server.py's routes for
 where that gate actually lives.
 
 Sync sqlite3, not aiosqlite — dispatcher/source_fetch.py runs inside a
-plain background thread (same "threading.Thread, not asyncio.create_task"
-reasoning as server.py's own research dispatch), calling into the same
-synchronous provider/tool-loop chain as every other dispatcher module —
-no asyncio anywhere in that call chain to hang off of.
+plain background thread ("threading.Thread, not asyncio.create_task",
+same reasoning as server.py's other background dispatches), calling
+into the same synchronous provider/tool-loop chain as every other
+dispatcher module — no asyncio anywhere in that call chain to hang
+off of.
 """
 
 import sqlite3
@@ -120,7 +121,7 @@ def latest_batch() -> dict | None:
     dispatcher/source_fetch.py's start_source_fetch_batch) to know
     whether Batch Dispatch is currently running. Single-user software:
     there's only ever meaningfully one batch "the one you're waiting on"
-    at a time, same reasoning as dispatcher/research_status.py."""
+    at a time."""
     with _connect() as conn:
         row = conn.execute("SELECT * FROM source_batches ORDER BY created_at DESC LIMIT 1").fetchone()
         return dict(row) if row else None
