@@ -39,8 +39,9 @@ from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ChatResponse, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
 from storage.agent_work import (
-    complete_step, create_step, create_run, due_workflows, get_workflow,
-    get_workflow_by_webhook_token, set_step_input, update_run_status, update_workflow_trigger,
+    complete_step, create_step, create_run, due_workflows, get_run, get_run_graph_snapshot,
+    get_run_steps, get_workflow, get_workflow_by_webhook_token, list_runs, set_step_input,
+    update_run_status, update_workflow_trigger,
 )
 from tools.documents import DocumentRenderError, render_pdf
 from tools.gmail_send import GmailSendError, send_gmail_message
@@ -916,12 +917,38 @@ async def _execute_run(run_id: str, graph: dict, initial_outputs: dict[str, str]
     # unchanged from before this feature existed. A node INSIDE a fan-out
     # group keys each iteration's output under "<node_id>#<item_index>",
     # since it genuinely produces one output per item, not one overall.
-    # Pre-seeded from outside the graph entirely — currently only a
-    # webhook trigger's incoming payload (2026-09-07), set before this
-    # function is even called (see start_webhook_run). Copied, not
-    # aliased, so mutating `outputs` below never reaches back into the
-    # caller's dict.
-    outputs: dict[str, str] = dict(initial_outputs or {})
+    # Pre-seeded from outside the graph entirely — a webhook trigger's
+    # incoming payload (2026-09-07, set before this function is even
+    # called, see start_webhook_run) or a crash-recovery resume's
+    # already-completed steps (2026-09-11, see resume_run below). Copied,
+    # not aliased, so mutating `outputs` below never reaches back into
+    # the caller's dict.
+    #
+    # Not every pre-seeded key is safe to treat as "skip this node" even
+    # when present, though — three real correctness traps below, all of
+    # them because the branch that skips a pre-seeded node (further down,
+    # `if node["id"] in outputs:`) never runs the side bookkeeping the
+    # "actually executed" branch does:
+    #   - a choose_path node's OWN not-taken-branch pruning only happens
+    #     when it actually runs (is_choose_path block below) — skip it
+    #     and a downstream node reachable only through the untaken branch
+    #     never gets marked skipped, so it wrongly tries to run.
+    #   - same shape for a node with its own outgoing error edges: the
+    #     "succeeded, prune the unused error edge(s)" step only happens
+    #     when it actually runs.
+    #   - a fan-out group member's real per-item composite keys
+    #     ("<node_id>#<item>") can't be reconstructed from one plain-
+    #     keyed pre-seeded value — resuming with just the plain key would
+    #     silently give every item the SAME (probably wrong) value.
+    # Filtered here, not in each caller, so every caller (today's webhook
+    # seeding, resume_run, any future one) gets this safety without
+    # needing to know NAVI's own graph internals to compute it.
+    _unsafe_to_skip = {n["id"] for n in order if n.get("kind") == "choose_path"}
+    _unsafe_to_skip |= set(error_edges_by_node.keys())
+    _unsafe_to_skip |= set(node_group.keys())
+    outputs: dict[str, str] = {
+        k: v for k, v in (initial_outputs or {}).items() if k not in _unsafe_to_skip
+    }
     seq = 0
 
     await update_run_status(run_id, "running")
@@ -1078,6 +1105,142 @@ async def _execute_run(run_id: str, graph: dict, initial_outputs: dict[str, str]
 
 def _execute_run_thread(run_id: str, graph: dict, initial_outputs: dict[str, str] | None = None) -> None:
     asyncio.run(_execute_run(run_id, graph, initial_outputs))
+
+
+# --- Crash-safe resume (NAVI reliability Stage 1, 2026-09-11) ---
+#
+# _execute_run runs in a daemon thread, not a separate process — if the
+# whole server process dies (crash, restart, Lightsail reboot), any run
+# still mid-flight is simply gone with nothing to notice or continue it.
+# A run stuck at status="running" with no thread actually executing it
+# can only mean that happened; resume_run picks it back up.
+#
+# Real, verified research behind the two constants below (not guessed —
+# see IDEAS.md's Stage 1 section for the sources): Temporal and Azure
+# Durable Functions both really do trust a completed activity's result
+# unconditionally on replay, no re-run, no staleness check — that's
+# _execute_run's existing `if node["id"] in outputs: skip` path (built
+# for webhook-payload seeding, reused here unchanged). But a separate,
+# real finding (not the same framework's own guidance) flags that
+# blindly trusting checkpointed state without revalidation is a
+# documented failure mode specifically for agentic systems pulling in
+# live external data — which is exactly what web_search/fetch_page are.
+# So those two kinds always re-run on resume regardless of how much time
+# passed, no threshold to tune or get wrong; every other completed kind
+# is trusted the Temporal/Durable-Functions way.
+_ALWAYS_RERUN_ON_RESUME_KINDS = {"web_search", "fetch_page"}
+
+# A step with no `finished_at` was genuinely mid-flight when the crash
+# hit — for most kinds that's safe to just re-run (nothing to duplicate).
+# These three have a real external side effect: if the crash landed
+# between the action firing and NAVI recording that it finished, there's
+# no way to tell from persisted data alone whether it already happened.
+# Guessing either way risks either silently duplicating a sent
+# email/message or silently dropping a step that never actually ran —
+# both worse than stopping and saying so.
+_AMBIGUOUS_SIDE_EFFECT_KINDS = {"send_email", "send_to_telegram", "save_note"}
+
+# A run older than this with no scan yet ever having resumed it is
+# vanishingly unlikely to still be genuinely, actively executing —
+# real NAVI node calls (an LLM turn, a tool call) finish in seconds to
+# low minutes, not stay silent for 15. Exists so the periodic re-scan
+# below can't mistake a run that's simply taking a while for an orphaned
+# one — the startup scan doesn't need this (nothing could possibly still
+# be running from before THIS process even started).
+_ORPHAN_GRACE_SECONDS = 15 * 60
+
+
+async def resume_run(run_id: str) -> bool:
+    """Re-executes a crash-orphaned run's remaining work, real API calls
+    and all — not simulated. Re-runs against the run's OWN frozen
+    graph_snapshot (never the live workflow definition, which may have
+    been edited since the crash — see storage/agent_work.py's create_run
+    docstring on why that's frozen at creation) and seeds every safely-
+    reusable completed step's real output, so _execute_run's own
+    pre-seeded-output skip path does the actual "don't redo finished
+    work" — this function's only real job is deciding what's SAFE to
+    seed. Returns True if it actually resumed something, False if this
+    run turned out not to need it (already resolved by the time this
+    ran, or genuinely still in progress)."""
+    run = await get_run(run_id)
+    if not run or run["status"] != "running":
+        return False  # already resolved some other way — not this function's job
+
+    graph = await get_run_graph_snapshot(run_id)
+    if graph is None:
+        await update_run_status(
+            run_id, "failed",
+            error="Crash-recovery: no saved graph snapshot for this run — can't safely resume it.",
+        )
+        return True
+
+    steps = await get_run_steps(run_id)
+    nodes_by_id = {n["id"]: n for n in graph.get("nodes", [])}
+
+    initial_outputs: dict[str, str] = {}
+    for step in steps:
+        if step["finished_at"] is None:
+            # Started, never recorded as finished — the crash hit here.
+            node = nodes_by_id.get(step["node_id"], {})
+            if node.get("kind") in _AMBIGUOUS_SIDE_EFFECT_KINDS:
+                await update_run_status(
+                    run_id, "failed",
+                    error=(
+                        f"Crash-recovery: node '{step['node_id']}' (kind={node.get('kind')}) was "
+                        "mid-flight when NAVI stopped — it may have already sent a real message/email, "
+                        "so this run was NOT auto-resumed. Check its status and re-run manually if needed."
+                    ),
+                )
+                return True
+            continue  # safe to just re-run — leave it out of initial_outputs
+        if step["status"] != "completed":
+            continue  # a real failure — re-running won't help, let the resumed walk hit it fresh
+        node = nodes_by_id.get(step["node_id"], {})
+        if node.get("kind") in _ALWAYS_RERUN_ON_RESUME_KINDS:
+            continue  # completed, but re-fetch rather than trust a possibly-stale result
+        if step["output"] is not None:
+            initial_outputs[step["node_id"]] = step["output"]
+
+    # _execute_run's own topology-safety filter (choose_path, error
+    # edges, fan-out membership) still applies on top of this — this
+    # function doesn't need to know NAVI's graph internals to get those
+    # right, see the comment where that filter lives.
+    threading.Thread(target=_execute_run_thread, args=(run_id, graph, initial_outputs), daemon=True).start()
+    return True
+
+
+async def resume_orphaned_runs(require_grace_period: bool = True) -> int:
+    """Scans for runs stuck at status="running" and resumes each. Called
+    once, unconditionally, at server startup (server.py) — nothing from
+    before this process started could possibly still be genuinely
+    executing, so no grace period needed there. ALSO registered as a
+    periodic job (server.py, same cadence as check_due_agent_workflows)
+    with the grace period on, to catch the other real failure mode a
+    pure startup scan misses entirely: _execute_run's background THREAD
+    dying (an unhandled exception) while the server process stays alive
+    — no restart happens, so nothing would otherwise ever notice. Returns
+    how many runs it actually resumed."""
+    orphaned = await list_runs(status="running")
+    resumed = 0
+    for run in orphaned:
+        if require_grace_period:
+            # Real bug caught before this ever ran live: the grace period
+            # has to measure time since the LAST STEP ACTIVITY, not since
+            # the run started — a genuinely healthy multi-step run can
+            # easily take longer than the grace period in total. Using
+            # run["started_at"] here would make the periodic scan fire a
+            # SECOND execution thread on top of a still-alive one for any
+            # long-running workflow — a real duplicate-execution bug, not
+            # a hypothetical one.
+            steps = await get_run_steps(run["id"])
+            last_activity = run["started_at"]
+            for step in steps:
+                last_activity = max(last_activity, step["finished_at"] or step["started_at"])
+            if (time.time() - last_activity) < _ORPHAN_GRACE_SECONDS:
+                continue
+        if await resume_run(run["id"]):
+            resumed += 1
+    return resumed
 
 
 async def start_run(

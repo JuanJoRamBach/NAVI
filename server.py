@@ -53,7 +53,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse,
 
 from dispatcher.agent_work import (
     WEBHOOK_RESPONSE_TIMEOUT_SECONDS, WorkflowError, check_due_workflows, discard_webhook_waiter,
-    peek_webhook_waiter, request_run_cancellation, set_webhook_trigger, start_webhook_run, start_workflow_run,
+    peek_webhook_waiter, request_run_cancellation, resume_orphaned_runs, set_webhook_trigger,
+    start_webhook_run, start_workflow_run,
 )
 from dispatcher.mcp_client import MCPError, approve_tools, discover_tools
 from dispatcher.mcp_oauth import MCPOAuthError, exchange_code_for_token, start_authorization
@@ -426,6 +427,17 @@ async def _start_background_scheduler() -> None:
     # hour during the ~1-week EU/US DST-changeover gap in late Oct/early
     # Nov since the two regions switch on different dates — known, not a bug.
     register_job("refresh_model_ranking_snapshot", "45 4 * * *", _refresh_model_ranking_snapshot)
+    # NAVI reliability Stage 1 (2026-09-11) — crash-safe resume. No grace
+    # period here: this fires once, right as THIS process boots, so
+    # nothing a "running" row could be referring to could possibly still
+    # be alive to interrupt. Same 5-minute cadence as the due-workflow
+    # check covers the other real failure mode (a run's background
+    # thread dying without the whole process restarting) — see
+    # resume_orphaned_runs's own docstring.
+    resumed = await resume_orphaned_runs(require_grace_period=False)
+    if resumed:
+        print(f"[startup] crash-recovery: resumed {resumed} orphaned agent run(s)")
+    register_job("resume_orphaned_agent_runs", "*/5 * * * *", resume_orphaned_runs)
     start_scheduler()
 
 
@@ -1061,12 +1073,17 @@ def config_models(task: str = Query(...)) -> dict:
     current = {"provider": current_role["provider"], "model": current_role["model"]} if current_role else None
 
     if not snapshot:
-        return {"task": task, "current": current, "candidates": [current] if current else []}
+        return {"task": task, "current": current, "candidates": [current] if current else [], "fetched_at": None}
 
     aa_index = fetch_aa_benchmarks(None)  # cache-only — no live fetch from a GET handler
     candidates = list_candidates(task, snapshot.get("catalog", []), aa_index)
     return {
         "task": task,
+        # Real, honest freshness signal (2026-09-11) — lets anyone check
+        # whether the daily 04:45 UTC refresh job (server.py's own
+        # startup hook) is actually firing on THIS live instance, rather
+        # than assuming from the code alone that it must be.
+        "fetched_at": snapshot.get("fetched_at"),
         "current": current,
         # quality/speed (2026-09-06) are the same real numbers
         # list_candidates ranks by, not new computation here — lets the

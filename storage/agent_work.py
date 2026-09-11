@@ -472,6 +472,25 @@ async def get_run(run_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+async def get_run_graph_snapshot(run_id: str) -> dict | None:
+    """The run's own frozen graph (see create_run's docstring on why this
+    is separate from get_run — a potentially large JSON blob most callers
+    of get_run don't need). Used by dispatcher/agent_work.py's
+    resume_run() to re-execute a crash-orphaned run against the exact
+    graph it actually started with, never the live workflow definition,
+    which may have been edited since. None for a pre-2026-09-08 run
+    (before graph_snapshot existed) or a run with no workflow_id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        async with db.execute(
+            "SELECT graph_snapshot FROM agent_runs WHERE id = ?", (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+    if not row or not row[0]:
+        return None
+    return json.loads(row[0])
+
+
 async def list_runs(workflow_id: str | None = None, status: str | None = None, limit: int = 50) -> list[dict]:
     query = "SELECT id, workflow_id, status, trigger_source, started_at, finished_at, error FROM agent_runs WHERE 1=1"
     params: list = []
