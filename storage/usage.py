@@ -110,6 +110,12 @@ CREATE TABLE IF NOT EXISTS groq_rate_snapshots (
     reset_requests_seconds REAL,
     updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tool_calls_daily (
+    tool_name TEXT NOT NULL,
+    day_utc TEXT NOT NULL,
+    calls INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (tool_name, day_utc)
+);
 """
 
 _initialized = False
@@ -274,5 +280,52 @@ def get_groq_snapshots() -> list[dict]:
         conn.row_factory = sqlite3.Row
         cur = conn.execute(
             "SELECT model, limit_requests, remaining_requests, reset_requests_seconds, updated_at FROM groq_rate_snapshots"
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def record_tool_call(tool_name: str) -> None:
+    """Real per-tool dispatch frequency (2026-09-11) — deliberately
+    separate from record_usage above, since tools/registry.py's dispatch()
+    runs entirely dispatcher-side (a real web search, an MCP call) with
+    ZERO LLM token cost of its own; this answers "whenever the dispatcher
+    uses which tools," a genuinely different question from the token/cost
+    tracking record_usage answers. Counts every dispatch attempt,
+    regardless of whether it then succeeds or raises — same "count the
+    attempt, not just the success" reasoning record_usage's own `requests`
+    counter already uses, since the dispatcher genuinely did route to this
+    tool either way. Never called for ask_user_choice (intercepted before
+    dispatch() is ever reached — see tools/registry.py's own comment)."""
+    day = _today_utc()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO tool_calls_daily (tool_name, day_utc, calls)
+            VALUES (?, ?, 1)
+            ON CONFLICT(tool_name, day_utc) DO UPDATE SET calls = calls + 1
+            """,
+            (tool_name, day),
+        )
+        conn.commit()
+
+
+def get_most_used_tools(days: int = 30, limit: int = 10) -> list[dict]:
+    """Real dispatch frequency per tool over the window, most-called
+    first — the tool-side sibling of the "most used models + providers"
+    idea (IDEAS.md, 2026-09-11): same kind of empirical usage signal,
+    just for which tools the dispatcher actually reaches for rather than
+    which models answer. Returns [{tool_name, calls}, ...]."""
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            """
+            SELECT tool_name, SUM(calls) AS calls
+            FROM tool_calls_daily
+            WHERE day_utc >= date('now', ?)
+            GROUP BY tool_name
+            ORDER BY calls DESC
+            LIMIT ?
+            """,
+            (f"-{days} days", limit),
         )
         return [dict(row) for row in cur.fetchall()]

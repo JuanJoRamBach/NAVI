@@ -744,6 +744,18 @@ def usage_savings(days: int = 30) -> dict:
     return get_savings_summary(days=days)
 
 
+@app.get("/usage/tools")
+def usage_tools(days: int = 30, limit: int = 10) -> dict:
+    """Real per-tool dispatch frequency (2026-09-11) — which tools the
+    DISPATCHER actually reaches for (tools/registry.py's dispatch(), both
+    NAVI's own tools and MCP calls), not an LLM-token number: dispatcher-
+    executed tool calls cost zero LLM tokens by definition, so this is a
+    usage-frequency signal, the tool-side sibling of a future "most used
+    models" view, not part of the savings math above."""
+    from storage.usage import get_most_used_tools
+    return {"days": days, "most_used": get_most_used_tools(days=days, limit=limit)}
+
+
 @app.get("/usage/mistral")
 def usage_mistral() -> dict:
     """Separate route, fetched on-demand when the panel's Mistral card is

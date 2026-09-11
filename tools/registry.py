@@ -346,6 +346,16 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
     topic_slug for save_note, so notes land in the same Filen folder as
     the step's final output.
     """
+    # Real per-tool dispatch frequency (2026-09-11) — isolated in its own
+    # try/except, same pattern providers/base.py's Provider.chat() already
+    # uses for record_usage, so a tracking failure can never break the
+    # actual tool call below it.
+    try:
+        from storage.usage import record_tool_call
+        record_tool_call(name)
+    except Exception:
+        pass
+
     try:
         if is_mcp_tool(name):
             # Routed, never executed inline here — dispatcher/mcp_client.py
