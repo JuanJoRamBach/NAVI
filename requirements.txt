@@ -5,6 +5,7 @@ py-vapid
 fpdf2
 python-docx
 python-pptx
+docxtpl
 fastapi
 uvicorn[standard]
 aiosqlite

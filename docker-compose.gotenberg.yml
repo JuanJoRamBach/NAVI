@@ -1,0 +1,39 @@
+# docker-compose.gotenberg.yml
+#
+# Self-hosted document-conversion service (see IDEAS.md's "Document
+# generation & viewing stack" section for the research behind this
+# choice). Runs alongside the main NAVI process on the same Lightsail
+# VPS — NOT part of the app's own Python process, a separate container.
+#
+# Bring up:      docker compose -f docker-compose.gotenberg.yml up -d
+# Health check:  curl http://localhost:3000/health
+# Point NAVI at it via the GOTENBERG_URL env var (tools/report_render.py),
+# e.g. GOTENBERG_URL=http://localhost:3000
+#
+# Real maintenance this takes on, so it's not a black box:
+# - Security patches: Gotenberg bundles LibreOffice + Chromium — pin the
+#   image tag below and bump it deliberately every so often, the same
+#   way any dependency gets updated, rather than tracking `:latest`.
+# - It's a second process to notice if it's down: no request will fail
+#   loudly if this one container dies (report_render.py's
+#   convert_docx_to_pdf just raises ReportRenderError — the DOCX itself
+#   still works fine, only the "give me a PDF too" path is affected).
+# - Resource footprint: bundles a full LibreOffice + headless Chromium,
+#   real memory use under load — worth watching on a small instance if
+#   PDF conversion becomes a frequent, not occasional, path.
+services:
+  gotenberg:
+    image: gotenberg/gotenberg:8
+    restart: unless-stopped
+    ports:
+      # Bound to localhost only — Gotenberg has NO built-in
+      # authentication, so publicly exposing 3000 would let anyone
+      # convert documents through your server for free, or worse, feed
+      # it arbitrary HTML/URLs to fetch (a real SSRF surface). Only the
+      # NAVI app process on this same box needs to reach it.
+      - "127.0.0.1:3000:3000"
+    # Real ceiling so one malformed/huge document can't hang the
+    # container indefinitely and block every other conversion behind it.
+    command:
+      - "gotenberg"
+      - "--api-timeout=60s"
