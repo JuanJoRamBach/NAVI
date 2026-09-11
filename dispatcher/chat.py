@@ -398,3 +398,106 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
     error_text = f"⚠️ {role_context} failed on every configured provider: {last_error}"
     await append_message(conversation_id, "navi", error_text)
     return {"text": error_text, "provider": None, "model": None}
+
+
+async def run_agent_vault_chat(agent: dict, conversation_id: str, text: str) -> dict:
+    """Persisted chat with one specific saved agent (Agent Vault) — sibling
+    of run_stored_mode_chat above, but the system prompt/tools come from
+    the agent's OWN row (storage/agents.py) instead of a fixed mode brief,
+    closing the gap AgentVaultChat.tsx's own header comment flagged
+    (2026-09-10: it was posting through agent_work's generic /chat/send,
+    same brief/tools/model as every other Agent Work chat, regardless of
+    which saved agent's window it was). Keeps full history (unlike
+    agent_work's deliberately stateless design above) — a saved-agent
+    chat is an ongoing conversation with that one agent, not a one-shot
+    "build this" instruction.
+    """
+    await append_message(conversation_id, "user", text)
+    history = await get_messages(conversation_id, limit=RECENT_MESSAGE_WINDOW)
+
+    tools = schemas_for(agent["tools"]) if agent["tools"] else None
+    system_parts = [agent["instructions"]]
+    if tools:
+        system_parts.append(CITATION_STYLE_PROMPT)
+    messages = [ChatMessage(role="system", content="\n\n".join(system_parts))]
+    for m in history:
+        if m["role"] == "navi" and m["content"].startswith("⚠️"):
+            continue
+        messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
+    messages[-1].content = f"{messages[-1].content}\n\n[Current UTC time: {datetime.now(timezone.utc).isoformat()}]"
+
+    try:
+        role = get_dispatcher_role(context="agent_work")
+    except ProviderNotConfigured as e:
+        error_text = f"⚠️ Can't reply right now — agent_work isn't configured: {e}"
+        await append_message(conversation_id, "navi", error_text)
+        return {"text": error_text, "provider": None, "model": None}
+
+    # A pinned model on the agent's own row (storage/agents.py's `model`
+    # field — always null today, no UI sets one yet, see AgentVault.tsx)
+    # takes priority over the shared agent_work role's own primary, but
+    # still falls back through that role's configured chain if it fails —
+    # same "extend, don't replace, the fallback chain" pattern the model
+    # picker below (ModelBadge, still wired to the shared role) relies on.
+    primary = {"provider": role["provider"], "model": role["model"]}
+    if agent.get("model") and "/" in agent["model"]:
+        pinned_provider, pinned_model = agent["model"].split("/", 1)
+        primary = {"provider": pinned_provider, "model": pinned_model}
+    attempts = config.get_attempts([primary] + role.get("fallback", []))
+    last_error = None
+    for i, attempt in enumerate(attempts):
+        try:
+            provider = get_provider(attempt["provider"])
+        except Exception as e:
+            last_error = str(e)
+            continue
+        try:
+            sent_messages = messages
+            response = await asyncio.to_thread(provider.chat, model=attempt["model"], messages=messages, tools=tools)
+            choice_call = next((tc for tc in response.tool_calls if tc.name == "ask_user_choice"), None)
+            if choice_call:
+                args = _parse_tool_args(choice_call.arguments)
+                question = args.get("question", "")
+                options = args.get("options") or []
+                await append_message(conversation_id, "navi", question, provider=attempt["provider"], model=attempt["model"])
+                return {
+                    "text": question, "provider": attempt["provider"], "model": attempt["model"],
+                    "usage_note": response.usage_note, "choices": options,
+                }
+            if tools and response.tool_calls:
+                response, sent_messages, iterations = await asyncio.to_thread(
+                    run_tool_loop, provider, attempt["model"], messages, response,
+                    context={"command": "chat-agent_vault", "topic_slug": "chat"}, tools=tools,
+                )
+                if iterations > 0 and not response.text and not response.tool_calls:
+                    reply = "Done — the action completed, but I didn't get a summary back."
+                    await append_message(conversation_id, "navi", reply, provider=attempt["provider"], model=attempt["model"])
+                    return {"text": reply, "provider": attempt["provider"], "model": attempt["model"], "usage_note": response.usage_note}
+            if not response.text and not response.tool_calls:
+                last_error = f"{attempt['provider']}/{attempt['model']} returned neither text nor a tool call"
+                await asyncio.to_thread(
+                    save_failed_exchange, "agent_vault", attempt["provider"], attempt["model"],
+                    sent_messages, last_error, response.raw,
+                )
+                continue
+            if not response.text and sent_messages is not messages:
+                reply = _extract_tool_results(sent_messages) or "(empty reply)"
+            else:
+                reply = response.text or "(empty reply)"
+            reply = _collapse_repeated_paragraphs(reply)
+            if i > 0:
+                reply += f"\n\n⚡ (primary was unavailable, answered via {attempt['provider']}/{attempt['model']} instead)"
+            await append_message(conversation_id, "navi", reply, provider=attempt["provider"], model=attempt["model"])
+            return {"text": reply, "provider": attempt["provider"], "model": attempt["model"], "usage_note": response.usage_note}
+        except ProviderError as e:
+            last_error = str(e)
+            if e.is_rate_limit:
+                config.mark_rate_limited(attempt["provider"], attempt["model"])
+            await asyncio.to_thread(
+                save_failed_exchange, "agent_vault", attempt["provider"], attempt["model"], messages, last_error,
+            )
+            continue
+
+    error_text = f"⚠️ agent chat failed on every configured provider: {last_error}"
+    await append_message(conversation_id, "navi", error_text)
+    return {"text": error_text, "provider": None, "model": None}

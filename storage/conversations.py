@@ -87,6 +87,23 @@ async def create_conversation(mode: str, project_id: str | None = None, parent_i
     return conversation_id
 
 
+async def ensure_conversation(conversation_id: str, mode: str) -> None:
+    """Like create_conversation, but for a caller that needs a KNOWN,
+    stable id up front (e.g. Agent Vault chat using the saved agent's own
+    id as its conversation id — see dispatcher/chat.py's
+    run_agent_vault_chat) rather than one minted here. INSERT OR IGNORE
+    so calling this on every turn (not just the first) is always safe."""
+    now = time.time()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        await db.execute(
+            "INSERT OR IGNORE INTO conversations (id, mode, project_id, parent_id, task_state, created_at, updated_at) "
+            "VALUES (?, ?, NULL, NULL, NULL, ?, ?)",
+            (conversation_id, mode, now, now),
+        )
+        await db.commit()
+
+
 async def get_conversation(conversation_id: str) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_schema(db)

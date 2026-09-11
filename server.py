@@ -59,7 +59,7 @@ from dispatcher.mcp_client import MCPError, approve_tools, discover_tools
 from dispatcher.mcp_oauth import MCPOAuthError, exchange_code_for_token, start_authorization
 from tools.mcp_marketplace import MCPMarketplaceError, search as search_mcp_marketplace
 from dispatcher.scheduler import register_job, start_scheduler
-from dispatcher.chat import run_mode_chat, run_stored_mode_chat
+from dispatcher.chat import run_agent_vault_chat, run_mode_chat, run_stored_mode_chat
 from dispatcher.devslate_chat import run_devslate_turn
 from dispatcher.executor import format_summary, run_chain
 from dispatcher.parser import COMMANDS, ParseResult, parse_message
@@ -74,7 +74,7 @@ from jobs.model_ranking import fetch_aa_benchmarks, list_candidates, load_snapsh
 from push.sender import PushError, add_subscription, send_push, subscription_count
 from storage.filen import StorageError, download_for_reply, file_download_url
 from storage.conversations import (
-    create_conversation, get_conversation, get_messages, get_task_state,
+    create_conversation, ensure_conversation, get_conversation, get_messages, get_task_state,
 )
 from storage.agent_work import (
     create_workflow as create_workflow_definition,
@@ -1684,6 +1684,35 @@ async def agents_get(agent_id: str) -> dict:
     if not agent:
         raise HTTPException(status_code=404, detail="not found")
     return agent
+
+
+@app.post("/agents/{agent_id}/chat")
+async def agents_chat(agent_id: str, request: Request) -> JSONResponse:
+    """Real per-saved-agent chat — the gap navi-pwa's AgentVaultChat.tsx
+    flagged in its own header comment (2026-09-10): it used to post
+    through agent_work's generic /chat/send regardless of which saved
+    agent's window was open. This uses THAT agent's own instructions/
+    tools/model (dispatcher/chat.py's run_agent_vault_chat), not a shared
+    mode brief.
+
+    conversation_id is always the agent's own id, not a per-tab/session
+    value the client mints or remembers — a saved agent has exactly one
+    ongoing chat (no branch/thread concept here, unlike Root Chat), so
+    the agent IS the conversation's natural, stable identity. Lets the
+    frontend drop its sessionStorage bookkeeping entirely: reopening the
+    same agent's chat, even in a new tab or after a refresh, naturally
+    continues the same server-side history.
+    """
+    agent = await get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="not found")
+    payload = await request.json()
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    await ensure_conversation(agent_id, mode="agent_vault")
+    result = await run_agent_vault_chat(agent, agent_id, text)
+    return JSONResponse({**result, "conversation_id": agent_id})
 
 
 @app.put("/agents/{agent_id}")
