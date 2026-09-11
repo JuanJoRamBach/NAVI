@@ -187,21 +187,32 @@ DEFAULTS = {
             ],
         },
         "dispatcher_autonomous": {"provider": "groq", "model": "openai/gpt-oss-120b"},
-        # dev_slate_chat: backs Dev Slate's own chat (dispatcher/devslate_chat.py),
-        # a separate role from normal_chat since it needs a genuinely
-        # coding-capable model, not whatever's cheapest for everyday
-        # questions. Cloudflare's qwen2.5-coder, with Mistral's Codestral
-        # as fallback — the only coding-model role left in this store
-        # since /code (a separate, redundant one-shot command) was
-        # retired 2026-09-04. Deliberately NO Groq anywhere in this role, primary
-        # or fallback: Groq's free tier caps at 8K tokens/minute, and
-        # Dev Slate's baseline turn (mode brief + task-state block + real
-        # conversation history) realistically exceeds that before any
-        # file content even enters the picture — the same reasoning that
-        # already ruled Groq out for Plan Chat's whole-conversation calls.
+        # dev_slate_chat: backs Dev Slate's own chat (dispatcher/devslate_chat.py).
+        # Cloudflare's qwen2.5-coder stays primary — a real coding model,
+        # still the right pick. Fallback changed 2026-09-11 (JuanJo:
+        # Dev Slate's real scope narrowed to "HTML/CSS/JS (or React/
+        # Tailwind)" — see DEV_SLATE_CHAT.md's own Goals section — so a
+        # heavyweight multi-language coding specialist like Codestral is
+        # overkill, and burning Mistral's scarce ~1B-tokens/MONTH free
+        # tier on a job that no longer needs specialization is a bad
+        # trade (same "monthly-reset is precious, reserve it for the
+        # undisputed-best case" principle just applied to source_fetch
+        # below). LLM7's gpt-oss instead — already normal_chat's PRIMARY,
+        # so already proven live to handle the same "replays real
+        # conversation history every turn" shape Dev Slate has; resets
+        # DAILY not monthly; and a genuinely separate quota pool from
+        # Cloudflare, unlike a same-provider Cloudflare fallback, which
+        # would share primary's own daily Neuron budget and fail for the
+        # identical reason primary just did. Groq still deliberately
+        # excluded, primary or fallback: its 8K-tokens/minute cap is
+        # realistically exceeded by Dev Slate's baseline turn (mode brief
+        # + task-state block + real conversation history) before any
+        # file content even enters the picture — unchanged reasoning from
+        # before this fallback swap, still applies regardless of which
+        # model ends up in the fallback slot.
         "dev_slate_chat": {
             "provider": "cloudflare", "model": "@cf/qwen/qwen2.5-coder-32b-instruct",
-            "fallback": [{"provider": "mistral", "model": "codestral-latest"}],
+            "fallback": [{"provider": "llm7", "model": "gpt-oss"}],
         },
         # agent_work: backs each node of an Agent Work workflow run
         # (dispatcher/agent_work.py) AND Agent Work's own chat
@@ -294,20 +305,29 @@ DEFAULTS = {
         # this role entirely (JuanJo: "openrouter shouldn't be used in
         # sources, it uses too many requests"). Cloudflare's
         # llama-3.1-8b-instruct-fp8-fast (proven tool-caller, already
-        # backing normal_chat/agent_work's fallback) is primary; Mistral's
-        # ministral-8b-latest (same size class, agent_work's own fallback)
-        # is second. Groq's gpt-oss-20b is a deliberate LAST resort only,
-        # not primary/second — its free tier caps at 8K tokens/minute
-        # (see normal_chat's own comment above), and this role's tool
+        # backing normal_chat/agent_work's fallback) is primary.
+        # Fallback order corrected 2026-09-11 (JuanJo: "monthly usage
+        # reset LLMs should be last fallback, unless they are the
+        # undisputed best for a specific work") — the 2026-09-06 chain put
+        # Mistral (ministral-8b-latest, ~1B tokens/MONTH, see
+        # providers/mistral.py) ahead of Groq (8K tokens/MINUTE, resets
+        # constantly) with no quality reason, just "same size class as
+        # agent_work's fallback." That's backwards: a fallback door that
+        # only recovers once a month is a far more precious resource than
+        # one that recovers within the hour, so it belongs LAST unless a
+        # model is genuinely the best fit for the job (dev_slate_chat's
+        # Codestral fallback below is that exception — a real
+        # coding-specialized model, not "similarly sized"). Groq now
+        # second, Mistral last. Groq's own per-minute-cap concern (why it
+        # wasn't primary/second in the first place — this role's tool
         # loop can pull in full fetched-page content across several
-        # round-trips, the same growing-context shape that already ruled
-        # Groq out of normal_chat/dev_slate_chat. As a rarely-hit third
-        # door it's fine; as primary it'd hit that cap constantly.
+        # round-trips) still applies to SUSTAINED use, but a second-
+        # fallback door is inherently occasional, not sustained.
         "source_fetch": {
             "primary": {"provider": "cloudflare", "model": "@cf/meta/llama-3.1-8b-instruct-fp8-fast"},
             "fallback": [
-                {"provider": "mistral", "model": "ministral-8b-latest"},
                 {"provider": "groq", "model": "openai/gpt-oss-20b"},
+                {"provider": "mistral", "model": "ministral-8b-latest"},
             ],
         },
         # No "brainstorm" entry — retired as a standalone command (2026-08-27):
@@ -952,3 +972,48 @@ def _migrate_normal_chat_fallback_off_small_model_2026_09_06():
 
 
 _migrate_normal_chat_fallback_off_small_model_2026_09_06()
+
+
+def _migrate_source_fetch_reset_cadence_order_2026_09_11():
+    """One-time correction for an already-materialized config.json (this
+    server's live one included) — see source_fetch's DEFAULTS comment
+    above for the full reasoning: the 2026-09-06 migration put Mistral
+    (monthly-reset) ahead of Groq (per-minute-reset) in this role's
+    fallback with no quality justification, just size-class similarity.
+    Force-overwrites the existing routing (not a fill-in-if-missing
+    migration), same pattern as every other _migrate_*_2026_09_06 above."""
+    if config.get("migrated_source_fetch_reset_cadence_order_2026_09_11"):
+        return
+    config.set_task_routing(
+        "source_fetch",
+        {"provider": "cloudflare", "model": "@cf/meta/llama-3.1-8b-instruct-fp8-fast"},
+        [
+            {"provider": "groq", "model": "openai/gpt-oss-20b"},
+            {"provider": "mistral", "model": "ministral-8b-latest"},
+        ],
+    )
+    config.set("migrated_source_fetch_reset_cadence_order_2026_09_11", True)
+
+
+_migrate_source_fetch_reset_cadence_order_2026_09_11()
+
+
+def _migrate_dev_slate_chat_off_codestral_2026_09_11():
+    """One-time correction for an already-materialized config.json (this
+    server's live one included) — see dev_slate_chat's DEFAULTS comment
+    above for the full reasoning: Dev Slate's real scope narrowed to
+    HTML/CSS/JS (or React/Tailwind), so Codestral's multi-language coding
+    specialization is no longer the deciding factor, and burning
+    Mistral's scarce monthly quota on it isn't a good trade anymore.
+    Force-overwrites the existing fallback (not a fill-in-if-missing
+    migration), same pattern as every other _migrate_*_2026_09_11 above."""
+    if config.get("migrated_dev_slate_chat_off_codestral_2026_09_11"):
+        return
+    config.set_role(
+        "dev_slate_chat", "cloudflare", "@cf/qwen/qwen2.5-coder-32b-instruct",
+        fallback=[{"provider": "llm7", "model": "gpt-oss"}],
+    )
+    config.set("migrated_dev_slate_chat_off_codestral_2026_09_11", True)
+
+
+_migrate_dev_slate_chat_off_codestral_2026_09_11()
