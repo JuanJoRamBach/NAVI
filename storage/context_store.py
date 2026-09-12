@@ -90,6 +90,20 @@ async def _ensure_schema(db: aiosqlite.Connection) -> None:
     if _initialized:
         return
     await db.executescript(_SCHEMA)
+    # ADD COLUMN migrations — CREATE TABLE IF NOT EXISTS never alters an
+    # already-existing table on a live database, only a brand-new one.
+    # Same pattern storage/sources.py already uses. `retired_at` /
+    # `retired_reason` are the explicit forgetting path (2026-09-13): an
+    # entry is never deleted, it stops being carried forward once the
+    # compactor DECLARES it obsolete and says why.
+    for stmt in (
+        "ALTER TABLE context_entries ADD COLUMN retired_at REAL",
+        "ALTER TABLE context_entries ADD COLUMN retired_reason TEXT",
+    ):
+        try:
+            await db.execute(stmt)
+        except Exception:
+            pass  # already applied in a prior run
     await db.commit()
     _initialized = True
 
@@ -162,17 +176,26 @@ async def append_entry(
         await db.commit()
 
 
-async def get_entries(conversation_id: str, since: float | None = None) -> list[dict]:
+async def get_entries(
+    conversation_id: str, since: float | None = None, include_retired: bool = False,
+) -> list[dict]:
     """Oldest first. `since` filters to entries created after a timestamp —
-    used to find the entries a live snapshot doesn't cover yet."""
+    used to find the entries a live snapshot doesn't cover yet.
+
+    Retired entries are excluded by default: they're still in the table
+    (nothing here is ever deleted — that's the audit trail), they're just
+    no longer carried forward into prompts or checked for survival.
+    `include_retired=True` is for inspecting what was retired and why."""
     query = (
-        "SELECT id, message_id, source, content, created_at FROM context_entries "
-        "WHERE conversation_id = ?"
+        "SELECT id, message_id, source, content, created_at, retired_at, retired_reason "
+        "FROM context_entries WHERE conversation_id = ?"
     )
     params: tuple = (conversation_id,)
     if since is not None:
         query += " AND created_at > ?"
         params = (conversation_id, since)
+    if not include_retired:
+        query += " AND retired_at IS NULL"
     query += " ORDER BY created_at ASC"
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_schema(db)
@@ -180,6 +203,31 @@ async def get_entries(conversation_id: str, since: float | None = None) -> list[
         async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
     return [dict(r) for r in rows]
+
+
+async def retire_entries(entry_ids: list[str], reason: str) -> int:
+    """Marks entries as no longer worth carrying forward. Never deletes —
+    the row stays, so "what did we used to remember, and why did we stop?"
+    is always answerable.
+
+    This is the ONLY sanctioned way for something to leave context.md.
+    Compaction silently omitting an entry does NOT retire it (that entry
+    gets rescued verbatim instead) — the compactor has to explicitly
+    declare it obsolete and give a reason. Silent loss and deliberate
+    forgetting look identical otherwise, and only one of them is safe."""
+    if not entry_ids:
+        return 0
+    now = time.time()
+    placeholders = ",".join("?" for _ in entry_ids)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        cursor = await db.execute(
+            f"UPDATE context_entries SET retired_at = ?, retired_reason = ? "
+            f"WHERE id IN ({placeholders}) AND retired_at IS NULL",
+            (now, reason, *entry_ids),
+        )
+        await db.commit()
+        return cursor.rowcount or 0
 
 
 # ---- Compacted snapshots ----

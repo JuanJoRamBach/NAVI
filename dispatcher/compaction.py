@@ -31,6 +31,7 @@ from storage.context_store import (
     estimate_tokens,
     get_entries,
     replace_live_snapshot,
+    retire_entries,
 )
 from storage.conversations import get_messages
 
@@ -66,14 +67,20 @@ _STOPWORDS = {
     "not", "no", "if", "then", "than", "so", "up", "out", "about", "into", "over", "after",
 }
 
-CONTEXT_COMPACTION_INSTRUCTION = """You are compacting the durable memory of an ongoing conversation. You are given the FULL raw conversation history. Produce the distilled memory that should be carried forward into every future turn.
+CONTEXT_COMPACTION_INSTRUCTION = """You are compacting the durable memory of an ongoing conversation. You are given the FULL raw conversation history, and separately a numbered list of what is currently being remembered. Produce the distilled memory that should be carried forward into every future turn.
+
+Build the summary from the RAW CONVERSATION, not by editing the numbered list — the list is there for one separate purpose only: telling you what is currently remembered so you can identify anything that has since become obsolete.
 
 Reply with ONLY a single JSON object, no prose, no markdown fence, matching exactly this shape:
 {
   "core_constraints": ["..."],
   "active_state": ["..."],
-  "key_decisions": ["..."]
+  "key_decisions": ["..."],
+  "superseded": [{"entry": 3, "reason": "..."}]
 }
+
+- "superseded": the numbered entries that are genuinely no longer true or no longer worth carrying — a blocker that got resolved, a decision that was later reversed, a task that finished, a duplicate of something else you kept. Give the real reason. Leave it empty if nothing has actually become obsolete.
+- Omitting something from your summary does NOT retire it — anything you leave out but don't explicitly list here is kept verbatim anyway. Retiring is a deliberate act with a stated reason, never a side effect of a short summary. Do not list an entry here just to make the summary shorter.
 
 - "core_constraints": stable facts, rules, preferences and requirements that are unlikely to change — the things that would still be true next week. Who the user is, what they're building, constraints they've stated, how they want things done.
 - "active_state": what is currently in flight — the task underway, open blockers, things explicitly still undecided. This is the section most likely to be wrong next week, and that's expected.
@@ -153,6 +160,18 @@ async def compact_context(conversation_id: str) -> dict:
     if not transcript:
         return {"ok": False, "reason": "no usable history to compact"}
 
+    # The currently-remembered entries, numbered, as a final separate
+    # message — NOT as the thing being summarized (the instruction is
+    # explicit about that). Their only job here is giving the compactor
+    # something concrete to point at when declaring an entry obsolete.
+    if entries:
+        numbered = "\n".join(f"{n}. {e['content']}" for n, e in enumerate(entries, start=1))
+        transcript.append(ChatMessage(
+            role="user",
+            content=f"[Currently remembered, for supersede decisions only — do not treat as "
+                    f"conversation content]\n{numbered}",
+        ))
+
     parsed = await compact_conversation(transcript, CONTEXT_COMPACTION_INSTRUCTION)
     if not parsed:
         return {"ok": False, "reason": "compaction call failed or returned unparseable output"}
@@ -161,10 +180,33 @@ async def compact_context(conversation_id: str) -> dict:
     if not compacted.strip():
         return {"ok": False, "reason": "compaction produced an empty result"}
 
+    # Retire only what the compactor EXPLICITLY declared obsolete, with a
+    # reason, pointing at a real entry number. Everything else it merely
+    # left out still gets rescued below — silent omission and deliberate
+    # forgetting must not be the same gesture.
+    retired_ids: list[str] = []
+    retired_detail: list[str] = []
+    for item in (parsed.get("superseded") or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("entry"))
+        except (TypeError, ValueError):
+            continue
+        reason = str(item.get("reason") or "").strip()
+        if not reason or not (1 <= idx <= len(entries)):
+            continue  # unusable claim — keep the entry rather than guess
+        target = entries[idx - 1]
+        retired_ids.append(target["id"])
+        retired_detail.append(f"{target['content'][:60]!r}: {reason}")
+        await retire_entries([target["id"]], reason)
+
+    retired_set = set(retired_ids)
     compacted_words = _content_words(compacted)
     rescued = [
         e["content"] for e in entries
-        if not _entry_survived(e["content"], compacted, compacted_words)
+        if e["id"] not in retired_set
+        and not _entry_survived(e["content"], compacted, compacted_words)
     ]
     if rescued:
         compacted += "\n\n## Preserved\n" + "\n".join(f"- {c}" for c in rescued)
@@ -178,6 +220,8 @@ async def compact_context(conversation_id: str) -> dict:
         "after_tokens": after_tokens,
         "entries_checked": len(entries),
         "entries_rescued": len(rescued),
+        "entries_retired": len(retired_ids),
+        "retired_detail": retired_detail,
         # Real signal for the escape valve (how_to_handle_context.md's
         # "hit the floor" question, still open): a pass that barely shrank
         # anything, or left the result still above target, is what that
@@ -186,9 +230,11 @@ async def compact_context(conversation_id: str) -> dict:
     }
     print(
         f"[compact_context] conversation={conversation_id} {before_tokens} -> {after_tokens} tokens, "
-        f"{len(rescued)}/{len(entries)} entries rescued verbatim, "
+        f"{len(rescued)}/{len(entries)} entries rescued verbatim, {len(retired_ids)} retired, "
         f"still_above_target={report['still_above_target']}"
     )
+    for d in retired_detail:
+        print(f"[compact_context]   retired {d}")
     return report
 
 
