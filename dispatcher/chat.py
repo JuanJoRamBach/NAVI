@@ -344,6 +344,33 @@ async def run_stored_mode_chat(
                 f"[run_stored_mode_chat] attempt {i} FIRST reply: "
                 f"text={(response.text or '')[:200]!r} tool_calls={[tc.name for tc in response.tool_calls]}"
             )
+            research_mode_call = next((tc for tc in response.tool_calls if tc.name == "propose_research_mode"), None)
+            if research_mode_call:
+                # Stage 3's "fast-path intent layer" (IDEAS.md,
+                # 2026-09-12) — only ever offered when NORMAL_CHAT.md's
+                # tools list includes propose_research_mode, so this only
+                # fires for mode == "normal" in practice. Intercepted the
+                # same way ask_user_choice is: no server-side action,
+                # calling it IS the model flagging a scope shift, and the
+                # DISPATCHER (not the model) phrases the actual offer —
+                # same "LLM proposes, dispatcher decides" principle
+                # Research mode's own propose_plan_ready checkpoint uses.
+                # `suggested_mode` rides on the return value (not
+                # persisted anywhere) so navi-pwa's App.tsx can flip
+                # chatMode client-side the moment "yes" is clicked —
+                # Normal/Research/Brainstorm already share one
+                # conversation_id (mode is a per-request parameter, never
+                # stored), so switching is just sending the next message
+                # under a different mode, no seed/handoff needed.
+                args = _parse_tool_args(research_mode_call.arguments)
+                reason = args.get("reason") or "This looks like it could use real research rather than a quick answer."
+                question = f"{reason} Want me to switch this to Research mode?"
+                options = ["Yes, switch to Research mode", "No, keep chatting here"]
+                await append_message(conversation_id, "navi", question, provider=attempt["provider"], model=attempt["model"])
+                return {
+                    "text": question, "provider": attempt["provider"], "model": attempt["model"],
+                    "choices": options, "suggested_mode": "research",
+                }
             choice_call = next((tc for tc in response.tool_calls if tc.name == "ask_user_choice"), None)
             if choice_call:
                 # Intercepted BEFORE run_tool_loop, not executed through it

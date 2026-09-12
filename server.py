@@ -1045,6 +1045,12 @@ async def chat_send(request: Request) -> JSONResponse:
             # nodes right after the chat builds it, instead of the
             # workflow only ever showing up in the Workflows list.
             "created_workflow_id": reply.get("created_workflow_id"),
+            # Set only when Normal Chat's model called propose_research_mode
+            # (Stage 3, 2026-09-12) — navi-pwa's App.tsx uses this to flip
+            # chatMode client-side the moment the user accepts, rather than
+            # sending the click back as plain text and hoping it's read as
+            # consent. Never set outside that one flow.
+            "suggested_mode": reply.get("suggested_mode"),
         })
 
     reply_text, _attachments = _handle_parse_result(result, "pwa", mode, channel="pwa")

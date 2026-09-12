@@ -280,6 +280,34 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "propose_research_mode",
+            "description": "Call this INSTEAD OF replying when the user's message has "
+                            "genuinely shifted from a quick question into something that "
+                            "deserves real research — a request for an in-depth "
+                            "investigation, a competitive/literature review, or a "
+                            "data-driven question where getting the scope right matters "
+                            "more than getting an answer fast. Not for every substantive "
+                            "question — most things, even meaty ones, are still a normal "
+                            "chat answer. Only call this when a proper plan (breaking the "
+                            "question into sub-questions, gathering real sources) would "
+                            "genuinely serve them better than what you'd say right now.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "One short sentence, shown to the user, on why this "
+                                        "looks like it needs real research rather than a "
+                                        "quick answer.",
+                    },
+                },
+                "required": ["reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "propose_plan_ready",
             "description": "Call this once clarification is genuinely done and there's "
                             "enough to draft a research plan — instead of drafting the "
@@ -295,15 +323,19 @@ TOOL_SCHEMAS = [
     },
 ]
 
-# ask_user_choice and propose_plan_ready are deliberately NOT handled in
-# dispatch() below — both are intercepted earlier, in
-# run_stored_mode_chat/run_devslate_turn/dispatcher/research.py, before a
-# call ever reaches the normal execute-and-continue tool loop. Calling
-# ask_user_choice is how the model hands a question back to the user;
-# calling propose_plan_ready is how it hands the readiness DECISION back
-# to the dispatcher (2026-09-12, how_to_handle_context.md's "dispatcher-
-# mediated, not model-narrated" design) — neither has a server-side
-# action to run.
+# ask_user_choice, propose_research_mode, and propose_plan_ready are
+# deliberately NOT handled in dispatch() below — all three are
+# intercepted earlier, in run_stored_mode_chat/run_devslate_turn/
+# dispatcher/research.py, before a call ever reaches the normal
+# execute-and-continue tool loop. Calling ask_user_choice is how the
+# model hands a question back to the user; calling propose_research_mode
+# (2026-09-12, Stage 3's "fast-path intent layer," IDEAS.md) is how it
+# flags a genuine scope shift toward real research, leaving the actual
+# mode-switch decision to the dispatcher/user rather than narrating it
+# itself; calling propose_plan_ready is how it hands the readiness
+# DECISION back to the dispatcher (2026-09-12, how_to_handle_context.md's
+# "dispatcher-mediated, not model-narrated" design) — none of the three
+# has a server-side action to run.
 
 
 def schemas_for(names: list[str]) -> list[dict]:
