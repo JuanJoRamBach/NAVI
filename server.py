@@ -426,6 +426,25 @@ async def _start_background_scheduler() -> None:
     # hour during the ~1-week EU/US DST-changeover gap in late Oct/early
     # Nov since the two regions switch on different dates — known, not a bug.
     register_job("refresh_model_ranking_snapshot", "45 4 * * *", _refresh_model_ranking_snapshot)
+    # Real gap found 2026-09-12: dispatcher/scheduler.py's _run_job_loop
+    # seeds croniter from "now" on every thread start and only ever waits
+    # for the NEXT future occurrence — it never fires an overdue job
+    # immediately. A once-a-day job combined with restarts happening more
+    # often than once every 24h (routine during active deploys — this
+    # exact server restarted 4+ times in one day recently) means the
+    # scheduled fire time keeps getting pushed to "tomorrow" before it's
+    # ever reached, so the snapshot can go stale indefinitely with no
+    # error anywhere to catch it. Real fix: also check staleness directly
+    # at startup and refresh immediately if needed, same "resumed =
+    # await resume_orphaned_runs(...)" pattern already used for Stage 1
+    # right below — don't just trust the recurring schedule alone. 20h
+    # threshold (not 24h) leaves real margin so a normal daily cadence
+    # doesn't ALSO refire this at every restart within the same day.
+    existing_snapshot = load_snapshot()
+    snapshot_age_s = time.time() - (existing_snapshot or {}).get("fetched_at", 0)
+    if not existing_snapshot or snapshot_age_s > 20 * 3600:
+        print(f"[startup] model-ranking snapshot stale or missing (age={snapshot_age_s:.0f}s) — refreshing now")
+        await _refresh_model_ranking_snapshot()
     # NAVI reliability Stage 1 (2026-09-11) — crash-safe resume. No grace
     # period here: this fires once, right as THIS process boots, so
     # nothing a "running" row could be referring to could possibly still
