@@ -28,6 +28,12 @@ MODE_FILES = {
     "brainstorm": "BRAINSTORM.md",
     "devslate": "DEV_SLATE_CHAT.md",
     "agent_work": "AGENT_WORK_CHAT.md",
+    # Not a user-selectable `mode` value from /chat/send — the execution
+    # stage of Research mode's plan-then-execute design, loaded directly
+    # by dispatcher/research.py once a drafted plan is accepted, never
+    # entered from a bare user message (see RESEARCH_EXECUTE_PLAN.md's
+    # own "Scope" section).
+    "research_execute": "RESEARCH_EXECUTE_PLAN.md",
 }
 
 _TOOLS_LINE = re.compile(r"^tools:\s*\[(.*?)\]\s*$", re.MULTILINE)

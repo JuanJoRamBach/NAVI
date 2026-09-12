@@ -61,6 +61,7 @@ from dispatcher.mcp_oauth import MCPOAuthError, exchange_code_for_token, start_a
 from tools.mcp_marketplace import MCPMarketplaceError, search as search_mcp_marketplace
 from dispatcher.scheduler import register_job, start_scheduler
 from dispatcher.chat import run_agent_vault_chat, run_mode_chat, run_stored_mode_chat
+from dispatcher.research import run_research_chat
 from dispatcher.devslate_chat import run_devslate_turn
 from dispatcher.executor import format_summary, run_chain
 from dispatcher.parser import COMMANDS, ParseResult, parse_message
@@ -1015,7 +1016,16 @@ async def chat_send(request: Request) -> JSONResponse:
     if result.kind == "plain_chat":
         if not conversation_id:
             conversation_id = await create_conversation(mode=mode)
-        reply = await run_stored_mode_chat(mode, conversation_id, text, auto_accept=auto_accept, reasoning_effort=reasoning_effort)
+        # Research mode (2026-09-12) needs real stage-tracking (planning
+        # -> readiness checkpoint -> plan confirmation -> execution) that
+        # no other mode has an equivalent of — dispatcher/research.py owns
+        # that state machine instead of the generic run_stored_mode_chat.
+        # Brainstorm isn't wired this way yet (see that module's own
+        # docstring) — still the generic path below.
+        if mode == "research":
+            reply = await run_research_chat(conversation_id, text)
+        else:
+            reply = await run_stored_mode_chat(mode, conversation_id, text, auto_accept=auto_accept, reasoning_effort=reasoning_effort)
         return JSONResponse({
             "reply": reply["text"], "conversation_id": conversation_id,
             "usage_note": reply.get("usage_note"), "choices": reply.get("choices"),

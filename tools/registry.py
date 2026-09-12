@@ -277,13 +277,33 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_plan_ready",
+            "description": "Call this once clarification is genuinely done and there's "
+                            "enough to draft a research plan — instead of drafting the "
+                            "plan text yourself. The dispatcher takes it from here: it "
+                            "confirms with the user, then drafts the actual plan from the "
+                            "full conversation. Don't describe or summarize the plan in "
+                            "your reply when calling this — just call it.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
 ]
 
-# ask_user_choice is deliberately NOT handled in dispatch() below — it's
-# intercepted earlier, in run_stored_mode_chat/run_devslate_turn, before a
-# call ever reaches the normal execute-and-continue tool loop. Calling it
-# is how the model hands the question back to the user, not something
-# that has a server-side action to run.
+# ask_user_choice and propose_plan_ready are deliberately NOT handled in
+# dispatch() below — both are intercepted earlier, in
+# run_stored_mode_chat/run_devslate_turn/dispatcher/research.py, before a
+# call ever reaches the normal execute-and-continue tool loop. Calling
+# ask_user_choice is how the model hands a question back to the user;
+# calling propose_plan_ready is how it hands the readiness DECISION back
+# to the dispatcher (2026-09-12, how_to_handle_context.md's "dispatcher-
+# mediated, not model-narrated" design) — neither has a server-side
+# action to run.
 
 
 def schemas_for(names: list[str]) -> list[dict]:
