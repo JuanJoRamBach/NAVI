@@ -65,6 +65,7 @@ class GroqProvider(Provider):
         messages: list[ChatMessage],
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        extra_params: dict | None = None,
     ) -> ChatResponse:
         payload = {
             "model": model,
@@ -73,6 +74,8 @@ class GroqProvider(Provider):
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice or "auto"
+        if extra_params:
+            payload.update(extra_params)
 
         try:
             resp = requests.post(

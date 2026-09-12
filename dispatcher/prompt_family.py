@@ -18,18 +18,15 @@ authored `instructions`, not one of NAVI's mode-brief files; wrapping
 someone's own custom agent instructions with NAVI-injected framing
 risks fighting whatever they actually wrote it to do.
 
-Two separate kinds of adaptation, with two different integration costs:
+Two separate kinds of adaptation:
 
-1. System-prompt TEXT (adapt_system_prompt below) — cheap to wire in.
-   Only changes what string gets built before provider.chat() is
-   called; no change to the call itself. Ships first.
+1. System-prompt TEXT (adapt_system_prompt below) — only changes what
+   string gets built before provider.chat() is called.
 2. API-call PARAMETERS (adapt_request_params below) — real API fields
-   per family (e.g. gpt-oss's Harmony reasoning_effort, Qwen's Thinking
-   ON/OFF toggle). NOT wired into anything yet: providers/base.py's
-   Provider.chat() has a fixed signature today (model, messages, tools,
-   tool_choice) with no way to forward an extra field — this needs that
-   signature widened first, a real, separate piece of work, not free
-   alongside this module.
+   per family (e.g. gpt-oss's Harmony reasoning_effort). Wired in
+   2026-09-12 once providers/base.py's Provider.chat()/_do_chat() grew
+   a real extra_params passthrough across all 7 transports — before
+   that this function existed but had nowhere to send its output.
 
 A THIRD real per-family finding — MiniMax M3 needing its internal
 reasoning fields preserved across multi-turn tool-calling or quality
@@ -176,17 +173,33 @@ def adapt_system_prompt(base_prompt: str, family: str, model: str) -> str | None
     return text
 
 
-def adapt_request_params(family: str, has_tools: bool) -> dict:
+def adapt_request_params(family: str, provider: str, has_tools: bool) -> dict:
     """Extra kwargs to merge into a provider.chat(...) call for this
-    family. NOT CALLED FROM ANYWHERE YET — see this module's own
-    docstring: providers/base.py's Provider.chat() has no way to accept
-    or forward an extra field today. Written now so the real, verified
-    findings are captured before they're forgotten, not because this is
-    wireable yet.
+    (family, provider) pair — forwarded via providers/base.py's
+    extra_params passthrough.
+
+    gpt-oss's Harmony format exposes a real reasoning_effort field
+    (low/medium/high, "medium" is OpenAI's own documented default when
+    unset — confirmed against their published gpt-oss model card).
+
+    The provider argument matters here for a real, verified reason
+    (2026-09-12, IDEAS.md's "Per-model reasoning_effort control"
+    section has the full design): Groq's 8K-tokens/MINUTE cap applies
+    account-wide regardless of model, and internal reasoning tokens are
+    real output tokens generated BEFORE the visible answer — a verbose
+    high-effort trace can burn that whole per-minute budget on
+    reasoning alone. Every other gpt-oss host NAVI routes to (LLM7,
+    Cloudflare) sits on a per-DAY pool instead, no acute per-call risk,
+    so only Groq gets hard-capped here. This is a technical ceiling,
+    not a preference — it's not meant to be bypassed by a caller, unlike
+    a future manual override which would only ever apply on a non-Groq
+    host in the first place (see the IDEAS.md design for why).
+
+    No phase-aware tiering (idle/exploratory/serious-job) yet — that
+    depends on Stage 3's fast-path intent layer, which doesn't exist.
+    "medium" here is the automatic, phase-blind default; automatic
+    tiering never reaches "high" regardless, per the same design doc.
     """
     if family == "gpt-oss":
-        # gpt-oss's Harmony format exposes a real reasoning_effort field
-        # (low/medium/high) via the system message — NAVI never sets it
-        # today.
-        return {"reasoning_effort": "medium"}
+        return {"reasoning_effort": "low" if provider == "groq" else "medium"}
     return {}

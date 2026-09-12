@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from config.store import config
 from dispatcher.executor import CITATION_STYLE_PROMPT, _extract_tool_results, _parse_tool_args, run_tool_loop
 from dispatcher.mode_briefs import get_mode_brief
-from dispatcher.prompt_family import adapt_system_prompt, classify_family
+from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, classify_family
 from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
@@ -122,23 +122,27 @@ def run_mode_chat(mode: str, text: str) -> str:
         except Exception as e:
             last_error = str(e)
             continue
-        # Per-family system-prompt adaptation (2026-09-11,
-        # dispatcher/prompt_family.py) — built fresh per attempt, not
-        # once before the loop, since a fallback chain can hand this
-        # request to a genuinely different model family. Deliberately
-        # skipped for agent_work — see prompt_family.py's own scope
-        # docstring for why (stateless, tool-call-driven, no free-form
-        # prose to adapt).
+        # Per-family system-prompt + request-param adaptation
+        # (2026-09-11/12, dispatcher/prompt_family.py) — built fresh per
+        # attempt, not once before the loop, since a fallback chain can
+        # hand this request to a genuinely different model family.
+        # Deliberately skipped for agent_work — see prompt_family.py's
+        # own scope docstring for why (stateless, tool-call-driven, no
+        # free-form prose to adapt; its own reasoning_effort treatment
+        # needs a separate, not-yet-built complexity classifier — see
+        # IDEAS.md).
         if mode == "agent_work":
             system_content = base_system_content
+            extra_params = None
         else:
             family = classify_family(attempt["provider"], attempt["model"])
             system_content = adapt_system_prompt(base_system_content, family, attempt["model"])
+            extra_params = adapt_request_params(family, attempt["provider"], has_tools=bool(tools)) or None
         messages = [ChatMessage(role="user", content=text)]
         if system_content is not None:
             messages.insert(0, ChatMessage(role="system", content=system_content))
         try:
-            response = provider.chat(model=attempt["model"], messages=messages, tools=tools)
+            response = provider.chat(model=attempt["model"], messages=messages, tools=tools, extra_params=extra_params)
             if tools and response.tool_calls:
                 # Free-form chat has no StepResult to attach an attempt
                 # count to (that's a /research-command-chain concept) —
@@ -146,7 +150,7 @@ def run_mode_chat(mode: str, text: str) -> str:
                 response, _messages, _iterations = run_tool_loop(
                     provider, attempt["model"], messages, response,
                     context={"command": f"chat-{mode}", "topic_slug": "chat"},
-                    tools=tools,
+                    tools=tools, extra_params=extra_params,
                 )
             reply = _collapse_repeated_paragraphs(response.text or "(empty reply)")
             if i > 0:
@@ -307,20 +311,24 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
             last_error = str(e)
             print(f"[run_stored_mode_chat] attempt {i} get_provider failed: {e}")
             continue
-        # Per-family system-prompt adaptation (2026-09-11) — built fresh
-        # per attempt; skipped for agent_work (see prompt_family.py's own
-        # scope docstring on why).
+        # Per-family system-prompt + request-param adaptation
+        # (2026-09-11/12) — built fresh per attempt; skipped for
+        # agent_work (see prompt_family.py's own scope docstring on why;
+        # its reasoning_effort treatment needs a separate, not-yet-built
+        # complexity classifier — see IDEAS.md).
         if mode == "agent_work":
             system_content = base_system_content
+            extra_params = None
         else:
             family = classify_family(attempt["provider"], attempt["model"])
             system_content = adapt_system_prompt(base_system_content, family, attempt["model"])
+            extra_params = adapt_request_params(family, attempt["provider"], has_tools=bool(tools)) or None
         messages = list(history_messages)
         if system_content is not None:
             messages.insert(0, ChatMessage(role="system", content=system_content))
         try:
             sent_messages = messages
-            response = await asyncio.to_thread(provider.chat, model=attempt["model"], messages=messages, tools=tools)
+            response = await asyncio.to_thread(provider.chat, model=attempt["model"], messages=messages, tools=tools, extra_params=extra_params)
             print(
                 f"[run_stored_mode_chat] attempt {i} FIRST reply: "
                 f"text={(response.text or '')[:200]!r} tool_calls={[tc.name for tc in response.tool_calls]}"
@@ -347,7 +355,7 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
                 print(f"[run_stored_mode_chat] attempt {i}: entering run_tool_loop")
                 response, sent_messages, iterations = await asyncio.to_thread(
                     run_tool_loop, provider, attempt["model"], messages, response,
-                    context={"command": f"chat-{mode}", "topic_slug": "chat"}, tools=tools,
+                    context={"command": f"chat-{mode}", "topic_slug": "chat"}, tools=tools, extra_params=extra_params,
                 )
                 created_workflow_id = _extract_created_workflow_id(sent_messages)
                 print(

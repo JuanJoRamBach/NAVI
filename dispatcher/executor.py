@@ -164,7 +164,7 @@ CITATION_STYLE_PROMPT = (
 
 def run_tool_loop(
     provider: Provider, model: str, messages: list[ChatMessage], response: ChatResponse, context: dict,
-    tools: list[dict] | None = None,
+    tools: list[dict] | None = None, extra_params: dict | None = None,
 ) -> tuple[ChatResponse, list[ChatMessage], int]:
     """Executes any tool_calls in `response`, feeds results back to the
     model, and repeats until the model stops asking for tools or the
@@ -183,7 +183,13 @@ def run_tool_loop(
     TOOL_SCHEMAS only for callers that genuinely want the whole belt).
 
     Public (not `_`-prefixed) because dispatcher/chat.py reuses this for
-    free-form mode-based chat, not just the command chain here."""
+    free-form mode-based chat, not just the command chain here.
+
+    extra_params (2026-09-12) — forwarded unchanged to every follow-up
+    provider.chat() call inside this loop, same reasoning as `tools`
+    above: a per-family setting like gpt-oss's reasoning_effort
+    (dispatcher/prompt_family.py) shouldn't silently reset on iteration
+    2 just because this loop rebuilt the call."""
     tools = tools if tools is not None else TOOL_SCHEMAS
     iterations = 0
     # Scoped to this one run_tool_loop call only — a fresh call (a new
@@ -257,7 +263,7 @@ def run_tool_loop(
                 role="tool", content=result_text, tool_call_id=tc.id, name=tc.name,
             )]
 
-        response = provider.chat(model=model, messages=messages, tools=tools)
+        response = provider.chat(model=model, messages=messages, tools=tools, extra_params=extra_params)
         iterations += 1
         print(
             f"[run_tool_loop] iteration={iterations} model replied "

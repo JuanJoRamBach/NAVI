@@ -58,6 +58,7 @@ class CloudflareProvider(Provider):
         messages: list[ChatMessage],
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        extra_params: dict | None = None,
     ) -> ChatResponse:
         account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
         if not account_id:
@@ -84,6 +85,8 @@ class CloudflareProvider(Provider):
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice or "auto"
+        if extra_params:
+            payload.update(extra_params)
 
         try:
             resp = requests.post(

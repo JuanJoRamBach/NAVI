@@ -31,7 +31,7 @@ import json
 from typing import Awaitable, Callable
 
 from dispatcher.mode_briefs import get_mode_brief
-from dispatcher.prompt_family import adapt_system_prompt, classify_family
+from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, classify_family
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
 from storage.conversations import append_message, get_messages, get_task_state
@@ -125,18 +125,20 @@ async def run_devslate_turn(conversation_id: str, user_text: str, relay: ToolRel
             last_error = str(e)
             continue
 
-        # Per-family system-prompt adaptation (2026-09-11) — built fresh
-        # per attempt, not once before the loop, since a fallback chain
-        # can hand this request to a genuinely different model family.
+        # Per-family system-prompt + request-param adaptation
+        # (2026-09-11/12) — built fresh per attempt, not once before the
+        # loop, since a fallback chain can hand this request to a
+        # genuinely different model family.
         family = classify_family(attempt["provider"], attempt["model"])
         system_content = adapt_system_prompt(base_system_content, family, attempt["model"])
+        extra_params = adapt_request_params(family, attempt["provider"], has_tools=True) or None
         messages = list(history_messages)
         if system_content is not None:
             messages.insert(0, ChatMessage(role="system", content=system_content))
 
         try:
             response = await asyncio.to_thread(
-                provider.chat, model=attempt["model"], messages=messages, tools=TOOL_SCHEMAS,
+                provider.chat, model=attempt["model"], messages=messages, tools=TOOL_SCHEMAS, extra_params=extra_params,
             )
 
             choice_call = next((tc for tc in response.tool_calls if tc.name == "ask_user_choice"), None)
@@ -169,7 +171,7 @@ async def run_devslate_turn(conversation_id: str, user_text: str, relay: ToolRel
                     )]
 
                 response = await asyncio.to_thread(
-                    provider.chat, model=attempt["model"], messages=messages, tools=TOOL_SCHEMAS,
+                    provider.chat, model=attempt["model"], messages=messages, tools=TOOL_SCHEMAS, extra_params=extra_params,
                 )
                 iterations += 1
 

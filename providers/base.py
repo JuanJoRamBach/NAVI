@@ -93,6 +93,7 @@ class Provider(ABC):
         messages: list[ChatMessage],
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        extra_params: dict | None = None,
     ) -> ChatResponse:
         """
         Send a chat completion request. Raises ProviderError on failure.
@@ -100,6 +101,16 @@ class Provider(ABC):
         tool_choice lets a caller force a specific tool (e.g. /graph-data
         forcing render_chart) instead of leaving it to "auto", which is
         the default when tools are provided but tool_choice isn't set.
+
+        extra_params (2026-09-12) — real per-family API fields NAVI
+        never had a way to send before this (e.g. gpt-oss's Harmony
+        reasoning_effort, see dispatcher/prompt_family.py's
+        adapt_request_params, the actual first caller). Merged directly
+        into the request payload by each provider's own _do_chat — kept
+        as a bare dict rather than named parameters here so a new
+        per-family field never needs touching this shared base class or
+        all 7 transports' signatures again, just the one transport that
+        cares. None/empty is always a safe no-op for every provider.
 
         Concrete (not abstract) on purpose — this is the one place every
         provider's call gets counted (see _REQUEST_COUNTS above), so it
@@ -142,7 +153,7 @@ class Provider(ABC):
                 tools = None
                 tool_choice = None
 
-        response = self._do_chat(model, messages, tools=tools, tool_choice=tool_choice)
+        response = self._do_chat(model, messages, tools=tools, tool_choice=tool_choice, extra_params=extra_params)
 
         # Generic, provider-agnostic real TOKEN persistence (2026-09-10) —
         # for the Usage counters panel AND the real savings-summary
@@ -178,10 +189,15 @@ class Provider(ABC):
         messages: list[ChatMessage],
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        extra_params: dict | None = None,
     ) -> ChatResponse:
         """Provider-specific transport — build the request, call the API,
         parse the response. Same contract chat() used to document
         directly; implement this exactly as chat() was implemented before
         this split. Never call this directly — call .chat() so the
-        request gets counted."""
+        request gets counted.
+
+        extra_params: merge directly into the JSON payload before
+        sending (`payload.update(extra_params)` or equivalent) — see
+        chat()'s own docstring above."""
         raise NotImplementedError
