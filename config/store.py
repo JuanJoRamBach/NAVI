@@ -221,6 +221,40 @@ DEFAULTS = {
             "provider": "cloudflare", "model": "@cf/qwen/qwen2.5-coder-32b-instruct",
             "fallback": [{"provider": "llm7", "model": "gpt-oss"}],
         },
+        # context_synthesis (2026-09-13): every whole-conversation
+        # synthesis job — context.md compaction (dispatcher/compaction.py's
+        # compact_context) and Research mode's plan drafting. Deliberately
+        # its OWN role rather than reusing normal_chat's, for two real
+        # reasons:
+        #
+        # 1. Quota shape. Ollama Cloud's free tier is GPU-time/session-
+        #    metered (5h sessions, weekly windows — see providers/
+        #    ollama_cloud.py's own docstring), NOT token-metered like
+        #    Groq/Cloudflare/Mistral. Compaction is infrequent and bursty,
+        #    which fits a session budget well, and routing it here means it
+        #    stops competing with live chat for the same measured daily
+        #    token allowance.
+        # 2. Capability shape. This is a high-reasoning, LONG-CONTEXT job
+        #    (it reads a whole raw chat log and decides what's worth
+        #    keeping), not cheap extraction. Real benchmark check
+        #    (Artificial Analysis, 2026-09-13): Nemotron 3 Super scores
+        #    91.75 on RULER long-context retrieval at 1M tokens vs
+        #    gpt-oss-120b's 22.30 — a very large gap on precisely the skill
+        #    this job needs. Super is also only 12B ACTIVE params (of 120B,
+        #    MoE), so it's cheaper per token than a denser 120b despite
+        #    matching or beating it on quality. Nemotron 3 Ultra was
+        #    considered and rejected: ~55B active params is far more
+        #    compute for a job Super already appears to dominate.
+        #
+        # Fallback is mistral-small-latest specifically for its 256K
+        # context — when Ollama's session window is exhausted this job
+        # still has to read a whole conversation, so context length matters
+        # more here than raw capability. Flagged as an open choice in
+        # how_to_handle_context.md; revisit if it proves too weak.
+        "context_synthesis": {
+            "provider": "ollama_cloud", "model": "nemotron-3-super",
+            "fallback": [{"provider": "mistral", "model": "mistral-small-latest"}],
+        },
         # agent_work: backs each node of an Agent Work workflow run
         # (dispatcher/agent_work.py) AND Agent Work's own chat
         # (run_stored_mode_chat). Moved BACK onto Groq's gpt-oss-120b as
@@ -1066,3 +1100,21 @@ def _migrate_off_dead_llm7_gpt_oss_2026_09_12():
 
 
 _migrate_off_dead_llm7_gpt_oss_2026_09_12()
+
+
+def _migrate_add_context_synthesis_role_2026_09_13():
+    """Adds the context_synthesis role (see DEFAULTS above for the full
+    reasoning) to an already-materialized config.json. Fill-in-if-missing,
+    NOT a force-overwrite: unlike the dead-model migration above there's no
+    broken state to correct here — if this role already exists because
+    someone pinned it by hand, that pin is a real choice and this must not
+    stomp it."""
+    if config.get_role("context_synthesis"):
+        return
+    config.set_role(
+        "context_synthesis", "ollama_cloud", "nemotron-3-super",
+        fallback=[{"provider": "mistral", "model": "mistral-small-latest"}],
+    )
+
+
+_migrate_add_context_synthesis_role_2026_09_13()

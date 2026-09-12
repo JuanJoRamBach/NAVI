@@ -280,6 +280,37 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "flag_key_insight",
+            "description": "Records ONE durable fact from this exchange into the "
+                            "conversation's long-term memory, so it survives after the "
+                            "recent-message window scrolls past it. Call this ALONGSIDE "
+                            "your normal reply (not instead of it) when the user has "
+                            "established something worth remembering later: a fact about "
+                            "them or their work, a stated preference, a constraint, or a "
+                            "decision they've made and why. Do NOT call it for ordinary "
+                            "conversational turns, for anything you inferred rather than "
+                            "were told, or for something already obvious from earlier in "
+                            "the conversation — a memory full of noise is worse than a "
+                            "short one. Most turns should not call this at all.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "insight": {
+                        "type": "string",
+                        "description": "The fact, in one self-contained sentence that will "
+                                        "still make sense months from now with no "
+                                        "surrounding conversation — write \"JuanJo prefers "
+                                        "terse replies without preamble\", not \"he prefers "
+                                        "that\".",
+                    },
+                },
+                "required": ["insight"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "propose_research_mode",
             "description": "Call this INSTEAD OF replying when the user's message has "
                             "genuinely shifted from a quick question into something that "
@@ -323,11 +354,20 @@ TOOL_SCHEMAS = [
     },
 ]
 
-# ask_user_choice, propose_research_mode, and propose_plan_ready are
-# deliberately NOT handled in dispatch() below — all three are
-# intercepted earlier, in run_stored_mode_chat/run_devslate_turn/
+# ask_user_choice, propose_research_mode, propose_plan_ready and
+# flag_key_insight are deliberately NOT handled in dispatch() below — all
+# four are intercepted earlier, in run_stored_mode_chat/run_devslate_turn/
 # dispatcher/research.py, before a call ever reaches the normal
-# execute-and-continue tool loop. Calling ask_user_choice is how the
+# execute-and-continue tool loop.
+#
+# flag_key_insight (2026-09-13) differs from the other three in one
+# important way: it is NON-TERMINAL. The other three ARE the turn's
+# outcome — calling one is how the model hands a question, a readiness
+# decision, or a scope-shift back to the dispatcher, and nothing else
+# happens that turn. flag_key_insight rides ALONGSIDE a normal reply: the
+# dispatcher records it into context.md's store and then carries on using
+# response.text as the actual answer, so a memory write never costs the
+# user their reply. Calling ask_user_choice is how the
 # model hands a question back to the user; calling propose_research_mode
 # (2026-09-12, Stage 3's "fast-path intent layer," IDEAS.md) is how it
 # flags a genuine scope shift toward real research, leaving the actual

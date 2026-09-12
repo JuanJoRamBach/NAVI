@@ -26,12 +26,21 @@ import re
 from datetime import datetime, timezone
 
 from config.store import config
-from dispatcher.executor import CITATION_STYLE_PROMPT, _extract_tool_results, _parse_tool_args, run_tool_loop, strip_reasoning_tags
+from dispatcher.compaction import CONTEXT_TRIGGER_TOKENS, compact_context
+from dispatcher.executor import (
+    CITATION_STYLE_PROMPT,
+    MAX_TOOL_ITERATIONS,
+    _extract_tool_results,
+    _parse_tool_args,
+    run_tool_loop,
+    strip_reasoning_tags,
+)
 from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, classify_family
 from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
+from storage.context_store import SOURCE_ASSISTANT, append_entry, build_context_block, record_friction
 from storage.conversations import append_message, get_messages
 from tools.registry import schemas_for
 
@@ -66,6 +75,52 @@ def _collapse_repeated_paragraphs(text: str) -> str:
             seen.add(normalized)
         kept.append(p)
     return "\n\n".join(kept)
+
+
+async def _maybe_compact_context(conversation_id: str) -> None:
+    """Fires a compaction pass if context.md has crossed its token ceiling.
+
+    Runs INLINE, at the end of the turn that crossed the line, after the
+    reply is already persisted. That placement is deliberate and is what
+    satisfies "block the user's input until compaction finishes"
+    (how_to_handle_context.md) with zero new infrastructure: the frontend
+    already disables the composer for the duration of an in-flight
+    /chat/send request, so extending that request IS the lock. No lock
+    column, no status endpoint, no polling loop, no way for a second
+    message to race a half-written snapshot.
+
+    The real cost is one visibly slower turn when it fires. Accepted for
+    v1 — moving this to a background job with a "Tidying up context…"
+    status is a genuine later refinement (the dead async-polling path in
+    navi-pwa's App.tsx is still sitting there for it), not a prerequisite.
+
+    Never raises: a failed compaction leaves the existing context in place
+    and the conversation keeps working, slightly over budget, rather than
+    the turn blowing up over housekeeping.
+    """
+    try:
+        _block, tokens = await build_context_block(conversation_id)
+        if tokens < CONTEXT_TRIGGER_TOKENS:
+            return
+        print(f"[chat] context.md at {tokens} tokens (ceiling {CONTEXT_TRIGGER_TOKENS}) — compacting")
+        report = await compact_context(conversation_id)
+        if not report.get("ok"):
+            await record_friction(
+                "compaction_failed", severity=3, conversation_id=conversation_id,
+                detail=str(report.get("reason")),
+            )
+        elif report.get("still_above_target"):
+            # The "hit the floor" signal (how_to_handle_context.md's open
+            # escape-valve question) — compaction ran but couldn't get
+            # under target. Recorded so the eventual spin-off-a-new-chat
+            # rule has real data to be designed against, rather than
+            # guessing a threshold now.
+            await record_friction(
+                "compaction_above_target", severity=2, conversation_id=conversation_id,
+                detail=f"{report.get('after_tokens')} tokens after compaction",
+            )
+    except Exception as e:
+        print(f"[chat] context compaction check failed (non-fatal): {e}")
 
 
 def _extract_created_workflow_id(sent_messages: list[ChatMessage]) -> str | None:
@@ -239,6 +294,27 @@ async def run_stored_mode_chat(
     base_system_parts = [brief.system_prompt]
     if tools:
         base_system_parts.append(CITATION_STYLE_PROMPT)
+    # context.md (2026-09-13) — the conversation's distilled durable memory,
+    # riding along on every turn so a fact established 50 messages ago still
+    # reaches the model after RECENT_MESSAGE_WINDOW scrolled past it. Sits
+    # inside the SAME single system message as the brief, not a second one
+    # (Cloudflare rejects any system message that isn't message[0] — see the
+    # long comment above), and BEFORE the history block, which keeps the
+    # documented prefix-caching invariant intact: it only changes when a
+    # compaction pass runs or a new insight is flagged, not per-turn.
+    #
+    # agent_work is excluded by construction — it's deliberately stateless
+    # (see below), so durable memory would contradict its whole design.
+    if mode != "agent_work":
+        context_block, _context_tokens = await build_context_block(conversation_id)
+        if context_block:
+            base_system_parts.append(
+                "## What you already know about this conversation\n"
+                "Durable memory from earlier in this conversation, distilled. Treat it as "
+                "established background, not as something the user just said — don't "
+                "re-confirm it back to them unprompted.\n\n"
+                + context_block
+            )
     # AGENT_WORK_REVIEW_INSTRUCTION's "confirm on a LATER message" design
     # requires the model to remember its own proposal on a future turn —
     # incompatible with agent_work now being stateless (2026-09-03,
@@ -344,6 +420,26 @@ async def run_stored_mode_chat(
                 f"[run_stored_mode_chat] attempt {i} FIRST reply: "
                 f"text={(response.text or '')[:200]!r} tool_calls={[tc.name for tc in response.tool_calls]}"
             )
+            # flag_key_insight is intercepted FIRST and is NON-TERMINAL —
+            # it's recorded and then execution carries straight on, so a
+            # memory write never costs the user their actual reply (see
+            # tools/registry.py's own note on why this one differs from the
+            # other three intercepted tools). Stripped from response.tool_calls
+            # afterward so the tool loop below doesn't try to dispatch it —
+            # dispatch() has no handler and would raise ToolExecutionError.
+            insight_calls = [tc for tc in response.tool_calls if tc.name == "flag_key_insight"]
+            if insight_calls:
+                response.tool_calls = [tc for tc in response.tool_calls if tc.name != "flag_key_insight"]
+                for tc in insight_calls:
+                    insight = (_parse_tool_args(tc.arguments).get("insight") or "").strip()
+                    if insight:
+                        # Provenance matters at consolidation time, not now:
+                        # SOURCE_ASSISTANT records that a model wrote this
+                        # down, so compaction can refuse to promote it into
+                        # a user-stated fact. See storage/context_store.py.
+                        await append_entry(conversation_id, insight, source=SOURCE_ASSISTANT)
+                        print(f"[run_stored_mode_chat] flagged key insight: {insight[:120]!r}")
+
             research_mode_call = next((tc for tc in response.tool_calls if tc.name == "propose_research_mode"), None)
             if research_mode_call:
                 # Stage 3's "fast-path intent layer" (IDEAS.md,
@@ -401,6 +497,17 @@ async def run_stored_mode_chat(
                     f"text={(response.text or '')[:200]!r} tool_calls={[tc.name for tc in response.tool_calls]} "
                     f"created_workflow_id={created_workflow_id}"
                 )
+                if iterations >= MAX_TOOL_ITERATIONS and response.tool_calls:
+                    # Hit the ceiling while STILL asking for more tools — the
+                    # model never reached an answer on its own. Distinct from
+                    # merely using every iteration and then replying, which is
+                    # fine. Recorded here rather than inside run_tool_loop
+                    # (that function is sync — see its own note).
+                    await record_friction(
+                        "tool_loop_exhausted", severity=2, conversation_id=conversation_id,
+                        detail=f"{attempt['provider']}/{attempt['model']} still requesting "
+                               f"{[tc.name for tc in response.tool_calls]} at limit",
+                    )
                 if iterations > 0 and not response.text and not response.tool_calls:
                     # run_tool_loop actually executed a real tool call here
                     # (e.g. create_workflow persisted a row, send_to_telegram
@@ -455,11 +562,31 @@ async def run_stored_mode_chat(
                 reply = _extract_tool_results(sent_messages) or "(empty reply)"
             else:
                 reply = strip_reasoning_tags(response.text) or "(empty reply)"
-            reply = _collapse_repeated_paragraphs(reply)
+            collapsed = _collapse_repeated_paragraphs(reply)
+            if collapsed != reply:
+                # The repetition-loop safety net actually tripped — a real
+                # quality signal that was previously just silently patched
+                # over. Logged as friction now (2026-09-13) rather than
+                # discarded; see storage/context_store.py on why all these
+                # signals land in one shared table.
+                await record_friction(
+                    "repetition_loop", severity=2, conversation_id=conversation_id,
+                    detail=f"{attempt['provider']}/{attempt['model']}",
+                )
+            reply = collapsed
             if i > 0:
                 reply += f"\n\n⚡ (primary was unavailable, answered via {attempt['provider']}/{attempt['model']} instead)"
+                await record_friction(
+                    "fallback_used", severity=1, conversation_id=conversation_id,
+                    detail=f"attempt {i}: {attempt['provider']}/{attempt['model']}",
+                )
             print(f"[run_stored_mode_chat] attempt {i}: DECISION = success, returning (created_workflow_id={created_workflow_id})")
             await append_message(conversation_id, "navi", reply, provider=attempt["provider"], model=attempt["model"])
+            # Ceiling check, AFTER the reply is persisted — see
+            # _maybe_compact_context's own docstring for why compaction
+            # runs inline here rather than as a background job.
+            if mode != "agent_work":
+                await _maybe_compact_context(conversation_id)
             return {
                 "text": reply, "provider": attempt["provider"], "model": attempt["model"],
                 "usage_note": response.usage_note,

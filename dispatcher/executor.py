@@ -299,6 +299,12 @@ def run_tool_loop(
         )
 
     print(f"[run_tool_loop] done after {iterations} iteration(s), final text={(response.text or '')[:200]!r}")
+    # NOTE: "hit MAX_TOOL_ITERATIONS while still requesting tools" is a real
+    # friction signal, but it's recorded by the CALLER (dispatcher/chat.py),
+    # not here — this function is sync and runs inside asyncio.to_thread, so
+    # it can't await the async friction writer, and spinning up a nested
+    # event loop just to log something would be worse than the signal is
+    # worth. Callers have `iterations` and `response.tool_calls` already.
     return response, messages, iterations
 
 

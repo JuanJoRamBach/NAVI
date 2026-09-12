@@ -69,6 +69,12 @@ _ROLE_NAME_FOR_CONTEXT = {
     "autonomous": "dispatcher_autonomous",
     "devslate": "dev_slate_chat",
     "agent_work": "agent_work",
+    # context_synthesis (2026-09-13): whole-conversation compaction and
+    # plan-drafting — infrequent, high-reasoning, long-context jobs that
+    # deliberately do NOT share a quota bucket with live chat. See
+    # config/store.py's own comment on the role for why it's primaried on
+    # Ollama Cloud specifically.
+    "context_synthesis": "context_synthesis",
 }
 
 
