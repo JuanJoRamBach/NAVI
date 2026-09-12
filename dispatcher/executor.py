@@ -161,6 +161,34 @@ CITATION_STYLE_PROMPT = (
     "Markdown link: [short title](url). Don't paste bare URLs in your answer."
 )
 
+# MiniMax M3's own docs (platform.minimax.io/docs/guides/text-m3-function-call,
+# fetched 2026-09-12, not assumed) confirm its default/native format embeds
+# reasoning INLINE in the content field as <think>reasoning</think>, with an
+# explicit "do not modify the content field" instruction for multi-turn
+# replay. Checked against this codebase's own providers/gmi.py and
+# providers/ollama_cloud.py (the two transports that actually serve
+# MiniMax M3/M2.7): both already forward `choice.get("content")` into
+# ChatResponse.text completely untouched, and run_tool_loop's own
+# assistant-message reconstruction below already forwards response.text
+# unmodified too — so the INTERNAL multi-turn replay this docs warning is
+# about already works correctly, contrary to prompt_family.py's older,
+# not-fully-verified note that run_tool_loop "doesn't preserve" this.
+#
+# The real, separate gap this closes instead: nothing strips the <think>
+# block back OUT before it becomes a user-visible reply or gets parsed as
+# structured JSON (dispatcher/research.py's execution-stage deliverable,
+# which would otherwise fail to json.loads outright on a leading <think>
+# tag). Only applied at the few points a response.text turns into an
+# outward-facing result — never inside run_tool_loop's own internal
+# replay, which must keep the full untouched content per MiniMax's docs.
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning_tags(text: str | None) -> str:
+    if not text:
+        return text or ""
+    return _THINK_TAG_RE.sub("", text).strip()
+
 
 def run_tool_loop(
     provider: Provider, model: str, messages: list[ChatMessage], response: ChatResponse, context: dict,

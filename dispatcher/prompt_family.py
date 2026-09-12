@@ -29,11 +29,21 @@ Two separate kinds of adaptation:
    that this function existed but had nowhere to send its output.
 
 A THIRD real per-family finding — MiniMax M3 needing its internal
-reasoning fields preserved across multi-turn tool-calling or quality
-degrades — deliberately does NOT live here. It's not a prompt or a
-parameter, it's dispatcher/executor.py's run_tool_loop dropping a field
-it should carry forward on replay. Separate, targeted fix, gated on
-family, when picked up.
+reasoning preserved across multi-turn tool-calling or quality degrades
+— deliberately does NOT live here, it's dispatcher/executor.py's
+concern. **Corrected 2026-09-12** (this note previously said run_tool_loop
+"drops" the field — checked against MiniMax's own docs and this
+codebase's actual provider transports, not assumed): MiniMax's default
+format embeds reasoning INLINE in the content field
+(`<think>reasoning</think>`), and providers/gmi.py / providers/
+ollama_cloud.py already forward that field completely untouched into
+ChatResponse.text — run_tool_loop's own replay already preserves it
+correctly, it never needed a fix. The REAL gap was the opposite
+direction: nothing stripped the tag back OUT before it became a
+user-visible reply or got parsed as structured JSON (Research mode's
+execution stage) — see executor.py's strip_reasoning_tags, applied only
+at those outward-facing points, never inside run_tool_loop's internal
+replay.
 
 The user's own message is NEVER touched by anything in this module —
 system-prompt text and request parameters only. See dispatcher/chat.py's

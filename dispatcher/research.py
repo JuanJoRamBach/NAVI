@@ -52,7 +52,7 @@ from datetime import datetime, timezone
 
 from config.store import config
 from dispatcher.compaction import compact_conversation, strip_code_fence
-from dispatcher.executor import _parse_tool_args, run_tool_loop
+from dispatcher.executor import _parse_tool_args, run_tool_loop, strip_reasoning_tags
 from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, classify_family
 from dispatcher.slugify import slugify
@@ -230,7 +230,7 @@ async def _run_planning_turn(conversation_id: str) -> dict:
             if not response.text and not response.tool_calls:
                 last_error = f"{attempt['provider']}/{attempt['model']} returned neither text nor a tool call"
                 continue
-            reply = response.text or "(empty reply)"
+            reply = strip_reasoning_tags(response.text) or "(empty reply)"
             if i > 0:
                 reply += f"\n\n⚡ (primary was unavailable, answered via {attempt['provider']}/{attempt['model']} instead)"
             await append_message(conversation_id, "navi", reply, provider=attempt["provider"], model=attempt["model"])
@@ -267,7 +267,11 @@ async def _draft_and_present_plan(conversation_id: str) -> dict:
 
 
 def _parse_report_json(text: str) -> dict | None:
-    stripped = strip_code_fence(text or "")
+    # strip_reasoning_tags first — a reasoning-native fallback (MiniMax M3,
+    # confirmed via its own docs to embed <think>...</think> directly in
+    # content by default) would otherwise leave the final JSON prefixed
+    # with a raw reasoning block, failing json.loads outright.
+    stripped = strip_code_fence(strip_reasoning_tags(text) or "")
     if not stripped:
         return None
     try:

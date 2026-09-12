@@ -26,7 +26,7 @@ import re
 from datetime import datetime, timezone
 
 from config.store import config
-from dispatcher.executor import CITATION_STYLE_PROMPT, _extract_tool_results, _parse_tool_args, run_tool_loop
+from dispatcher.executor import CITATION_STYLE_PROMPT, _extract_tool_results, _parse_tool_args, run_tool_loop, strip_reasoning_tags
 from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, classify_family
 from dispatcher.provider_debug import save_failed_exchange
@@ -152,7 +152,7 @@ def run_mode_chat(mode: str, text: str) -> str:
                     context={"command": f"chat-{mode}", "topic_slug": "chat"},
                     tools=tools, extra_params=extra_params,
                 )
-            reply = _collapse_repeated_paragraphs(response.text or "(empty reply)")
+            reply = _collapse_repeated_paragraphs(strip_reasoning_tags(response.text) or "(empty reply)")
             if i > 0:
                 reply += f"\n\n⚡ (Groq was busy, answered via {attempt['provider']}/{attempt['model']} instead)"
             elif response.usage_note:
@@ -454,7 +454,7 @@ async def run_stored_mode_chat(
                 # the raw results were sitting right there in the transcript.
                 reply = _extract_tool_results(sent_messages) or "(empty reply)"
             else:
-                reply = response.text or "(empty reply)"
+                reply = strip_reasoning_tags(response.text) or "(empty reply)"
             reply = _collapse_repeated_paragraphs(reply)
             if i > 0:
                 reply += f"\n\n⚡ (primary was unavailable, answered via {attempt['provider']}/{attempt['model']} instead)"
@@ -563,7 +563,7 @@ async def run_agent_vault_chat(agent: dict, conversation_id: str, text: str) -> 
             if not response.text and sent_messages is not messages:
                 reply = _extract_tool_results(sent_messages) or "(empty reply)"
             else:
-                reply = response.text or "(empty reply)"
+                reply = strip_reasoning_tags(response.text) or "(empty reply)"
             reply = _collapse_repeated_paragraphs(reply)
             if i > 0:
                 reply += f"\n\n⚡ (primary was unavailable, answered via {attempt['provider']}/{attempt['model']} instead)"

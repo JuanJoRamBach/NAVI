@@ -31,6 +31,7 @@ import json
 from typing import Awaitable, Callable
 
 from dispatcher.mode_briefs import get_mode_brief
+from dispatcher.executor import strip_reasoning_tags
 from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, classify_family
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
@@ -175,7 +176,7 @@ async def run_devslate_turn(conversation_id: str, user_text: str, relay: ToolRel
                 )
                 iterations += 1
 
-            reply = response.text or "(empty reply)"
+            reply = strip_reasoning_tags(response.text) or "(empty reply)"
             if i > 0:
                 reply += f"\n\n⚡ (primary was unavailable, answered via {attempt['provider']}/{attempt['model']} instead)"
             await append_message(conversation_id, "navi", reply, provider=attempt["provider"], model=attempt["model"])
