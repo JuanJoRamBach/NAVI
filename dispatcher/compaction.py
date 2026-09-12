@@ -43,8 +43,17 @@ from storage.conversations import get_messages
 # Both are starting points to tune against real usage, not derived
 # constants — see how_to_handle_context.md's own reasoning for why a flat
 # ceiling sized to the smallest permitted model was rejected.
-CONTEXT_TRIGGER_TOKENS = 12_000
-CONTEXT_TARGET_TOKENS = 6_000
+#
+# Lowered from 12,000/6,000 to 5,000/2,500 (2026-09-13) against a real
+# measurement rather than a guess: a realistic flagged insight is ~26
+# tokens (measured across six real-shaped examples, range 13-46), so
+# 12,000 was ~420 insights — effectively never firing, which defeats the
+# point of having a ceiling. At 5,000 it's ~175 insights. JuanJo's call,
+# and the intended tuning direction is explicit: if this compacts TOO
+# eagerly in practice, raise it back gradually until it settles, rather
+# than starting loose and hoping.
+CONTEXT_TRIGGER_TOKENS = 5_000
+CONTEXT_TARGET_TOKENS = 2_500
 
 # Below this, an entry's survival check is skipped — a very short flagged
 # note ("fiscal year starts in April") has too few distinctive words for
