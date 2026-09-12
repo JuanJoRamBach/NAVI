@@ -70,7 +70,7 @@ from messaging.base import IncomingMessage, MessagingAdapter, MessagingError
 from messaging.discord import DiscordAdapter
 from messaging.telegram import TelegramAdapter
 from config.store import config
-from jobs.model_ranking import fetch_aa_benchmarks, list_candidates, load_snapshot, refresh_snapshot
+from jobs.model_ranking import SNAPSHOT_SCHEMA_VERSION, fetch_aa_benchmarks, list_candidates, load_snapshot, refresh_snapshot
 from push.sender import PushError, add_subscription, send_push, subscription_count
 from storage.filen import StorageError, download_for_reply, file_download_url
 from storage.conversations import (
@@ -440,10 +440,23 @@ async def _start_background_scheduler() -> None:
     # right below — don't just trust the recurring schedule alone. 20h
     # threshold (not 24h) leaves real margin so a normal daily cadence
     # doesn't ALSO refire this at every restart within the same day.
+    #
+    # schema_version check (2026-09-12, same day, separate real incident):
+    # a fetch_llm7_models bug fix was correctly deployed but had zero
+    # visible effect because the snapshot was already <20h old from an
+    # earlier refresh — age alone can't tell "fresh data" apart from
+    # "fresh timestamp, stale logic." jobs/model_ranking.py's
+    # SNAPSHOT_SCHEMA_VERSION is bumped whenever fetch_*/rank_for_task
+    # logic meaningfully changes; a mismatch (including an old snapshot
+    # with no schema_version field at all, i.e. None) is treated the
+    # same as missing/stale so a code-only fix can't silently sit
+    # un-applied against cached data again.
     existing_snapshot = load_snapshot()
     snapshot_age_s = time.time() - (existing_snapshot or {}).get("fetched_at", 0)
-    if not existing_snapshot or snapshot_age_s > 20 * 3600:
-        print(f"[startup] model-ranking snapshot stale or missing (age={snapshot_age_s:.0f}s) — refreshing now")
+    schema_stale = (existing_snapshot or {}).get("schema_version") != SNAPSHOT_SCHEMA_VERSION
+    if not existing_snapshot or snapshot_age_s > 20 * 3600 or schema_stale:
+        reason = "missing" if not existing_snapshot else "schema version changed" if schema_stale else f"age={snapshot_age_s:.0f}s"
+        print(f"[startup] model-ranking snapshot stale ({reason}) — refreshing now")
         await _refresh_model_ranking_snapshot()
     # NAVI reliability Stage 1 (2026-09-11) — crash-safe resume. No grace
     # period here: this fires once, right as THIS process boots, so

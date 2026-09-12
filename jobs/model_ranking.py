@@ -33,6 +33,21 @@ MODEL_RANKING_PATH = Path(__file__).parent.parent / "model_ranking_snapshot.json
 AA_CACHE_PATH = Path(__file__).parent.parent / "aa_benchmarks_cache.json"
 AA_CACHE_MAX_AGE_S = 7 * 24 * 3600  # weekly — benchmark quality doesn't shift day to day
 
+# Real incident, 2026-09-12: fixed a genuine bug in fetch_llm7_models
+# (was treating LLM7's tier:"turbo" as the sole free-tier signal,
+# wrongly including a paid model) — the code fix was correct and
+# deployed, but the on-disk snapshot was already <20h old from an
+# earlier same-day refresh, so server.py's startup staleness check
+# (age-only) didn't regenerate it and the fix had zero visible effect
+# until someone manually forced a refresh. Bump this whenever fetch_*/
+# rank_for_task logic meaningfully changes — server.py's startup hook
+# checks it alongside the age check and forces an immediate refresh on
+# a mismatch, so a code-only fix can't silently sit un-applied against
+# stale cached data again. Deliberately just a manually-bumped int, not
+# a content hash — this file changes rarely enough that remembering to
+# bump it is a fine tradeoff for the simplicity.
+SNAPSHOT_SCHEMA_VERSION = 1
+
 GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 LLM7_MODELS_URL = "https://api.llm7.io/v1/models"
@@ -638,6 +653,7 @@ def build_ranking_snapshot() -> dict:
     # model GMI's catalog has, not the free subset.
     return {
         "fetched_at": time.time(),
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "catalog": catalog,
         "provider_counts": {
             p: {
