@@ -15,6 +15,7 @@ model as the tool result.
 import json
 from urllib.parse import urlparse as _urlparse
 
+from tools.content_safety import screened
 from tools.document_save import DocumentError, create_document
 from tools.fetch import FetchError, fetch_page
 from tools.notes import NoteError, save_note
@@ -421,13 +422,13 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
                 if not results:
                     return "No results found on any trusted site for this term."
                 lines = [f"- {r['title']} ({r['url']}): {r['snippet']}" for r in results]
-                return "\n".join(lines)
+                return screened("\n".join(lines))
 
             results = web_search(query, max_results=max_results)
             if not results:
                 return "No results found."
             lines = [f"- {r['title']} ({r['url']}): {r['snippet']}" for r in results]
-            return "\n".join(lines)
+            return screened("\n".join(lines))
 
         if name == "save_source":
             # Enforced in code, not just asked for in the tool description
@@ -474,7 +475,7 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
             return f"Saved source document {doc_id} for review."
 
         if name == "fetch_page":
-            return fetch_page(arguments["url"])
+            return screened(fetch_page(arguments["url"]))
 
         if name == "save_note":
             path = save_note(
