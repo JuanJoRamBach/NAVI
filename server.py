@@ -163,7 +163,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=PWA_CORS_ORIGINS,
     allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Content-Type", "X-Navi-Api-Key"],
+    allow_headers=["Content-Type", "X-Navi-Api-Key", "Authorization"],
 )
 
 # Shared-secret gate for the whole API (2026-09-04) — real gap found and
