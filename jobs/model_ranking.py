@@ -214,6 +214,18 @@ def fetch_llm7_models() -> list[dict]:
     for m in data:
         if m.get("tier") != "turbo":
             continue  # only turbo carries a free daily allotment
+        # Real bug, live-confirmed 2026-09-12 (flagged 2026-08-27, fixed
+        # now): "tier" alone isn't the free/paid signal — DeepSeek-V4-
+        # Flash-0731 carries tier="turbo" but usage_based_only=true and
+        # real non-zero pricing (confirmed directly against LLM7's own
+        # /v1/models). usage_based_only is the actual billing flag; the
+        # 3 real free turbo models (codestral-latest, minimax-m2.7,
+        # mistral-Nemo-Instruct-2407) all report usage_based_only=false
+        # despite also carrying a "pricing" block — that block is just
+        # the rate that WOULD apply if usage-based billing kicked in,
+        # not evidence they're actually billed.
+        if m.get("usage_based_only"):
+            continue
         mid = m.get("id", "")
         caps = m.get("capabilities") or {}
         out.append({
