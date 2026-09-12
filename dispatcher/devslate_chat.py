@@ -31,6 +31,7 @@ import json
 from typing import Awaitable, Callable
 
 from dispatcher.mode_briefs import get_mode_brief
+from dispatcher.prompt_family import adapt_system_prompt, classify_family
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
 from storage.conversations import append_message, get_messages, get_task_state
@@ -88,9 +89,15 @@ async def run_devslate_turn(conversation_id: str, user_text: str, relay: ToolRel
     # own default provider) rejects any system-role message that isn't
     # both the first AND only one (2026-09-02, discovered via the same bug
     # in dispatcher/chat.py's run_stored_mode_chat).
+    #
+    # Not a system ChatMessage yet — base_system_content gets adapted per
+    # family (dispatcher/prompt_family.py, 2026-09-11) fresh for each
+    # fallback attempt below, same reasoning and pattern as
+    # dispatcher/chat.py's run_stored_mode_chat: a fallback chain can hand
+    # this request to a genuinely different model family.
     state_block = format_task_state_for_prompt(task_state)
-    system_content = f"{brief.system_prompt}\n\nCurrent Slate task state:\n{state_block}" if state_block else brief.system_prompt
-    messages = [ChatMessage(role="system", content=system_content)]
+    base_system_content = f"{brief.system_prompt}\n\nCurrent Slate task state:\n{state_block}" if state_block else brief.system_prompt
+    history_messages: list[ChatMessage] = []
     # The just-appended user message is already the last row `history`
     # returns (get_messages reads it back from storage), so this isn't
     # double-counted. A past failure's own error text (always prefixed
@@ -99,7 +106,7 @@ async def run_devslate_turn(conversation_id: str, user_text: str, relay: ToolRel
     for m in history:
         if m["role"] == "navi" and m["content"].startswith("⚠️"):
             continue
-        messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
+        history_messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
 
     try:
         role = get_dispatcher_role(context="devslate")
@@ -117,6 +124,15 @@ async def run_devslate_turn(conversation_id: str, user_text: str, relay: ToolRel
         except Exception as e:
             last_error = str(e)
             continue
+
+        # Per-family system-prompt adaptation (2026-09-11) — built fresh
+        # per attempt, not once before the loop, since a fallback chain
+        # can hand this request to a genuinely different model family.
+        family = classify_family(attempt["provider"], attempt["model"])
+        system_content = adapt_system_prompt(base_system_content, family, attempt["model"])
+        messages = list(history_messages)
+        if system_content is not None:
+            messages.insert(0, ChatMessage(role="system", content=system_content))
 
         try:
             response = await asyncio.to_thread(

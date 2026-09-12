@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from config.store import config
 from dispatcher.executor import CITATION_STYLE_PROMPT, _extract_tool_results, _parse_tool_args, run_tool_loop
 from dispatcher.mode_briefs import get_mode_brief
+from dispatcher.prompt_family import adapt_system_prompt, classify_family
 from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
@@ -107,8 +108,7 @@ def run_mode_chat(mode: str, text: str) -> str:
     # Combined into one system message, not two — see run_stored_mode_chat
     # below for why (Cloudflare rejects more than one system-role entry).
     tools = schemas_for(brief.tools) if brief.tools else None
-    system_content = f"{brief.system_prompt}\n\n{CITATION_STYLE_PROMPT}" if tools else brief.system_prompt
-    messages = [ChatMessage(role="system", content=system_content), ChatMessage(role="user", content=text)]
+    base_system_content = f"{brief.system_prompt}\n\n{CITATION_STYLE_PROMPT}" if tools else brief.system_prompt
 
     # Same-model-family fallback chain (added 2026-08-29 after a real
     # "Groq rate limited" hard failure) — try the primary, then each
@@ -122,6 +122,21 @@ def run_mode_chat(mode: str, text: str) -> str:
         except Exception as e:
             last_error = str(e)
             continue
+        # Per-family system-prompt adaptation (2026-09-11,
+        # dispatcher/prompt_family.py) — built fresh per attempt, not
+        # once before the loop, since a fallback chain can hand this
+        # request to a genuinely different model family. Deliberately
+        # skipped for agent_work — see prompt_family.py's own scope
+        # docstring for why (stateless, tool-call-driven, no free-form
+        # prose to adapt).
+        if mode == "agent_work":
+            system_content = base_system_content
+        else:
+            family = classify_family(attempt["provider"], attempt["model"])
+            system_content = adapt_system_prompt(base_system_content, family, attempt["model"])
+        messages = [ChatMessage(role="user", content=text)]
+        if system_content is not None:
+            messages.insert(0, ChatMessage(role="system", content=system_content))
         try:
             response = provider.chat(model=attempt["model"], messages=messages, tools=tools)
             if tools and response.tool_calls:
@@ -208,16 +223,24 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
     # just "system messages must be consecutively first." Combining into
     # one message satisfies either reading and can't regress anything.
     tools = schemas_for(brief.tools) if brief.tools else None
-    system_parts = [brief.system_prompt]
+    base_system_parts = [brief.system_prompt]
     if tools:
-        system_parts.append(CITATION_STYLE_PROMPT)
+        base_system_parts.append(CITATION_STYLE_PROMPT)
     # AGENT_WORK_REVIEW_INSTRUCTION's "confirm on a LATER message" design
     # requires the model to remember its own proposal on a future turn —
     # incompatible with agent_work now being stateless (2026-09-03,
     # JuanJo: "no context.md for the chat... just needs the LLM to create
     # the json schema with the steps"). auto_accept stays a harmless no-op
     # parameter for every other mode.
-    messages = [ChatMessage(role="system", content="\n\n".join(system_parts))]
+    #
+    # Not a system ChatMessage yet — base_system_content gets adapted per
+    # family (dispatcher/prompt_family.py, 2026-09-11) fresh for each
+    # fallback attempt below, since a fallback chain can hand this same
+    # request to a genuinely different model family. Everything below
+    # this point (history_messages) is the part that stays IDENTICAL
+    # across attempts.
+    base_system_content = "\n\n".join(base_system_parts)
+    history_messages: list[ChatMessage] = []
     # The just-appended user message is already the last row `history`
     # returns (get_messages reads it back from storage) — not double
     # counted. "navi" -> "assistant" matches storage's own role
@@ -245,12 +268,12 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
     # append_message above/below for the frontend's own display
     # history — this only changes what's SENT to the model.
     if mode == "agent_work":
-        messages.append(ChatMessage(role="user", content=text))
+        history_messages.append(ChatMessage(role="user", content=text))
     else:
         for m in history:
             if m["role"] == "navi" and m["content"].startswith("⚠️"):
                 continue
-            messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
+            history_messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
     # UTC time grounding (JuanJo, 2026-09-01: "if it asks for something
     # close to 'do it in X time', must send the messages with a UTC
     # signal") — the model has no inherent sense of "now," so a request
@@ -270,7 +293,7 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
     # additional for prefix-based caching while keeping every system
     # message genuinely first. The stored copy (already persisted above,
     # via append_message) is untouched — only this outgoing copy changes.
-    messages[-1].content = f"{messages[-1].content}\n\n[Current UTC time: {datetime.now(timezone.utc).isoformat()}]"
+    history_messages[-1].content = f"{history_messages[-1].content}\n\n[Current UTC time: {datetime.now(timezone.utc).isoformat()}]"
 
     attempts = config.get_attempts([{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", []))
     attempt_labels = [f"{a['provider']}/{a['model']}" for a in attempts]
@@ -284,6 +307,17 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
             last_error = str(e)
             print(f"[run_stored_mode_chat] attempt {i} get_provider failed: {e}")
             continue
+        # Per-family system-prompt adaptation (2026-09-11) — built fresh
+        # per attempt; skipped for agent_work (see prompt_family.py's own
+        # scope docstring on why).
+        if mode == "agent_work":
+            system_content = base_system_content
+        else:
+            family = classify_family(attempt["provider"], attempt["model"])
+            system_content = adapt_system_prompt(base_system_content, family, attempt["model"])
+        messages = list(history_messages)
+        if system_content is not None:
+            messages.insert(0, ChatMessage(role="system", content=system_content))
         try:
             sent_messages = messages
             response = await asyncio.to_thread(provider.chat, model=attempt["model"], messages=messages, tools=tools)
