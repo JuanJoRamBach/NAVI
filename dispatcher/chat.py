@@ -179,7 +179,9 @@ def run_mode_chat(mode: str, text: str) -> str:
 # still meaningful for nothing else) purely so no caller needs updating.
 
 
-async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_accept: bool = True) -> dict:
+async def run_stored_mode_chat(
+    mode: str, conversation_id: str, text: str, auto_accept: bool = True, reasoning_effort: str | None = None,
+) -> dict:
     """Persisted sibling of run_mode_chat above — appends the user's
     message, replays a windowed slice of REAL history (not just this one
     message, except for agent_work — see below) alongside the mode's
@@ -188,7 +190,14 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
     mirroring dispatcher/devslate_chat.py's run_devslate_turn, which this
     is deliberately modeled on — same role-selection/fallback/tool-loop
     shape as run_mode_chat above, just with storage/conversations.py
-    wrapped around it instead of nothing."""
+    wrapped around it instead of nothing.
+
+    reasoning_effort (2026-09-12): the manual override from the PWA's
+    slider next to the model picker — passed straight through to
+    adapt_request_params, which only actually applies it for a non-Groq
+    gpt-oss attempt (see that function's own docstring). Harmless no-op
+    for every other family/provider, so callers that never send it
+    (typed /commands, older clients) are unaffected."""
     await append_message(conversation_id, "user", text)
 
     brief = get_mode_brief(mode)
@@ -322,7 +331,9 @@ async def run_stored_mode_chat(mode: str, conversation_id: str, text: str, auto_
         else:
             family = classify_family(attempt["provider"], attempt["model"])
             system_content = adapt_system_prompt(base_system_content, family, attempt["model"])
-            extra_params = adapt_request_params(family, attempt["provider"], has_tools=bool(tools)) or None
+            extra_params = adapt_request_params(
+                family, attempt["provider"], has_tools=bool(tools), reasoning_effort=reasoning_effort,
+            ) or None
         messages = list(history_messages)
         if system_content is not None:
             messages.insert(0, ChatMessage(role="system", content=system_content))

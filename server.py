@@ -988,6 +988,13 @@ async def chat_send(request: Request) -> JSONResponse:
     # dispatcher/chat.py's AGENT_WORK_REVIEW_INSTRUCTION) — defaults True
     # so omitting it (every other mode's client) is a no-op.
     auto_accept = payload.get("auto_accept", True)
+    # Manual reasoning-effort override from the PWA's slider next to the
+    # model picker (2026-09-12, IDEAS.md's "Per-model reasoning_effort
+    # control") — only meaningful for a non-Groq gpt-oss primary;
+    # validated here so a malformed/stale client value can't reach
+    # adapt_request_params as anything other than None or a real value.
+    raw_reasoning_effort = payload.get("reasoning_effort")
+    reasoning_effort = raw_reasoning_effort if raw_reasoning_effort in ("low", "medium", "high") else None
     if not text:
         return JSONResponse({"error": "missing 'text'"}, status_code=400)
     result = parse_message(text)
@@ -995,7 +1002,7 @@ async def chat_send(request: Request) -> JSONResponse:
     if result.kind == "plain_chat":
         if not conversation_id:
             conversation_id = await create_conversation(mode=mode)
-        reply = await run_stored_mode_chat(mode, conversation_id, text, auto_accept=auto_accept)
+        reply = await run_stored_mode_chat(mode, conversation_id, text, auto_accept=auto_accept, reasoning_effort=reasoning_effort)
         return JSONResponse({
             "reply": reply["text"], "conversation_id": conversation_id,
             "usage_note": reply.get("usage_note"), "choices": reply.get("choices"),

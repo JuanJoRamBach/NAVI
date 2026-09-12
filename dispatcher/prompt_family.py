@@ -173,7 +173,10 @@ def adapt_system_prompt(base_prompt: str, family: str, model: str) -> str | None
     return text
 
 
-def adapt_request_params(family: str, provider: str, has_tools: bool) -> dict:
+_VALID_REASONING_EFFORTS = {"low", "medium", "high"}
+
+
+def adapt_request_params(family: str, provider: str, has_tools: bool, reasoning_effort: str | None = None) -> dict:
     """Extra kwargs to merge into a provider.chat(...) call for this
     (family, provider) pair — forwarded via providers/base.py's
     extra_params passthrough.
@@ -191,15 +194,23 @@ def adapt_request_params(family: str, provider: str, has_tools: bool) -> dict:
     reasoning alone. Every other gpt-oss host NAVI routes to (LLM7,
     Cloudflare) sits on a per-DAY pool instead, no acute per-call risk,
     so only Groq gets hard-capped here. This is a technical ceiling,
-    not a preference — it's not meant to be bypassed by a caller, unlike
-    a future manual override which would only ever apply on a non-Groq
-    host in the first place (see the IDEAS.md design for why).
+    not a preference — it holds even under `reasoning_effort` below
+    (the manual slider only ever renders for a non-Groq gpt-oss primary
+    in the first place — see navi-pwa's App.tsx — but this is enforced
+    here too, not just left to the frontend to respect).
 
-    No phase-aware tiering (idle/exploratory/serious-job) yet — that
-    depends on Stage 3's fast-path intent layer, which doesn't exist.
-    "medium" here is the automatic, phase-blind default; automatic
-    tiering never reaches "high" regardless, per the same design doc.
+    `reasoning_effort` (2026-09-12) is the manual override from the
+    UI slider next to the model picker — only meaningful for a non-Groq
+    gpt-oss primary. When absent (automatic/phase-blind path — no
+    idle/exploratory/serious-job tiering exists yet, that depends on
+    Stage 3's fast-path intent layer), "medium" is the default; the
+    automatic path never reaches "high" regardless, per IDEAS.md's
+    design doc.
     """
     if family == "gpt-oss":
-        return {"reasoning_effort": "low" if provider == "groq" else "medium"}
+        if provider == "groq":
+            return {"reasoning_effort": "low"}
+        if reasoning_effort in _VALID_REASONING_EFFORTS:
+            return {"reasoning_effort": reasoning_effort}
+        return {"reasoning_effort": "medium"}
     return {}
