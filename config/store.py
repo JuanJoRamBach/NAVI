@@ -179,10 +179,17 @@ DEFAULTS = {
         # 2026-08 GA) sidesteps that entirely: it's Cloudflare's Neuron-
         # based free tier, not Groq's per-minute-token one, so this is a
         # real quality upgrade with no new quota risk, not a tradeoff.
+        # Real, live-confirmed break (2026-09-12): LLM7 retired "gpt-oss"
+        # from its catalog entirely — GET /v1/models (keyless, checked
+        # directly) no longer lists it at all. This role's primary WAS
+        # llm7/gpt-oss; every normal_chat request was failing outright on
+        # primary. Promoted to Cloudflare's own gpt-oss-120b (already
+        # trusted here — verified live on Cloudflare's catalog, 2026-08
+        # GA, was already this role's first fallback) rather than pick a
+        # new, unverified LLM7 model under incident pressure.
         "normal_chat": {
-            "provider": "llm7", "model": "gpt-oss",
+            "provider": "cloudflare", "model": "@cf/openai/gpt-oss-120b",
             "fallback": [
-                {"provider": "cloudflare", "model": "@cf/openai/gpt-oss-120b"},
                 {"provider": "mistral", "model": "mistral-small-latest"},
             ],
         },
@@ -667,7 +674,7 @@ def _migrate_dispatcher_chat_add_fallback():
     if not role.get("fallback"):
         config.set_role(
             "dispatcher_chat", role.get("provider", "groq"), role.get("model", "openai/gpt-oss-120b"),
-            fallback=[{"provider": "llm7", "model": "gpt-oss"}],
+            fallback=[{"provider": "mistral", "model": "ministral-8b-latest"}],
         )
     config.set("migrated_dispatcher_chat_add_fallback", True)
 
@@ -805,7 +812,7 @@ def _migrate_add_agent_work_role():
     if not config.get_role("agent_work"):
         config.set_role(
             "agent_work", "groq", "openai/gpt-oss-120b",
-            fallback=[{"provider": "llm7", "model": "gpt-oss"}],
+            fallback=[{"provider": "mistral", "model": "ministral-8b-latest"}],
         )
     config.set("migrated_add_agent_work_role", True)
 
@@ -1011,9 +1018,51 @@ def _migrate_dev_slate_chat_off_codestral_2026_09_11():
         return
     config.set_role(
         "dev_slate_chat", "cloudflare", "@cf/qwen/qwen2.5-coder-32b-instruct",
-        fallback=[{"provider": "llm7", "model": "gpt-oss"}],
+        fallback=[{"provider": "mistral", "model": "ministral-8b-latest"}],
     )
     config.set("migrated_dev_slate_chat_off_codestral_2026_09_11", True)
 
 
 _migrate_dev_slate_chat_off_codestral_2026_09_11()
+
+
+def _migrate_off_dead_llm7_gpt_oss_2026_09_12():
+    """Real, live-confirmed incident (2026-09-12): LLM7 retired "gpt-oss"
+    from its catalog — GET /v1/models (keyless, checked directly against
+    api.llm7.io) no longer lists it at all. This was normal_chat's actual
+    PRIMARY model (not just a fallback) — every normal_chat request was
+    failing outright. It was also the fallback for dev_slate_chat,
+    dispatcher_chat, and agent_work, so their safety net was silently
+    dead too, even though those roles weren't failing outright yet.
+
+    Editing DEFAULTS above only affects a brand-new store — this server's
+    already-materialized config.json keeps the dead references until
+    this runs once. Force-overwrites every affected role unconditionally
+    (not a fill-in-if-missing migration), same pattern as
+    _migrate_dev_slate_chat_off_codestral_2026_09_11 above — a manual
+    reassignment later isn't fought by this, since it only ever runs
+    once per instance."""
+    if config.get("migrated_off_dead_llm7_gpt_oss_2026_09_12"):
+        return
+    config.set_role(
+        "normal_chat", "cloudflare", "@cf/openai/gpt-oss-120b",
+        fallback=[{"provider": "mistral", "model": "mistral-small-latest"}],
+    )
+    for role_name, role in (
+        ("dev_slate_chat", {"provider": "cloudflare", "model": "@cf/qwen/qwen2.5-coder-32b-instruct"}),
+        ("dispatcher_chat", {"provider": "groq", "model": "openai/gpt-oss-120b"}),
+        ("agent_work", {"provider": "groq", "model": "openai/gpt-oss-120b"}),
+    ):
+        current = config.get_role(role_name) or role
+        # Only touch the fallback, keep whatever primary is already
+        # live (a prior manual pin on primary is a real, intentional
+        # choice — this migration's job is fixing the dead SAFETY NET,
+        # not overriding an unrelated deliberate pick).
+        config.set_role(
+            role_name, current.get("provider", role["provider"]), current.get("model", role["model"]),
+            fallback=[{"provider": "mistral", "model": "ministral-8b-latest"}],
+        )
+    config.set("migrated_off_dead_llm7_gpt_oss_2026_09_12", True)
+
+
+_migrate_off_dead_llm7_gpt_oss_2026_09_12()
