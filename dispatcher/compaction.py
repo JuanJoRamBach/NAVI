@@ -278,24 +278,36 @@ async def compact_conversation(messages: list[ChatMessage], instruction: str) ->
 
     call_messages = [ChatMessage(role="system", content=instruction)] + messages
     attempts = config.get_attempts([{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", []))
+    # Every failure below is LOGGED before it is skipped. This function
+    # used to `continue` silently on all of them, so a caller only ever
+    # learned that it returned None — which is how a plain 60-second read
+    # timeout reached a user as "couldn't distil this page into a
+    # document", with nothing anywhere saying why. An auxiliary call being
+    # allowed to fail is not a reason for the failure to be invisible.
     for attempt in attempts:
+        label = f"{attempt['provider']}/{attempt['model']}"
         try:
             provider = get_provider(attempt["provider"])
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            print(f"[compact_conversation] {label}: provider unavailable — {e}")
             continue
         try:
             response = await asyncio.to_thread(provider.chat, model=attempt["model"], messages=call_messages)
         except ProviderError as e:
             if e.is_rate_limit:
                 config.mark_rate_limited(attempt["provider"], attempt["model"])
+            print(f"[compact_conversation] {label}: call failed — {e}")
             continue
         text = strip_code_fence(response.text or "")
         if not text:
+            print(f"[compact_conversation] {label}: empty reply")
             continue
         try:
             parsed = json.loads(text)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            print(f"[compact_conversation] {label}: reply was not JSON ({e}); starts: {text[:160]!r}")
             continue
         if isinstance(parsed, dict):
             return parsed
+        print(f"[compact_conversation] {label}: JSON parsed but was {type(parsed).__name__}, not an object")
     return None

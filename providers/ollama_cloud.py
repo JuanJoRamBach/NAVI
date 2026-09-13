@@ -60,7 +60,18 @@ class OllamaCloudProvider(Provider):
                     "Content-Type": "application/json",
                 },
                 json=payload,
-                timeout=60,  # cloud-hosted large models — give it more room than Groq
+                # 180s, not 60. Ollama Cloud is used for exactly one role,
+                # context_synthesis, and every job on it is the same shape:
+                # read a whole document and generate a long structured
+                # result. Compaction, branch specs and Source distillation
+                # are all minutes-of-work calls, not chat replies.
+                #
+                # 60s was inherited from chat-shaped assumptions and it
+                # genuinely bit: distilling a 4,500-token article through
+                # nemotron-3-super (120B MoE, free GPU pool, possible cold
+                # start) read-timed-out every time, and the user saw
+                # "couldn't distil this page" for what was only impatience.
+                timeout=180,
             )
         except requests.RequestException as e:
             raise ProviderError(f"Ollama Cloud request failed: {e}")
