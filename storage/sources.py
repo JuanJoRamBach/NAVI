@@ -43,10 +43,17 @@ CREATE TABLE IF NOT EXISTS source_batches (
 CREATE TABLE IF NOT EXISTS source_documents (
     id TEXT PRIMARY KEY,
     batch_id TEXT NOT NULL,
-    -- Nullable since 2026-09-13: URLs are pasted directly, so there is
-    -- often no search term, and a document that varied by the term it
-    -- was found under would be a worse document.
-    term TEXT,
+    -- Vestigial since 2026-09-13: URLs are pasted directly, so there is
+    -- no search term any more (dispatcher/source_ingest.py explains why
+    -- a document must not depend on the term it was found under).
+    --
+    -- STILL NOT NULL, and it has to stay that way. Every database created
+    -- before that date has NOT NULL here, and SQLite cannot drop a NOT
+    -- NULL constraint with ALTER TABLE — only a full table rebuild can,
+    -- which is not worth the risk to user data for a dead column. So this
+    -- declaration matches what live databases actually have, and nothing
+    -- may write NULL into it. Writers pass "" instead; see create_document.
+    term TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL,
     url TEXT NOT NULL,
     domain TEXT NOT NULL,
@@ -178,7 +185,12 @@ def create_document(
             "INSERT INTO source_documents (id, batch_id, term, title, url, domain, filen_path, status, reason, "
             "document, markdown, extractor, truncated, fetch_error, grounding, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (doc_id, batch_id, term, title, url, domain_of(url), filen_path, status, reason,
+            # term coerced to "" rather than passed through as None: the
+            # column is a dead field but is NOT NULL on every pre-2026-09-13
+            # database, and SQLite cannot drop that constraint. Writing NULL
+            # fails the insert outright — which it did, live, the first
+            # time a URL-driven batch ran.
+            (doc_id, batch_id, term or "", title, url, domain_of(url), filen_path, status, reason,
              document, markdown, extractor, 1 if truncated else 0, fetch_error, grounding, time.time()),
         )
         conn.commit()

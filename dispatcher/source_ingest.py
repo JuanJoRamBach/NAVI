@@ -91,14 +91,36 @@ def ingest_urls(urls: list[str]) -> str:
     thread — a batch of real fetches plus a model call each is far too
     slow to hold an HTTP request open for."""
     batch_id = create_batch()
-    try:
-        for url in urls:
-            url = (url or "").strip()
-            if url:
-                _ingest_one(batch_id, url)
-        finish_batch(batch_id)
-    except Exception as e:  # noqa: BLE001 - a batch must always close out
-        finish_batch(batch_id, error=str(e))
+    failures: list[str] = []
+    for url in urls:
+        url = (url or "").strip()
+        if not url:
+            continue
+        try:
+            _ingest_one(batch_id, url)
+        except Exception as e:  # noqa: BLE001 - see below
+            # PER URL, not per batch. _ingest_one already handles the
+            # failures it can anticipate (dead link, empty extraction,
+            # failed distillation) by writing a row that explains itself.
+            # This catches the ones it cannot — and the whole point of
+            # one-call-per-document is that a single bad page does not take
+            # the others down with it. A batch-level try/except silently
+            # abandoned every URL after the first failure, which is exactly
+            # what happened live when a NULL term hit a NOT NULL column.
+            print(f"[sources] unexpected failure on {url}: {e}")
+            failures.append(f"{url}: {e}")
+            try:
+                create_document(
+                    batch_id=batch_id, term=None, title=url, url=url, filen_path=None,
+                    status="failed", reason=f"Something went wrong reading this: {e}",
+                    fetch_error=str(e),
+                )
+            except Exception as inner:  # noqa: BLE001 - reporting must not raise either
+                print(f"[sources] couldn't even record that failure: {inner}")
+    # The batch itself only reports an error if EVERY url failed. A mixed
+    # run is a success with visible failures, not a failed run — the rows
+    # say which is which.
+    finish_batch(batch_id, error="; ".join(failures) if failures and len(failures) == len([u for u in urls if u.strip()]) else None)
     return batch_id
 
 
