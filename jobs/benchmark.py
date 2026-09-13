@@ -33,10 +33,17 @@ the cached count, even though most providers report it. Cached input is
 the single biggest lever on real cost, so a cost benchmark that ignored
 it would be measuring the wrong thing.
 
+    python -m jobs.benchmark --check          # are the keys actually working?
+    python -m jobs.benchmark --list           # what can be measured
     python -m jobs.benchmark                  # every scenario, 5 reps
     python -m jobs.benchmark chat_idle        # one scenario
     python -m jobs.benchmark --reps 3
-    python -m jobs.benchmark --list
+
+Start with --check. It sends a one-word prompt to every provider the chat
+tiers route to and reports what came back, because a key being PRESENT and
+a key WORKING are different facts, and the gap between them is only
+discovered at the first real call otherwise. --check --no-live checks
+presence alone and spends nothing.
 """
 
 from __future__ import annotations
@@ -366,6 +373,85 @@ def _preflight(force: bool = False) -> bool:
     return bool(force)
 
 
+def _chain() -> list[tuple[str, str, str]]:
+    """(tier, label, provider, model) for every attempt in every chat
+    tier, in the order routing would actually try them."""
+    from providers.registry import CHAT_TIERS, get_dispatcher_role
+    out = []
+    for tier in CHAT_TIERS:
+        try:
+            role = get_dispatcher_role(context=tier)
+        except Exception:  # noqa: BLE001
+            continue
+        chain = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
+        for i, a in enumerate(chain):
+            out.append((tier, "primary" if i == 0 else f"fallback {i}", a["provider"], a["model"]))
+    return out
+
+
+def check_providers(live: bool = True) -> bool:
+    """Answers "are the keys actually set?" — the question the preflight
+    only half-answers.
+
+    Presence is not the same as working. A key that is present but wrong,
+    revoked or out of quota passes every static check and fails at the
+    first real call, which is exactly when it is most expensive to find
+    out. So by default this sends a genuinely tiny prompt to each distinct
+    provider and reports what came back.
+
+    Reports EVERY provider, not just the broken ones. "Nothing printed"
+    is a terrible answer to "is this configured correctly?".
+    """
+    import os
+
+    from config.store import config
+    from providers.base import ChatMessage
+    from providers.registry import get_provider
+
+    rows = _chain()
+    seen: dict[str, tuple[str, str]] = {}
+    for tier, label, provider, model in rows:
+        seen.setdefault(provider, (f"{tier} {label}", model))
+
+    print(f"{'provider':14} {'first used as':22} {'key':10} {'live call':32}")
+    print("-" * 82)
+    all_ok = True
+    for provider, (where, model) in seen.items():
+        has_key = bool(config.get_provider_key(provider))
+        if provider == "cloudflare" and has_key and not os.environ.get("CLOUDFLARE_ACCOUNT_ID"):
+            has_key = False
+            key_note = "NO ACCT"
+        else:
+            key_note = "found" if has_key else "MISSING"
+
+        result = "skipped" if not live else "-"
+        if live and has_key:
+            try:
+                p = get_provider(provider)
+                r = p.chat(model=model, messages=[ChatMessage(role="user", content="Reply with: ok")])
+                result = "ok" if (r.text or "").strip() else "empty reply"
+            except Exception as e:  # noqa: BLE001
+                result = f"FAILED: {str(e)[:24]}"
+        elif live:
+            result = "not attempted"
+
+        ok = has_key and (not live or result == "ok")
+        all_ok = all_ok and ok
+        print(f"{provider:14} {where:22} {key_note:10} {result:32}")
+
+    print()
+    if all_ok:
+        print("All providers in the chat chains are configured and answering.")
+    else:
+        print(
+            "Something above is not usable. A benchmark would silently fall through "
+            "to whatever still works and measure the wrong models.\n\n"
+            "If a key reads MISSING, the shell most likely has not sourced .env:\n\n"
+            "    set -a && source .env && set +a\n"
+        )
+    return all_ok
+
+
 async def run_scenario(name: str, reps: int) -> dict:
     spec = SCENARIOS[name]
     runs = []
@@ -426,6 +512,9 @@ def _summarize(runs: list[dict]) -> dict:
 
 async def main() -> None:
     args = [a for a in sys.argv[1:]]
+    if "--check" in args:
+        check_providers(live="--no-live" not in args)
+        return
     if "--list" in args:
         for name, spec in SCENARIOS.items():
             print(f"  {name:26} {spec['description']}")
