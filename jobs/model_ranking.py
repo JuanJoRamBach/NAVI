@@ -46,13 +46,16 @@ AA_CACHE_MAX_AGE_S = 7 * 24 * 3600  # weekly — benchmark quality doesn't shift
 # stale cached data again. Deliberately just a manually-bumped int, not
 # a content hash — this file changes rarely enough that remembering to
 # bump it is a fine tradeoff for the simplicity.
-SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 2  # 2 (2026-09-13): Gemini added as a catalog source
 
 GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 LLM7_MODELS_URL = "https://api.llm7.io/v1/models"
 MISTRAL_MODELS_URL = "https://api.mistral.ai/v1/models"
 GMI_MODELS_URL = "https://api.gmi-serving.com/v1/models"
+# Native endpoint on purpose — Gemini's OpenAI-compat layer (what
+# providers/gemini.py actually calls for chat) has no catalog listing.
+GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 CLOUDFLARE_MODELS_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search"
 AA_BULK_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
 
@@ -251,6 +254,66 @@ def fetch_llm7_models() -> list[dict]:
             "free": True,
             "param_b": extract_param_billions(mid),
             "availability_pct": m.get("availability_last_hour_percent"),
+        })
+    return out
+
+
+def fetch_gemini_models(api_key: str | None) -> list[dict]:
+    """Google AI Studio, via the native models endpoint (the OpenAI-compat
+    layer doesn't expose a catalog listing — chat completions only).
+
+    Real free/paid detection problem, stated honestly rather than papered
+    over: this endpoint returns NO pricing, quota or tier field of any
+    kind. The only programmatic signal is which models the key can see,
+    and a key sees Pro models it cannot actually call on the free tier.
+    So free-ness here is a NAME RULE, not a read value — Pro is paid
+    (confirmed 2026-09-13 against JuanJo's own AI Studio dashboard, which
+    showed every Pro variant at 0 RPM / 0 TPM / 0 RPD), everything else in
+    the Flash family is free.
+
+    That's the same shape of hand-maintained heuristic fetch_mistral_models
+    below already carries, and it has the same failure mode: it will go
+    stale silently when Google changes tiers (they moved Pro behind
+    billing in April/May 2026 with no API-visible signal). Re-check
+    against the AI Studio dashboard when Gemini routing misbehaves, and
+    treat this rule as suspect first.
+
+    Context length is real, though — inputTokenLimit comes straight from
+    the API rather than being assumed.
+    """
+    if not api_key:
+        return []
+    try:
+        resp = requests.get(GEMINI_MODELS_URL, params={"key": api_key}, timeout=20)
+        resp.raise_for_status()
+        data = (resp.json() or {}).get("models") or []
+    except (requests.RequestException, ValueError):
+        return []
+
+    out = []
+    for m in data:
+        # "models/gemini-3.5-flash-lite" -> "gemini-3.5-flash-lite", which
+        # is what the OpenAI-compat endpoint expects as `model`.
+        mid = str(m.get("name", "")).replace("models/", "")
+        if not mid:
+            continue
+        if "generateContent" not in (m.get("supportedGenerationMethods") or []):
+            continue  # embeddings/vision-only/etc — not chat candidates
+        lowered = mid.lower()
+        if "gemini" not in lowered:
+            continue  # skip embedding models and any non-Gemini entries
+        out.append({
+            "provider": "gemini", "id": mid,
+            "context_length": m.get("inputTokenLimit"),
+            # Function calling is supported across the Gemini chat family
+            # and confirmed on the OpenAI-compat endpoint (Google's own
+            # compatibility doc, checked 2026-09-13). Not exposed per-model
+            # by this endpoint, so this is a family-level fact, not a read
+            # value — flagged the same way GMI's own unknown is.
+            "tools": True,
+            "vision": True,
+            "free": "pro" not in lowered,  # see docstring — name rule, not a read field
+            "param_b": extract_param_billions(mid),
         })
     return out
 
@@ -635,6 +698,7 @@ def build_ranking_snapshot() -> dict:
     catalog += fetch_mistral_models(config.get_provider_key("mistral"))
     catalog += fetch_gmi_models(config.get_provider_key("gmi"))
     catalog += fetch_cloudflare_models(config.get_provider_key("cloudflare"))
+    catalog += fetch_gemini_models(config.get_provider_key("gemini"))
 
     aa_index = fetch_aa_benchmarks(os.environ.get("AANALYSIS_API_KEY"))
 
@@ -660,7 +724,7 @@ def build_ranking_snapshot() -> dict:
                 "total": len([m for m in catalog if m["provider"] == p]),
                 "free": len([m for m in catalog if m["provider"] == p and m.get("free")]),
             }
-            for p in ("groq", "openrouter", "llm7", "mistral", "gmi", "cloudflare")
+            for p in ("groq", "openrouter", "llm7", "mistral", "gmi", "cloudflare", "gemini")
         },
         "rankings": rankings,
     }

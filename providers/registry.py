@@ -10,6 +10,7 @@ transport class, add one line here. Nothing else in the codebase changes.
 from config.store import config
 from providers.base import Provider
 from providers.cloudflare import CloudflareProvider
+from providers.gemini import GeminiProvider
 from providers.gmi import GMIProvider
 from providers.groq import GroqProvider
 from providers.llm7 import LLM7Provider
@@ -25,7 +26,9 @@ _TRANSPORTS: dict[str, type[Provider]] = {
     "llm7": LLM7Provider,
     "mistral": MistralProvider,
     "gmi": GMIProvider,
-    # "nvidia_nim": NvidiaNimProvider,  # add when built
+    "gemini": GeminiProvider,
+    # nvidia_nim deliberately NOT added — its free tier's own Terms of
+    # Service prohibit production use (see config/store.py's note).
 }
 
 

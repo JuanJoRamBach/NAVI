@@ -94,12 +94,44 @@ def _decrypt_secret(value: str | None) -> str | None:
         # silently breaking every connection saved before this change.
         return value
 
+# Fallback environment variable per provider, consulted by
+# get_provider_key when the config store has nothing (see its docstring).
+# The names match what's actually set in the server's .env — notably
+# Google's own credential name (GOOGLE_AI_API_KEY) differs from NAVI's
+# internal provider name ("gemini", since every model is gemini-*), and
+# this is the one place those two names are reconciled.
+PROVIDER_KEY_ENV = {
+    "gemini": "GOOGLE_AI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "llm7": "LLM7_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "cloudflare": "CLOUDFLARE_API_KEY",
+    "gmi": "GMI_API_KEY",
+    "ollama_cloud": "OLLAMA_CLOUD_API_KEY",
+    "nvidia_nim": "NVIDIA_NIM_API_KEY",
+}
+
 DEFAULTS = {
     "providers": {
         # name -> { "api_key": str | None, "enabled": bool }
         "openrouter": {"api_key": None, "enabled": True},
         "groq": {"api_key": None, "enabled": True},
         "llm7": {"api_key": None, "enabled": True},
+        # Google AI Studio (2026-09-13). Key comes from GOOGLE_AI_API_KEY
+        # in .env via PROVIDER_KEY_ENV above, not stored in config.json.
+        # NOT usable for client data unless the EEA/UK/CH paid-tier data
+        # policy applies to the account — see providers/gemini.py's own
+        # docstring on why that gate matters.
+        "gemini": {"api_key": None, "enabled": True},
+        # nvidia_nim stays disabled and unbuilt ON PURPOSE (re-confirmed
+        # 2026-09-13): NVIDIA's API Trial Terms of Service §1.2/§1.4
+        # restrict the free hosted API to "internal testing and evaluation
+        # purposes, not in production", and §1.2 extends that to the
+        # Generated Content as well — so NAVI could not ship outputs
+        # produced with it either. Verified against NVIDIA's own legal PDF,
+        # not a blog summary. Don't enable this without a paid NVIDIA AI
+        # Enterprise subscription.
         "nvidia_nim": {"api_key": None, "enabled": False},
     },
     "roles": {
@@ -452,7 +484,25 @@ class ConfigStore:
         self._save()
 
     def get_provider_key(self, provider: str) -> str | None:
-        return self._data.get("providers", {}).get(provider, {}).get("api_key")
+        """Config store first, environment second.
+
+        The env fallback exists (2026-09-13) because keys set in the
+        server's .env silently did nothing before: this only ever read
+        config.json, so a perfectly reasonable `GOOGLE_AI_API_KEY=...` in
+        .env looked configured but wasn't, with no error anywhere to
+        explain why. Every other server secret in NAVI (NAVI_API_KEY,
+        NAVI_FILES_TOKEN, CLOUDFLARE_ACCOUNT_ID, TELEGRAM_BOT_TOKEN) is
+        already env-based, so .env was the reasonable place to expect
+        this to work.
+
+        Store wins over env deliberately: a key set at runtime through
+        the real config route is an explicit, deliberate act and must not
+        be shadowed by a stale environment variable."""
+        stored = self._data.get("providers", {}).get(provider, {}).get("api_key")
+        if stored:
+            return stored
+        env_name = PROVIDER_KEY_ENV.get(provider)
+        return os.environ.get(env_name) if env_name else None
 
     def is_provider_enabled(self, provider: str) -> bool:
         return self._data.get("providers", {}).get(provider, {}).get("enabled", False)
