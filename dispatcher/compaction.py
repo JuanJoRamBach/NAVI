@@ -276,7 +276,27 @@ async def compact_conversation(messages: list[ChatMessage], instruction: str) ->
     except ProviderNotConfigured:
         return None
 
-    call_messages = [ChatMessage(role="system", content=instruction)] + messages
+    # The transcript is MATERIAL, so the ask is repeated AFTER it rather
+    # than sitting only in front. Two reasons, one of them load-bearing.
+    #
+    # Mistral rejects outright any message list whose last entry is an
+    # assistant turn: "Expected last role User or Tool (or Assistant with
+    # prefix True) for serving but got assistant" — a real 400, observed
+    # 2026-09-14. A conversation almost always ends on NAVI's own reply, so
+    # this broke the compaction FALLBACK for every history-derived call:
+    # branch specs and context compaction alike. Source distillation was
+    # spared only by accident, because its material is a single user
+    # message. Every other provider tolerated it, which is exactly why it
+    # went unnoticed until the fallback was needed.
+    #
+    # It is also better prompting regardless: the instruction becomes the
+    # last thing read, rather than something to recall across a long
+    # transcript.
+    call_messages = (
+        [ChatMessage(role="system", content=instruction)]
+        + messages
+        + [ChatMessage(role="user", content="Now produce the JSON described above, and nothing else.")]
+    )
     attempts = config.get_attempts([{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", []))
     # Every failure below is LOGGED before it is skipped. This function
     # used to `continue` silently on all of them, so a caller only ever
