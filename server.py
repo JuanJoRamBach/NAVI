@@ -918,6 +918,30 @@ def sources_get_one(doc_id: str) -> JSONResponse:
     doc = get_source_document(doc_id)
     if not doc:
         return JSONResponse({"error": "Document not found"}, status_code=404)
+
+    # A distilled document renders from the database, not from Filen.
+    # Filen now holds a PDF — a convenience copy for a person to keep or
+    # send on — and handing those bytes to a Markdown viewer would show
+    # binary. The structured document is the real artifact and it is
+    # already here, so render it directly.
+    if doc.get("document"):
+        try:
+            import json as _json
+            from tools.source_document import render_source_markdown
+            content = render_source_markdown(
+                _json.loads(doc["document"]),
+                extractor=doc.get("extractor"),
+                truncated=bool(doc.get("truncated")),
+            )
+            return JSONResponse({**doc, "content": content})
+        except Exception as e:  # noqa: BLE001 - fall through to the file below
+            print(f"[sources] couldn't render document {doc_id}: {e}")
+
+    # A row with no distillation but a kept page — a failed distil keeps
+    # the markdown precisely so there is still something to read.
+    if doc.get("markdown"):
+        return JSONResponse({**doc, "content": doc["markdown"]})
+
     content = None
     if doc.get("filen_path"):
         try:
