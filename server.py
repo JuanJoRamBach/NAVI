@@ -62,7 +62,8 @@ from tools.mcp_marketplace import MCPMarketplaceError, search as search_mcp_mark
 from dispatcher.scheduler import register_job, start_scheduler
 from dispatcher.chat import run_agent_vault_chat, run_mode_chat, run_stored_mode_chat
 from dispatcher.compaction import CONTEXT_TRIGGER_TOKENS
-from storage.context_store import build_context_block
+from dispatcher.branch import draft_branch_spec, format_spec_markdown, seed_branch_context
+from storage.context_store import SOURCE_BRANCH_BRIEF, append_entry, build_context_block
 from dispatcher.research import run_research_chat
 from dispatcher.devslate_chat import run_devslate_turn
 from dispatcher.executor import format_summary, run_chain
@@ -1003,6 +1004,75 @@ async def _context_fill(conversation_id: str | None) -> float | None:
     if not tokens:
         return None
     return round(tokens / CONTEXT_TRIGGER_TOKENS, 3)
+
+
+@app.post("/chat/branch/draft")
+async def chat_branch_draft(request: Request) -> JSONResponse:
+    """Drafts the spec a new branch would open with, WITHOUT creating
+    anything. Split from the create route on purpose: this is the
+    requirements sign-off moment, and the user has to be able to read the
+    scope and decline it without a half-made branch left behind.
+
+    A null spec is a normal outcome, not an error — a parent with barely
+    any history has nothing to hand down, and the branch should still open
+    (see dispatcher/branch.py's MIN_PARENT_MESSAGES_FOR_SPEC).
+    """
+    payload = await request.json()
+    parent_id = payload.get("parent_conversation_id")
+    scope = (payload.get("scope") or "").strip()
+    if not scope:
+        return JSONResponse({"error": "missing 'scope'"}, status_code=400)
+    if not parent_id:
+        # A branch off a chat that never reached the server has no history
+        # to compact. Not an error — there is simply no spec to draft.
+        return JSONResponse({"spec": None, "markdown": None})
+    spec = await draft_branch_spec(parent_id, scope)
+    return JSONResponse({
+        "spec": spec,
+        "markdown": format_spec_markdown(spec) if spec else None,
+    })
+
+
+@app.post("/chat/branch/create")
+async def chat_branch_create(request: Request) -> JSONResponse:
+    """Creates the branch conversation and seeds it with an ACCEPTED spec.
+
+    The spec comes back from the client rather than being redrafted here,
+    so what gets seeded is exactly what the user read and agreed to —
+    redrafting would risk seeding something subtly different from what was
+    on screen, which would make the checkpoint theatre.
+
+    Unlike every other chat, a branch gets its server conversation at
+    creation instead of lazily on its first message: it has to exist now
+    to hold the entries.
+    """
+    payload = await request.json()
+    scope = (payload.get("scope") or "").strip()
+    if not scope:
+        return JSONResponse({"error": "missing 'scope'"}, status_code=400)
+    spec = payload.get("spec")
+    conversation_id = await create_conversation(
+        mode=payload.get("mode") or "normal",
+        project_id=payload.get("project_id"),
+        parent_id=payload.get("parent_conversation_id"),
+    )
+    seeded = 0
+    if isinstance(spec, dict) and spec.get("goal"):
+        seeded = await seed_branch_context(conversation_id, spec)
+    else:
+        # No spec to hand down. Record the scope itself so the branch at
+        # least knows what it is for — that much the user did state.
+        await append_entry(
+            conversation_id, f"This branch exists to: {scope}",
+            source=SOURCE_BRANCH_BRIEF, pinned=True,
+        )
+        seeded = 1
+    _block, tokens = await build_context_block(conversation_id)
+    return JSONResponse({
+        "conversation_id": conversation_id,
+        "seeded_entries": seeded,
+        "context_fill": round(tokens / CONTEXT_TRIGGER_TOKENS, 3) if tokens else None,
+    })
 
 
 @app.post("/chat/send")

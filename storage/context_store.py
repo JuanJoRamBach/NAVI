@@ -45,6 +45,15 @@ DB_PATH = Path(__file__).parent.parent / "conversations.db"
 SOURCE_USER = "user_message"
 SOURCE_ASSISTANT = "assistant_reply"
 SOURCE_TOOL = "tool_result"
+# Inherited intent, not something said in this conversation. A branch
+# chat opens with its spec already dissected into entries carrying this
+# source, so consolidation can tell "this was handed down as the scope of
+# the work" apart from "this came up while doing the work".
+SOURCE_BRANCH_BRIEF = "branch_brief"
+# The outcome of a completed branch, written back into its parent as a
+# single entry. Same direction discipline as Agent_Work_Context.md: the
+# parent receives the result, never the branch's whole history.
+SOURCE_BRANCH_RESULT = "branch_result"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS context_entries (
@@ -99,6 +108,12 @@ async def _ensure_schema(db: aiosqlite.Connection) -> None:
     for stmt in (
         "ALTER TABLE context_entries ADD COLUMN retired_at REAL",
         "ALTER TABLE context_entries ADD COLUMN retired_reason TEXT",
+        # `pinned` exempts an entry from retirement entirely (2026-09-13).
+        # Built for a branch spec's acceptance criteria: everything else in
+        # a spec can legitimately go stale as the work progresses, but the
+        # criteria ARE the definition of finished — lose them and the
+        # branch can no longer tell whether it is done.
+        "ALTER TABLE context_entries ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
     ):
         try:
             await db.execute(stmt)
@@ -158,20 +173,25 @@ def estimate_tokens(text: str) -> int:
 
 async def append_entry(
     conversation_id: str, content: str, source: str = SOURCE_ASSISTANT,
-    message_id: str | None = None,
+    message_id: str | None = None, pinned: bool = False,
 ) -> None:
     """Records one flagged key insight. Never deduplicates — a repeated
     flag is itself real signal (it's how frequency scoring would later
     tell a reinforced fact from a one-off), and compaction is where
-    duplicates actually get merged."""
+    duplicates actually get merged.
+
+    `pinned` marks an entry no consolidation pass may retire. Use it only
+    for something whose loss would break a mechanism rather than merely
+    forget a fact — today that means a branch spec's acceptance criteria,
+    which are what "done" is judged against."""
     if not (content or "").strip():
         return
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_schema(db)
         await db.execute(
-            "INSERT INTO context_entries (id, conversation_id, message_id, source, content, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), conversation_id, message_id, source, content.strip(), time.time()),
+            "INSERT INTO context_entries (id, conversation_id, message_id, source, content, created_at, pinned) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), conversation_id, message_id, source, content.strip(), time.time(), 1 if pinned else 0),
         )
         await db.commit()
 
@@ -187,7 +207,7 @@ async def get_entries(
     no longer carried forward into prompts or checked for survival.
     `include_retired=True` is for inspecting what was retired and why."""
     query = (
-        "SELECT id, message_id, source, content, created_at, retired_at, retired_reason "
+        "SELECT id, message_id, source, content, created_at, retired_at, retired_reason, pinned "
         "FROM context_entries WHERE conversation_id = ?"
     )
     params: tuple = (conversation_id,)
@@ -214,7 +234,13 @@ async def retire_entries(entry_ids: list[str], reason: str) -> int:
     Compaction silently omitting an entry does NOT retire it (that entry
     gets rescued verbatim instead) — the compactor has to explicitly
     declare it obsolete and give a reason. Silent loss and deliberate
-    forgetting look identical otherwise, and only one of them is safe."""
+    forgetting look identical otherwise, and only one of them is safe.
+
+    A pinned entry is refused outright — enforced here in the one place
+    retirement can happen, rather than trusted to every caller and every
+    future compaction prompt. Returns the number actually retired, so a
+    refusal is visible to the caller as a smaller count rather than
+    silently reported as success."""
     if not entry_ids:
         return 0
     now = time.time()
@@ -223,7 +249,7 @@ async def retire_entries(entry_ids: list[str], reason: str) -> int:
         await _ensure_schema(db)
         cursor = await db.execute(
             f"UPDATE context_entries SET retired_at = ?, retired_reason = ? "
-            f"WHERE id IN ({placeholders}) AND retired_at IS NULL",
+            f"WHERE id IN ({placeholders}) AND retired_at IS NULL AND pinned = 0",
             (now, reason, *entry_ids),
         )
         await db.commit()
