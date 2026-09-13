@@ -310,6 +310,62 @@ async def _safety():
 
 # ---- Runner -----------------------------------------------------------
 
+def _preflight(force: bool = False) -> bool:
+    """Checks every provider the chat tiers route to BEFORE spending
+    anything, and refuses to start if one is unreachable.
+
+    This exists because of a real run (2026-09-13): a full benchmark
+    completed with every chat scenario answered by LLM7 — the SECOND
+    fallback — because the shell had not sourced .env. Gemini's key lives
+    only there, and Cloudflare reads CLOUDFLARE_ACCOUNT_ID straight from
+    the environment, while LLM7's key is in the config database and so
+    works anywhere. The run looked successful and measured the wrong
+    models from start to finish.
+
+    Noticing that afterwards, from the models column, costs a whole run.
+    Noticing it here costs nothing. --force proceeds anyway, for
+    deliberately measuring a degraded chain.
+    """
+    import os
+
+    from config.store import config
+    from providers.registry import CHAT_TIERS, get_dispatcher_role
+
+    problems: list[str] = []
+    seen: set[str] = set()
+    for tier in CHAT_TIERS:
+        try:
+            role = get_dispatcher_role(context=tier)
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"{tier}: no routing configured ({e})")
+            continue
+        chain = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
+        for position, attempt in enumerate(chain):
+            name = attempt["provider"]
+            if name in seen:
+                continue
+            seen.add(name)
+            label = "primary" if position == 0 else f"fallback {position}"
+            if not config.get_provider_key(name):
+                problems.append(f"{name} ({tier} {label}): no API key in the store or the environment")
+            elif name == "cloudflare" and not os.environ.get("CLOUDFLARE_ACCOUNT_ID"):
+                problems.append(f"cloudflare ({tier} {label}): CLOUDFLARE_ACCOUNT_ID not set")
+
+    if not problems:
+        return True
+    print("Providers the chat tiers route to that this shell cannot reach:\n")
+    for p in problems:
+        print(f"  - {p}")
+    print(
+        "\nEvery call would silently fall through to whatever still works, and the\n"
+        "run would measure the wrong models without saying so. Usually this means\n"
+        ".env was not sourced:\n\n"
+        "    set -a && source .env && set +a\n\n"
+        "Pass --force to benchmark the degraded chain on purpose.\n"
+    )
+    return bool(force)
+
+
 async def run_scenario(name: str, reps: int) -> dict:
     spec = SCENARIOS[name]
     runs = []
@@ -385,6 +441,8 @@ async def main() -> None:
         return
 
     _isolate_storage()
+    if not _preflight(force="--force" in sys.argv):
+        return
     print(f"Benchmarking {len(names)} scenario(s), {reps} reps each — REAL API calls.\n")
     results = []
     for name in names:

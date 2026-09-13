@@ -1,0 +1,80 @@
+{
+  "run_at": "20260913T183521Z",
+  "reps": 2,
+  "results": [
+    {
+      "scenario": "source_grounding",
+      "description": "One claim adjudicated by safeguard-20b against its passage",
+      "runs": [
+        {
+          "rep": 1,
+          "seconds": 0.85,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 554,
+          "cached": 512,
+          "completion": 96,
+          "total": 650,
+          "models": [
+            "groq/openai/gpt-oss-safeguard-20b"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "openai/gpt-oss-safeguard-20b",
+              "ok": true,
+              "seconds": 0.85,
+              "prompt": 554,
+              "cached": 512,
+              "completion": 96,
+              "total": 650
+            }
+          ]
+        },
+        {
+          "rep": 2,
+          "seconds": 0.81,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 554,
+          "cached": 512,
+          "completion": 100,
+          "total": 654,
+          "models": [
+            "groq/openai/gpt-oss-safeguard-20b"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "openai/gpt-oss-safeguard-20b",
+              "ok": true,
+              "seconds": 0.81,
+              "prompt": 554,
+              "cached": 512,
+              "completion": 100,
+              "total": 654
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "ok_runs": 2,
+        "tokens_min": 650,
+        "tokens_max": 654,
+        "tokens_mean": 652,
+        "tokens_stdev": 2.8,
+        "variance_ratio": 1.01,
+        "seconds_mean": 0.8,
+        "seconds_max": 0.85,
+        "prompt_mean": 554,
+        "completion_mean": 98,
+        "cached_mean": 512,
+        "models": [
+          "groq/openai/gpt-oss-safeguard-20b"
+        ]
+      }
+    }
+  ]
+}
