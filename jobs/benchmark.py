@@ -541,6 +541,15 @@ async def run_scenario(name: str, reps: int) -> dict:
             **probe.totals(),
             "calls_detail": probe.calls,
         }
+        # Keep the swallowed output, but only for reps that went wrong.
+        # Suppressing the dispatcher's logging is what makes the terminal
+        # readable; throwing it away is what made "branch_spec FAILED"
+        # unexplainable without re-running the whole thing. A failure is
+        # exactly when those lines are worth having — and compaction now
+        # logs its own reasons there, so this is where they land.
+        if error or run["failed_calls"]:
+            captured = noise.getvalue().strip().splitlines()
+            run["log"] = captured[-25:]
         runs.append(run)
         print(_line(name, run), flush=True)
     return {"scenario": name, "description": spec["description"], "runs": runs,
