@@ -61,6 +61,8 @@ from dispatcher.mcp_oauth import MCPOAuthError, exchange_code_for_token, start_a
 from tools.mcp_marketplace import MCPMarketplaceError, search as search_mcp_marketplace
 from dispatcher.scheduler import register_job, start_scheduler
 from dispatcher.chat import run_agent_vault_chat, run_mode_chat, run_stored_mode_chat
+from dispatcher.compaction import CONTEXT_TRIGGER_TOKENS
+from storage.context_store import build_context_block
 from dispatcher.research import run_research_chat
 from dispatcher.devslate_chat import run_devslate_turn
 from dispatcher.executor import format_summary, run_chain
@@ -982,6 +984,27 @@ async def webhook_discord() -> PlainTextResponse:
     return PlainTextResponse("ok")  # outbound-only phase — nothing to act on yet
 
 
+async def _context_fill(conversation_id: str | None) -> float | None:
+    """This conversation's memory usage as a fraction of the compaction
+    ceiling, for the PWA's fullness bar. None when there is nothing stored
+    yet, so a brand-new chat shows no bar at all rather than an empty one.
+
+    Never raises: a gauge must not be able to fail a turn that already
+    succeeded. A broken reading is reported as absent, not as zero — zero
+    would be a confident claim that the conversation holds nothing.
+    """
+    if not conversation_id:
+        return None
+    try:
+        _block, tokens = await build_context_block(conversation_id)
+    except Exception as e:  # noqa: BLE001 - see docstring
+        print(f"[chat_send] context_fill unavailable: {e}")
+        return None
+    if not tokens:
+        return None
+    return round(tokens / CONTEXT_TRIGGER_TOKENS, 3)
+
+
 @app.post("/chat/send")
 async def chat_send(request: Request) -> JSONResponse:
     """The PWA's own chat surface for Normal/Research/Brainstorm/Agent
@@ -1051,6 +1074,21 @@ async def chat_send(request: Request) -> JSONResponse:
             # sending the click back as plain text and hoping it's read as
             # consent. Never set outside that one flow.
             "suggested_mode": reply.get("suggested_mode"),
+            # How full this conversation's own memory is, 0..1 against the
+            # compaction ceiling — read AFTER the turn, so a turn that
+            # triggered compaction reports the post-compaction value and the
+            # bar visibly drops instead of sitting pinned at full.
+            #
+            # Deliberately NOT a fraction of the answering model's context
+            # window: which model answers changes per turn now (three tiers
+            # plus fallbacks), so that denominator would move for reasons
+            # that have nothing to do with the conversation, and against a
+            # 128K-1M window it would read single digits forever. This is
+            # NAVI's own budget, which is the thing that actually governs
+            # behaviour. Uncapped on purpose — >1 is a real state (a
+            # compaction pass that couldn't get under target) and the client
+            # clamps the bar rather than the server hiding it.
+            "context_fill": await _context_fill(conversation_id),
         })
 
     reply_text, _attachments = _handle_parse_result(result, "pwa", mode, channel="pwa")
