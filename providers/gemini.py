@@ -23,6 +23,26 @@ examples — that was the one capability NAVI actually depends on and it
 would have been the dealbreaker. Streaming and structured output are
 supported too (neither used here yet).
 
+KNOWN RISK, not yet observed — multi-turn tool calling and
+`thought_signature`. Google documents that when tools are used with
+models whose "thinking" layers are active, the caller must capture the
+model's intermediate `thought_signature` and pass it BACK into the chat
+history alongside the function result. dispatcher/executor.py's
+run_tool_loop reconstructs its assistant message from exactly two fields
+(`content` and `tool_calls`) and would silently drop anything else — so
+if the compat layer surfaces a thought_signature that Gemini expects
+echoed, NAVI drops it every iteration.
+
+This is the SAME failure shape investigated for MiniMax M3 on
+2026-09-12, which turned out fine because MiniMax keeps its reasoning
+inline in `content` (which run_tool_loop does forward). Gemini may or
+may not be the same — unverified either way, because it's only reachable
+through a real multi-turn tool loop against a thinking-enabled model.
+It would present as degraded multi-turn tool quality rather than an
+error, which is the hardest kind of failure to notice. Check this first
+if Gemini tool loops start behaving worse than single-turn calls
+suggest they should.
+
 Two documented caveats, both real:
 - Google labels the compat layer "still in beta while we extend feature
   support."

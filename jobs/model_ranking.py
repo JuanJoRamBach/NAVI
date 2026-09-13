@@ -67,6 +67,24 @@ GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 # are audio/video-first at 131K ctx, and Gemini offers pure-text Flash
 # models at 1M ctx, so there's no case for routing chat to one.
 GEMINI_EXCLUDE_PATTERNS = ("tts", "image", "transcribe", "robotics", "computer-use", "omni", "embedding")
+
+# Models that will ERROR if a `tools` parameter is passed at all, checked
+# INDEPENDENTLY of GEMINI_EXCLUDE_PATTERNS above rather than relying on
+# the exclusion list to have already removed them (2026-09-13). The two
+# lists overlap today, which makes this look redundant — it isn't. The
+# exclusion list answers "is this a chat model?", this one answers "can
+# it take custom functions?", and those are genuinely different
+# questions. Omni is the specific reason this exists as its own check:
+# it IS highly conversational, so it's the model most likely to get
+# re-admitted above by someone reasonably asking "why is a chat model
+# excluded?" — at which point a blanket tools=True would start sending
+# `tools` to something that throws.
+#
+# Computer Use is a subtler case in the same family: it doesn't refuse
+# tools outright, it's hardwired to exactly one (the virtual desktop) and
+# cannot accept arbitrary user-defined functions — which for NAVI's
+# purposes is the same as no tool support.
+_GEMINI_NO_CUSTOM_TOOLS = ("embedding", "image", "imagen", "tts", "transcribe", "omni", "computer-use", "robotics")
 CLOUDFLARE_MODELS_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search"
 AA_BULK_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
 
@@ -318,12 +336,20 @@ def fetch_gemini_models(api_key: str | None) -> list[dict]:
         out.append({
             "provider": "gemini", "id": mid,
             "context_length": m.get("inputTokenLimit"),
-            # Function calling is supported across the Gemini chat family
-            # and confirmed on the OpenAI-compat endpoint (Google's own
-            # compatibility doc, checked 2026-09-13). Not exposed per-model
-            # by this endpoint, so this is a family-level fact, not a read
-            # value — flagged the same way GMI's own unknown is.
-            "tools": True,
+            # Not a read value — this endpoint exposes no tool-support
+            # field, so it's a rule (see _GEMINI_NO_CUSTOM_TOOLS above for
+            # what's excluded and why it's checked separately). Live-
+            # verified 2026-09-13 for gemini-3.5-flash-lite specifically:
+            # a real get_weather call came back with correct arguments
+            # through the OpenAI-compat endpoint.
+            #
+            # One documented quirk that does NOT affect NAVI: Flash-Lite
+            # supports tools but can't STREAM tool arguments in real time
+            # the way the larger models can. NAVI never streams — every
+            # transport here blocks for the complete response — so this
+            # costs nothing today. It would matter if streaming is ever
+            # added.
+            "tools": not any(p in lowered for p in _GEMINI_NO_CUSTOM_TOOLS),
             "vision": True,
             "free": "pro" not in lowered,  # see docstring — name rule, not a read field
             "param_b": extract_param_billions(mid),
