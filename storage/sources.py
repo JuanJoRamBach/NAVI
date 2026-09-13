@@ -43,7 +43,10 @@ CREATE TABLE IF NOT EXISTS source_batches (
 CREATE TABLE IF NOT EXISTS source_documents (
     id TEXT PRIMARY KEY,
     batch_id TEXT NOT NULL,
-    term TEXT NOT NULL,
+    -- Nullable since 2026-09-13: URLs are pasted directly, so there is
+    -- often no search term, and a document that varied by the term it
+    -- was found under would be a worse document.
+    term TEXT,
     title TEXT NOT NULL,
     url TEXT NOT NULL,
     domain TEXT NOT NULL,
@@ -71,10 +74,40 @@ def _connect():
             # AUTO-rejected document (2026-09-06, JuanJo: "why some were
             # rejected... must be informed to the user") — NULL for every
             # normal pending_review/human-reviewed row.
-            try:
-                conn.execute("ALTER TABLE source_documents ADD COLUMN reason TEXT")
-            except sqlite3.OperationalError:
-                pass  # already applied in a prior run
+            #
+            # The 2026-09-13 rebuild added the rest: a Source is no longer
+            # a title and a file path, it is a structured document plus
+            # the cleaned page it was distilled from. Keeping `markdown`
+            # is load-bearing, not a nicety — it makes the structured
+            # document a VIEW of the source rather than a replacement for
+            # it, so a poor distillation costs a re-run and never the
+            # material itself.
+            for stmt in (
+                "ALTER TABLE source_documents ADD COLUMN reason TEXT",
+                # The distilled document, JSON (tools/source_document.py).
+                "ALTER TABLE source_documents ADD COLUMN document TEXT",
+                # The cleaned Markdown it was distilled FROM. Ground truth.
+                "ALTER TABLE source_documents ADD COLUMN markdown TEXT",
+                # Which extractor produced that markdown, so a document
+                # built on the degraded regex fallback is identifiable
+                # rather than silently indistinguishable.
+                "ALTER TABLE source_documents ADD COLUMN extractor TEXT",
+                # The page was longer than MAX_CHARS. A document distilled
+                # from a truncated page is honest work on partial input and
+                # has to say so.
+                "ALTER TABLE source_documents ADD COLUMN truncated INTEGER DEFAULT 0",
+                # Why a URL produced no document at all. A dead link still
+                # gets a row — pasting five URLs and getting three cards
+                # with no explanation reads as a bug.
+                "ALTER TABLE source_documents ADD COLUMN fetch_error TEXT",
+                # Grounding summary, JSON: how many claims verified, how
+                # many disputed, whether it needs attention.
+                "ALTER TABLE source_documents ADD COLUMN grounding TEXT",
+            ):
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # already applied in a prior run
             conn.commit()
             _initialized = True
         yield conn
@@ -128,8 +161,11 @@ def latest_batch() -> dict | None:
 
 
 def create_document(
-    batch_id: str, term: str, title: str, url: str, filen_path: str | None,
+    batch_id: str, term: str | None, title: str, url: str, filen_path: str | None,
     status: str = "pending_review", reason: str | None = None,
+    document: str | None = None, markdown: str | None = None,
+    extractor: str | None = None, truncated: bool = False,
+    fetch_error: str | None = None, grounding: str | None = None,
 ) -> str:
     """`status`/`reason` default to the normal human-review flow — passed
     explicitly only for a document the DISPATCHER already auto-rejected
@@ -139,9 +175,11 @@ def create_document(
     doc_id = str(uuid.uuid4())
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO source_documents (id, batch_id, term, title, url, domain, filen_path, status, reason, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (doc_id, batch_id, term, title, url, domain_of(url), filen_path, status, reason, time.time()),
+            "INSERT INTO source_documents (id, batch_id, term, title, url, domain, filen_path, status, reason, "
+            "document, markdown, extractor, truncated, fetch_error, grounding, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (doc_id, batch_id, term, title, url, domain_of(url), filen_path, status, reason,
+             document, markdown, extractor, 1 if truncated else 0, fetch_error, grounding, time.time()),
         )
         conn.commit()
     return doc_id
@@ -201,3 +239,40 @@ def set_document_status(doc_id: str, status: str) -> bool:
         cur = conn.execute("UPDATE source_documents SET status = ? WHERE id = ?", (status, doc_id))
         conn.commit()
         return cur.rowcount > 0
+
+def find_by_url(url: str) -> dict | None:
+    """The most recent document already produced for this exact URL.
+
+    This is what stops a re-paste costing a fetch, a distillation call and
+    a verification pass for a page already read — the dominant cost in
+    this whole pipeline is the model call, and it is entirely avoidable
+    when the answer is already stored.
+
+    Exact URL match only, deliberately. Deciding that two URLs are "the
+    same page" is genuinely hard (tracking parameters, trailing slashes,
+    http vs https, AMP variants, redirects), and a wrong match silently
+    serves a document for a DIFFERENT page — far worse than paying to
+    fetch the same article twice. The fetcher already resolves redirects
+    and stores the final URL, which catches the common case honestly.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM source_documents WHERE url = ? AND fetch_error IS NULL "
+            "ORDER BY created_at DESC LIMIT 1",
+            (url,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_inspected(limit: int = 500) -> list[dict]:
+    """Every URL already read, newest first — what the UI shows as
+    Inspected Sources. One row per URL, not per attempt: re-reading a page
+    should not make the list longer."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT url, domain, title, status, MAX(created_at) AS created_at, COUNT(*) AS times "
+            "FROM source_documents WHERE fetch_error IS NULL "
+            "GROUP BY url ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]

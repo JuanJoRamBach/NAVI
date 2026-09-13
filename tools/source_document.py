@@ -371,31 +371,35 @@ def apply_verdicts(doc: dict, verdicts: dict[int, dict | None]) -> dict:
 
 # ---- Structuring: turning a page into a document ----------------------
 
-SOURCE_DOCUMENT_INSTRUCTION = """You are turning ONE fetched web page into a structured Source document. Someone researching "{term}" will read your output instead of the page, and an AI assistant will later answer questions from it. Everything you leave out is lost to both of them.
+SOURCE_DOCUMENT_INSTRUCTION = """You are turning ONE web page into a Source document. Someone will read your output instead of the page, and an AI assistant will later answer questions from it. Anything you leave out is lost to both of them.
 
-Work ONLY from the page text given below. Never add anything you know about this subject from elsewhere — not context, not correction, not background. If the page is wrong, that is a fact ABOUT the page and belongs in caveats, not something for you to fix.
+Work ONLY from the page text below. Never add anything you know about this subject from elsewhere — not background, not correction, not context. If the page is wrong, that is a fact ABOUT the page and belongs in caveats; it is not yours to fix.
 
 Reply with ONLY a single JSON object, no prose, no markdown fence:
-{{
-  "summary": "string — what this page actually says, in three or four sentences, for someone who will not read it",
+{
+  "about": "one sentence — what this page is",
+  "summary": "three or four sentences — what it actually says, for someone who will not read it",
+  "topics": ["short topic label", "..."],
   "key_points": [
-    {{"claim": "string — one self-contained point the page makes",
-      "quote": "string — the exact words from the page that carry this point"}}
+    {"claim": "one self-contained point the page makes",
+     "quote": "the exact words from the page that carry it"}
   ],
-  "relevance": "string — what this page contributes to \"{term}\" specifically, and what it does not",
-  "caveats": ["string", "..."]
-}}
+  "covers": ["a question this page can actually answer", "..."],
+  "caveats": ["something a careful reader should know before trusting this", "..."]
+}
 
-On "quote": copy the page's words EXACTLY, character for character. Do not tidy, shorten, join separated sentences, or fix the grammar. These are checked against the page automatically, and a quote you improved is a quote that no longer matches. Quote the smallest span that genuinely carries the claim.
+On "quote": copy the page's words EXACTLY, character for character. Do not tidy, shorten, join separated sentences, or fix grammar. These are checked against the page automatically, and a quote you improved is a quote that no longer matches. Quote the smallest span that genuinely carries the claim.
 
-If a point is real but no single passage states it — it runs across several paragraphs, or it is about the page as a whole — keep the point and quote the single most representative passage you can. Do NOT invent a sentence to quote, and do NOT drop the point: an unquotable observation is often the most valuable one in the document.
+If a point is real but no single passage states it — it runs across several paragraphs, or it is about the page as a whole — keep the point and quote the most representative passage you can find. Do NOT invent a sentence to quote, and do NOT drop the point: an unquotable observation is often the most valuable one in the document.
 
-On "caveats": what a careful reader needs to know before trusting this. Is it vendor marketing for a product? Are its numbers stated without attribution? Is it opinion, a first-person report, out of date, paywalled, or contradicting itself? An empty list is a real answer if the page is straightforwardly sound — do not invent doubts.
+On "covers": real questions someone could bring to this page and leave satisfied. Be specific — "what the five layers of an agent harness are" is useful, "AI stuff" is not. This is how the document gets found later, so a vague entry makes it unfindable.
 
-6 to 10 key points for a substantial article, fewer for a short one. Never pad."""
+On "caveats": is this vendor marketing for a product? Are its numbers stated without attribution? Is it opinion, a personal account, out of date, paywalled, or self-contradicting? An empty list is a real answer if the page is straightforwardly sound — do not invent doubts to look thorough.
+
+6 to 10 key points for a substantial article, fewer for a short one. Never pad a list to look complete."""
 
 
-def build_structuring_messages(term, title, url, markdown):
+def build_structuring_messages(title, url, markdown):
     """The content goes in as a normal message, not folded into the
     instruction — keeps the instruction byte-identical across every
     document, which is what lets a provider's prefix cache hit."""

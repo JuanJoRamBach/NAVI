@@ -94,8 +94,9 @@ from storage.auth import (
     count_users, create_session, create_user, delete_session, get_session_user,
     get_user_by_email, get_user_by_id, list_users, set_user_active, update_user_role, verify_password,
 )
-from storage.sources import delete_document as delete_source_document, get_document as get_source_document, latest_batch as latest_source_batch, list_documents as list_source_documents, set_document_status as set_source_document_status
+from storage.sources import delete_document as delete_source_document, get_document as get_source_document, latest_batch as latest_source_batch, list_documents as list_source_documents, set_document_status as set_source_document_status, list_inspected
 from dispatcher.source_fetch import start_source_fetch_batch
+from dispatcher.source_ingest import start_ingest
 from tools.devslate_tools import new_tool_call_id
 
 PORT = int(os.environ.get("PORT", "10000"))
@@ -827,6 +828,42 @@ def usage_mistral() -> dict:
         return {"usage": None, "credit_usd": MISTRAL_MONTHLY_CREDIT_USD}
     from providers.mistral import get_admin_usage
     return {"usage": get_admin_usage(key), "credit_usd": MISTRAL_MONTHLY_CREDIT_USD}
+
+
+@app.post("/sources/ingest")
+async def sources_ingest(request: Request) -> JSONResponse:
+    """Sources, URL-driven (2026-09-13). The user pastes URLs; the
+    dispatcher fetches, distils and grounds each one. No search terms:
+    see dispatcher/source_ingest.py on why discovery and curation were
+    separated, and why a document must not depend on the term it happened
+    to be found under.
+
+    Acks immediately — each URL costs a real fetch plus a model call, far
+    too slow to hold the request open for.
+    """
+    payload = await request.json()
+    urls = [u.strip() for u in (payload.get("urls") or []) if isinstance(u, str) and u.strip()]
+    if not urls:
+        return JSONResponse({"error": "'urls' must be a non-empty list"}, status_code=400)
+    # http(s) only. A file:// or data: URL here would be the dispatcher
+    # reading something it was never asked to read.
+    bad = [u for u in urls if not u.lower().startswith(("http://", "https://"))]
+    if bad:
+        return JSONResponse({"error": f"Only http(s) URLs are accepted: {bad[0]}"}, status_code=400)
+    start_ingest(urls)
+    return JSONResponse({"started": True, "urls": len(urls)})
+
+
+@app.get("/sources/inspected")
+def sources_inspected(limit: int = 500) -> dict:
+    """Every URL already read — what the UI shows as Inspected Sources.
+
+    Replaces the old client-side Trusted Sites list, which existed to
+    restrict a search that no longer happens. This is a record of what has
+    genuinely been inspected, and it is what lets a re-pasted URL be
+    recognised instead of re-fetched and re-distilled.
+    """
+    return {"inspected": list_inspected(limit=limit)}
 
 
 @app.post("/sources/batch")
