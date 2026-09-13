@@ -15,12 +15,25 @@ server with no display.
 
 import io
 
-import matplotlib
-matplotlib.use("Agg")
+# Soft imports — see tools/report_render.py's own import block for the
+# full reasoning. Short version: these are OPTIONAL OUTPUT formats, and a
+# missing one must degrade to "that format is unavailable", never take the
+# whole API down. On 2026-09-13 an uninstalled docxtpl did exactly that on
+# the live box: a module-scope ImportError in a renderer propagated up
+# through server.py and crash-looped the service 366 times, so chat
+# stopped working because a document library nobody had asked to use
+# wasn't present.
+_MISSING: str | None = None
+try:
+    import matplotlib
+    matplotlib.use("Agg")
 
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402 — already a matplotlib dependency, no new install
-from matplotlib.colors import to_rgb  # noqa: E402
+    import matplotlib.pyplot as plt  # noqa: E402
+    import numpy as np  # noqa: E402 — already a matplotlib dependency, no new install
+    from matplotlib.colors import to_rgb  # noqa: E402
+except ImportError as e:
+    _MISSING = str(e)
+    matplotlib = plt = np = to_rgb = None
 
 # Dark, clean, "futuristic but grounded" theme — deliberately not just a
 # color swap: no chart-box border, minimal single-axis gridlines, generous
@@ -144,6 +157,12 @@ def render_chart(
     """Renders the chart and returns PNG bytes. Raises ChartError on bad
     input (e.g. mismatched label/value counts) rather than producing a
     misleading chart."""
+    if _MISSING:
+        # Raised at call time, not import time — see the import block above.
+        raise ChartError(
+            f"Chart rendering is unavailable on this server ({_MISSING}). "
+            "Run: pip install -r requirements.txt"
+        )
     if not labels or not series:
         raise ChartError("Chart needs at least one label and one data series.")
     for s in series:

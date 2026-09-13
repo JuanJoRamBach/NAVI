@@ -26,15 +26,28 @@ license.
 import re
 from io import BytesIO
 
-import matplotlib
-from docx import Document
-from docx.shared import Pt as DocxPt
-from fpdf import FPDF
-from pptx import Presentation
-from pptx.util import Inches, Pt as PptxPt
+# Soft imports — see tools/report_render.py's own import block for the
+# full reasoning. Short version: these are OPTIONAL OUTPUT formats, and a
+# missing one must degrade to "that format is unavailable", never take the
+# whole API down. On 2026-09-13 an uninstalled docxtpl did exactly that on
+# the live box: a module-scope ImportError in a renderer propagated up
+# through server.py and crash-looped the service 366 times, so chat
+# stopped working because a document library nobody had asked to use
+# wasn't present.
+_MISSING: str | None = None
+try:
+    import matplotlib
+    from docx import Document
+    from docx.shared import Pt as DocxPt
+    from fpdf import FPDF
+    from pptx import Presentation
+    from pptx.util import Inches, Pt as PptxPt
+except ImportError as e:
+    _MISSING = str(e)
+    matplotlib = Document = DocxPt = FPDF = Presentation = Inches = PptxPt = None
 
-_DEJAVU_PATH = f"{matplotlib.get_data_path()}/fonts/ttf/DejaVuSans.ttf"
-_DEJAVU_BOLD_PATH = f"{matplotlib.get_data_path()}/fonts/ttf/DejaVuSans-Bold.ttf"
+_DEJAVU_PATH = f"{matplotlib.get_data_path()}/fonts/ttf/DejaVuSans.ttf" if matplotlib else ""
+_DEJAVU_BOLD_PATH = f"{matplotlib.get_data_path()}/fonts/ttf/DejaVuSans-Bold.ttf" if matplotlib else ""
 
 
 class DocumentRenderError(Exception):
@@ -159,6 +172,12 @@ RENDERERS = {
 
 
 def render(format_name: str, title: str, content: str) -> bytes:
+    if _MISSING:
+        # Raised at call time, not import time — see the import block above.
+        raise DocumentRenderError(
+            f"Document rendering is unavailable on this server ({_MISSING}). "
+            "Run: pip install -r requirements.txt"
+        )
     renderer = RENDERERS.get(format_name.lower())
     if not renderer:
         raise DocumentRenderError(f"Unsupported format: {format_name}")

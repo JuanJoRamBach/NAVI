@@ -19,7 +19,25 @@ import os
 from io import BytesIO
 
 import requests
-from docxtpl import DocxTemplate, RichText
+
+# Soft import, deliberately. This module renders an OPTIONAL deliverable
+# — the Gotenberg PDF path already degrades to "unavailable, not a
+# crash" when GOTENBERG_URL is unset, and the same standard has to apply
+# to the DOCX half. It did not: docxtpl was a hard module-scope import,
+# dispatcher/research.py imports this module at ITS module scope, and
+# server.py imports research — so one uninstalled rendering dependency
+# took the ENTIRE API down in a restart loop, chat included (observed on
+# the live box 2026-09-13, 366 restarts).
+#
+# Every caller already handles ReportRenderError, so raising it at call
+# time is the degradation path that was always intended. A document
+# format nobody asked for on this request must never be able to stop a
+# chat message being answered.
+try:
+    from docxtpl import DocxTemplate, RichText
+except ImportError:  # docxtpl not installed — report rendering is simply unavailable
+    DocxTemplate = None
+    RichText = None
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "templates", "research_report.docx")
 
@@ -55,7 +73,16 @@ def render_research_report_docx(report: dict) -> bytes:
     date, objective, executive_summary, methodology, key_findings,
     analysis, recommendations, gaps, sources). Raises ReportRenderError
     on a malformed report rather than silently producing a half-filled
-    document."""
+    document.
+
+    Raises ReportRenderError if docxtpl isn't installed — see the import
+    above on why that's a raise here rather than an ImportError at
+    startup."""
+    if DocxTemplate is None:
+        raise ReportRenderError(
+            "Report rendering is unavailable on this server: the 'docxtpl' package "
+            "isn't installed. Run: pip install -r requirements.txt"
+        )
     try:
         doc = DocxTemplate(TEMPLATE_PATH)
         context = dict(report)
