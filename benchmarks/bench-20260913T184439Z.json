@@ -1,0 +1,159 @@
+{
+  "run_at": "20260913T184439Z",
+  "reps": 2,
+  "complete": true,
+  "scenarios_requested": [
+    "source_grounding",
+    "content_safety"
+  ],
+  "results": [
+    {
+      "scenario": "source_grounding",
+      "description": "One claim adjudicated by safeguard-20b against its passage",
+      "runs": [
+        {
+          "rep": 1,
+          "seconds": 0.86,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 554,
+          "cached": 512,
+          "completion": 117,
+          "total": 671,
+          "models": [
+            "groq/openai/gpt-oss-safeguard-20b"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "openai/gpt-oss-safeguard-20b",
+              "ok": true,
+              "seconds": 0.85,
+              "prompt": 554,
+              "cached": 512,
+              "completion": 117,
+              "total": 671
+            }
+          ]
+        },
+        {
+          "rep": 2,
+          "seconds": 0.84,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 554,
+          "cached": 512,
+          "completion": 127,
+          "total": 681,
+          "models": [
+            "groq/openai/gpt-oss-safeguard-20b"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "openai/gpt-oss-safeguard-20b",
+              "ok": true,
+              "seconds": 0.84,
+              "prompt": 554,
+              "cached": 512,
+              "completion": 127,
+              "total": 681
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "ok_runs": 2,
+        "tokens_min": 671,
+        "tokens_max": 681,
+        "tokens_mean": 676,
+        "tokens_stdev": 7.1,
+        "variance_ratio": 1.01,
+        "seconds_mean": 0.8,
+        "seconds_max": 0.86,
+        "prompt_mean": 554,
+        "completion_mean": 122,
+        "cached_mean": 512,
+        "models": [
+          "groq/openai/gpt-oss-safeguard-20b"
+        ]
+      }
+    },
+    {
+      "scenario": "content_safety",
+      "description": "Screening one fetched page through Prompt Guard",
+      "runs": [
+        {
+          "rep": 1,
+          "seconds": 0.72,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 22,
+          "cached": null,
+          "completion": 0,
+          "total": 22,
+          "models": [
+            "groq/meta-llama/llama-prompt-guard-2-86m"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "meta-llama/llama-prompt-guard-2-86m",
+              "ok": true,
+              "seconds": 0.72,
+              "prompt": 22,
+              "cached": null,
+              "completion": 0,
+              "total": 0
+            }
+          ]
+        },
+        {
+          "rep": 2,
+          "seconds": 0.71,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 22,
+          "cached": null,
+          "completion": 0,
+          "total": 22,
+          "models": [
+            "groq/meta-llama/llama-prompt-guard-2-86m"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "meta-llama/llama-prompt-guard-2-86m",
+              "ok": true,
+              "seconds": 0.71,
+              "prompt": 22,
+              "cached": null,
+              "completion": 0,
+              "total": 0
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "ok_runs": 2,
+        "tokens_min": 22,
+        "tokens_max": 22,
+        "tokens_mean": 22,
+        "tokens_stdev": 0.0,
+        "variance_ratio": 1.0,
+        "seconds_mean": 0.7,
+        "seconds_max": 0.72,
+        "prompt_mean": 22,
+        "completion_mean": 0,
+        "cached_mean": null,
+        "models": [
+          "groq/meta-llama/llama-prompt-guard-2-86m"
+        ]
+      }
+    }
+  ]
+}

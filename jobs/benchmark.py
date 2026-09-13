@@ -545,18 +545,33 @@ async def main() -> None:
     if not _preflight(force="--force" in sys.argv):
         return
     print(f"Benchmarking {len(names)} scenario(s), {reps} reps each — REAL API calls.\n")
-    results = []
-    for name in names:
-        print(f"{name} — {SCENARIOS[name]['description']}")
-        results.append(await run_scenario(name, reps))
-        print()
-
     OUT_DIR.mkdir(exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = OUT_DIR / f"bench-{stamp}.json"
-    path.write_text(json.dumps({
-        "run_at": stamp, "reps": reps, "results": results,
-    }, indent=2, ensure_ascii=False), encoding="utf-8")
+    results: list[dict] = []
+
+    def save() -> None:
+        # Written after EVERY scenario, not once at the end. A full run is
+        # ~25 minutes because the synthesis scenarios take ~80s per call,
+        # and a benchmark that discards everything it already measured when
+        # interrupted punishes exactly the runs most worth keeping. Ctrl-C
+        # now costs only the scenario in flight.
+        path.write_text(json.dumps({
+            "run_at": stamp, "reps": reps,
+            "complete": len(results) == len(names),
+            "scenarios_requested": names,
+            "results": results,
+        }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    try:
+        for name in names:
+            print(f"{name} — {SCENARIOS[name]['description']}")
+            results.append(await run_scenario(name, reps))
+            save()
+            print()
+    except KeyboardInterrupt:
+        save()
+        print(f"\nStopped early — {len(results)} of {len(names)} scenario(s) kept.\n")
 
     print(f"{'scenario':26} {'mean':>8} {'min':>8} {'max':>8} {'var':>6} {'cached':>8} {'secs':>7}")
     print("-" * 76)
