@@ -58,6 +58,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from config.dotenv import ensure_env  # noqa: E402 - must follow the path insert
+
+# Load the server's own .env before anything reads a key. systemd never
+# exports into an interactive shell, so a job run by hand has none of the
+# secrets the running service has — see config/dotenv.py for the run this
+# cost us.
+_ENV_FILE = ensure_env()
+
 OUT_DIR = Path(__file__).resolve().parent.parent / "benchmarks"
 DEFAULT_REPS = 5
 
@@ -413,6 +421,10 @@ def check_providers(live: bool = True) -> bool:
     for tier, label, provider, model in rows:
         seen.setdefault(provider, (f"{tier} {label}", model))
 
+    if _ENV_FILE:
+        print(f"Loaded environment from {_ENV_FILE}\n")
+    else:
+        print("No .env file loaded - relying on whatever is already in this shell.\n")
     print(f"{'provider':14} {'first used as':22} {'key':10} {'live call':32}")
     print("-" * 82)
     all_ok = True
