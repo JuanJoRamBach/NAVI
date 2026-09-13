@@ -122,7 +122,14 @@ class MistralProvider(Provider):
             raise ProviderError(f"Mistral request failed: {e}")
 
         if resp.status_code == 429:
-            raise ProviderError("Mistral rate limited", is_rate_limit=True)
+            # Keep the body. A 429 is the most AMBIGUOUS error a provider
+            # returns — a per-second throttle, a daily quota, a monthly quota,
+            # capacity, or an account that was never activated all share this
+            # one status code, and only the body tells them apart. Every other
+            # status here already preserves it; 429 was the one that threw it
+            # away, which is how "Mistral rate limited" reached a user who had
+            # not spent a penny, with nothing to explain it.
+            raise ProviderError(f"Mistral rate limited: {resp.text[:300]}", is_rate_limit=True)
         if resp.status_code >= 400:
             raise ProviderError(f"Mistral error {resp.status_code}: {resp.text[:300]}")
 
