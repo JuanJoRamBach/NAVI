@@ -1,0 +1,211 @@
+{
+  "run_at": "20260913T184747Z",
+  "reps": 3,
+  "complete": true,
+  "scenarios_requested": [
+    "source_grounding",
+    "content_safety"
+  ],
+  "results": [
+    {
+      "scenario": "source_grounding",
+      "description": "One claim adjudicated by safeguard-20b against its passage",
+      "runs": [
+        {
+          "rep": 1,
+          "seconds": 0.88,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 554,
+          "cached": 512,
+          "completion": 102,
+          "total": 656,
+          "models": [
+            "groq/openai/gpt-oss-safeguard-20b"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "openai/gpt-oss-safeguard-20b",
+              "ok": true,
+              "seconds": 0.87,
+              "prompt": 554,
+              "cached": 512,
+              "completion": 102,
+              "total": 656
+            }
+          ]
+        },
+        {
+          "rep": 2,
+          "seconds": 0.82,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 554,
+          "cached": 512,
+          "completion": 106,
+          "total": 660,
+          "models": [
+            "groq/openai/gpt-oss-safeguard-20b"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "openai/gpt-oss-safeguard-20b",
+              "ok": true,
+              "seconds": 0.82,
+              "prompt": 554,
+              "cached": 512,
+              "completion": 106,
+              "total": 660
+            }
+          ]
+        },
+        {
+          "rep": 3,
+          "seconds": 0.79,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 554,
+          "cached": 512,
+          "completion": 108,
+          "total": 662,
+          "models": [
+            "groq/openai/gpt-oss-safeguard-20b"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "openai/gpt-oss-safeguard-20b",
+              "ok": true,
+              "seconds": 0.79,
+              "prompt": 554,
+              "cached": 512,
+              "completion": 108,
+              "total": 662
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "ok_runs": 3,
+        "tokens_min": 656,
+        "tokens_max": 662,
+        "tokens_mean": 659.3,
+        "tokens_stdev": 3.1,
+        "variance_ratio": 1.01,
+        "seconds_mean": 0.8,
+        "seconds_max": 0.88,
+        "prompt_mean": 554,
+        "completion_mean": 105.3,
+        "cached_mean": 512,
+        "models": [
+          "groq/openai/gpt-oss-safeguard-20b"
+        ]
+      }
+    },
+    {
+      "scenario": "content_safety",
+      "description": "Screening one fetched page through Prompt Guard",
+      "runs": [
+        {
+          "rep": 1,
+          "seconds": 0.76,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 22,
+          "cached": null,
+          "completion": 0,
+          "total": 22,
+          "models": [
+            "groq/meta-llama/llama-prompt-guard-2-86m"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "meta-llama/llama-prompt-guard-2-86m",
+              "ok": true,
+              "seconds": 0.76,
+              "prompt": 22,
+              "cached": null,
+              "completion": 0,
+              "total": 0
+            }
+          ]
+        },
+        {
+          "rep": 2,
+          "seconds": 0.73,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 22,
+          "cached": null,
+          "completion": 0,
+          "total": 22,
+          "models": [
+            "groq/meta-llama/llama-prompt-guard-2-86m"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "meta-llama/llama-prompt-guard-2-86m",
+              "ok": true,
+              "seconds": 0.73,
+              "prompt": 22,
+              "cached": null,
+              "completion": 0,
+              "total": 0
+            }
+          ]
+        },
+        {
+          "rep": 3,
+          "seconds": 0.77,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 22,
+          "cached": null,
+          "completion": 0,
+          "total": 22,
+          "models": [
+            "groq/meta-llama/llama-prompt-guard-2-86m"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "meta-llama/llama-prompt-guard-2-86m",
+              "ok": true,
+              "seconds": 0.77,
+              "prompt": 22,
+              "cached": null,
+              "completion": 0,
+              "total": 0
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "ok_runs": 3,
+        "tokens_min": 22,
+        "tokens_max": 22,
+        "tokens_mean": 22,
+        "tokens_stdev": 0.0,
+        "variance_ratio": 1.0,
+        "seconds_mean": 0.8,
+        "seconds_max": 0.77,
+        "prompt_mean": 22,
+        "completion_mean": 0,
+        "cached_mean": null,
+        "models": [
+          "groq/meta-llama/llama-prompt-guard-2-86m"
+        ]
+      }
+    }
+  ]
+}

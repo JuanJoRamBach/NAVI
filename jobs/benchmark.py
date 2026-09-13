@@ -22,7 +22,17 @@ stubs anywhere — a stubbed benchmark measures the stub. That means this
 spends real quota: REPS x scenarios calls, on whichever providers the
 config actually routes to. Run it deliberately.
 
-Every run records prompt / cached / completion / total tokens, wall
+OUTPUT is one line per rep and nothing else:
+
+    Task: X; Rep: N; Input Tokens: N; Cached Tokens: N; Output Tokens: N; Model used: provider/model
+
+Semicolon-separated so it pastes straight into a sheet. The dispatcher is
+loud while it works and every one of those lines is noise here, so its
+output is swallowed during a rep (still useful in the server journal, just
+not on this screen). Timings, per-call detail, variance and summaries all
+go to the JSON file instead.
+
+Each run records prompt / cached / completion / total tokens, wall
 clock, and which provider+model actually answered — the last one matters
 because a fallback firing mid-benchmark changes what is being measured,
 and would otherwise look like variance in the primary.
@@ -49,6 +59,8 @@ presence alone and spends nothing.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import json
 import statistics
 import sys
@@ -464,6 +476,33 @@ def check_providers(live: bool = True) -> bool:
     return all_ok
 
 
+def _line(task: str, run: dict) -> str:
+    """The only thing this tool prints during a run.
+
+    One line per rep, semicolon-separated, so it pastes straight into a
+    sheet without anyone having to pick it out of log noise. Everything
+    else — timings, per-call detail, summaries — still goes to the JSON
+    file; it just does not go on the screen.
+
+    Cached shows "-" rather than 0 when the provider reported nothing.
+    Zero is a claim that nothing was cached; a blank is the truth when we
+    cannot tell, and the difference matters for the one number this is
+    most useful for.
+    """
+    if run.get("error") or run.get("failed_calls"):
+        reason = run.get("error") or "provider call failed"
+        return f"Task: {task}; Rep: {run['rep']}; FAILED: {reason}"
+    cached = run["cached"] if run.get("cached") is not None else "-"
+    models = ", ".join(run.get("models") or []) or "-"
+    return (
+        f"Task: {task}; Rep: {run['rep']}; "
+        f"Input Tokens: {run.get('prompt') or 0}; "
+        f"Cached Tokens: {cached}; "
+        f"Output Tokens: {run.get('completion') or 0}; "
+        f"Model used: {models}"
+    )
+
+
 async def run_scenario(name: str, reps: int) -> dict:
     spec = SCENARIOS[name]
     runs = []
@@ -472,8 +511,14 @@ async def run_scenario(name: str, reps: int) -> dict:
         originals = _patched(probe)
         t0 = time.time()
         error = None
+        # The dispatcher prints a great deal while it works. None of it is
+        # what this tool is for, and it buries the one line per rep that
+        # is. Swallowed here rather than silenced at the source, because
+        # those prints are genuinely useful in the server's journal.
+        noise = io.StringIO()
         try:
-            await spec["fn"]()
+            with contextlib.redirect_stdout(noise):
+                await spec["fn"]()
         except Exception as e:  # noqa: BLE001 - a failed rep is data, not a crash
             error = f"{type(e).__name__}: {e}"[:200]
         finally:
@@ -486,11 +531,7 @@ async def run_scenario(name: str, reps: int) -> dict:
             "calls_detail": probe.calls,
         }
         runs.append(run)
-        mark = "!" if error else " "
-        print(f"  {mark}rep {i+1}/{reps}: {run['total']:>7} tokens  "
-              f"({run['prompt'] or 0} in / {run['completion'] or 0} out)  "
-              f"{run['calls']} call(s)  {run['seconds']}s"
-              + (f"  ERROR {error[:60]}" if error else ""))
+        print(_line(name, run), flush=True)
     return {"scenario": name, "description": spec["description"], "runs": runs,
             "summary": _summarize(runs)}
 
@@ -544,18 +585,20 @@ async def main() -> None:
     _isolate_storage()
     if not _preflight(force="--force" in sys.argv):
         return
-    print(f"Benchmarking {len(names)} scenario(s), {reps} reps each — REAL API calls.\n")
     OUT_DIR.mkdir(exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = OUT_DIR / f"bench-{stamp}.json"
     results: list[dict] = []
 
     def save() -> None:
-        # Written after EVERY scenario, not once at the end. A full run is
-        # ~25 minutes because the synthesis scenarios take ~80s per call,
-        # and a benchmark that discards everything it already measured when
-        # interrupted punishes exactly the runs most worth keeping. Ctrl-C
-        # now costs only the scenario in flight.
+        # Written after EVERY scenario. A full run is ~25 minutes because
+        # the synthesis scenarios take ~80s per call, and discarding what
+        # was already measured would punish exactly the runs most worth
+        # keeping. Ctrl-C costs only the scenario in flight.
+        #
+        # Everything the screen no longer shows - timings, per-call detail,
+        # summaries, variance - is still in here. The terminal is for one
+        # line per rep; the file is for everything else.
         path.write_text(json.dumps({
             "run_at": stamp, "reps": reps,
             "complete": len(results) == len(names),
@@ -565,25 +608,10 @@ async def main() -> None:
 
     try:
         for name in names:
-            print(f"{name} — {SCENARIOS[name]['description']}")
             results.append(await run_scenario(name, reps))
             save()
-            print()
     except KeyboardInterrupt:
         save()
-        print(f"\nStopped early — {len(results)} of {len(names)} scenario(s) kept.\n")
-
-    print(f"{'scenario':26} {'mean':>8} {'min':>8} {'max':>8} {'var':>6} {'cached':>8} {'secs':>7}")
-    print("-" * 76)
-    for r in results:
-        s = r["summary"]
-        if not s.get("ok_runs"):
-            print(f"{r['scenario']:26} {'ALL RUNS FAILED':>40}")
-            continue
-        cached = s["cached_mean"] if s["cached_mean"] is not None else "-"
-        print(f"{r['scenario']:26} {s['tokens_mean']:>8} {s['tokens_min']:>8} "
-              f"{s['tokens_max']:>8} {s['variance_ratio']:>6} {str(cached):>8} {s['seconds_mean']:>7}")
-    print(f"\nWritten to {path}")
 
 
 if __name__ == "__main__":
