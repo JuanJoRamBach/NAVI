@@ -35,13 +35,20 @@ from dispatcher.executor import (
     run_tool_loop,
     strip_reasoning_tags,
 )
+from dispatcher.branch import (
+    COMPLETE_OPTIONS, completion_as_entry, draft_completion, format_completion_markdown,
+)
 from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, classify_family
 from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider, next_chat_tier
-from storage.context_store import SOURCE_ASSISTANT, append_entry, build_context_block, record_friction
-from storage.conversations import append_message, get_messages
+from storage.context_store import (
+    SOURCE_ASSISTANT, SOURCE_BRANCH_RESULT, append_entry, build_context_block, record_friction,
+)
+from storage.conversations import (
+    append_message, get_conversation, get_messages, get_task_state, set_task_state,
+)
 from tools.registry import schemas_for
 
 RECENT_MESSAGE_WINDOW = 20
@@ -234,6 +241,82 @@ def run_mode_chat(mode: str, text: str) -> str:
 # still meaningful for nothing else) purely so no caller needs updating.
 
 
+async def _propose_branch_completion(conversation_id: str, provider: str, model: str) -> dict | None:
+    """Turns a model's completion claim into a handover the user can
+    actually judge, and parks the branch until they answer.
+
+    Returns None if the handover can't be drafted — the caller then just
+    lets the turn answer normally, which is strictly better than telling
+    the user their work is finished and then failing to say what it was.
+    """
+    doc = await draft_completion(conversation_id)
+    if not doc:
+        return None
+    await set_task_state(conversation_id, {"branch_stage": "awaiting_complete", "completion": doc})
+    reply = (
+        "Here's what I'd hand back to the main chat:\n\n"
+        + format_completion_markdown(doc)
+        + "\n\nAccepting closes this chat and sends that summary back."
+    )
+    await append_message(conversation_id, "navi", reply, provider=provider, model=model)
+    return {
+        "text": reply, "provider": provider, "model": model,
+        "choices": list(COMPLETE_OPTIONS),
+    }
+
+
+async def _settle_pending_branch_completion(conversation_id: str, text: str) -> dict | None:
+    """Reads the user's answer to a pending handover. Returns None when
+    there's nothing pending, so the turn proceeds normally.
+
+    Three outcomes, and the third one matters most: accept closes the
+    branch, an explicit decline resumes work, and ANYTHING ELSE also
+    resumes work rather than being swallowed as an answer. Someone who
+    ignores the question and keeps typing has plainly not accepted, and
+    treating an unrelated message as consent would close their work on
+    their behalf.
+    """
+    state = await get_task_state(conversation_id) or {}
+    if state.get("branch_stage") != "awaiting_complete":
+        return None
+    doc = state.get("completion") or {}
+    await set_task_state(conversation_id, None)
+
+    if not _is_branch_accept(text):
+        return None  # declined, or moved on — either way, keep working
+
+    conversation = await get_conversation(conversation_id)
+    parent_id = (conversation or {}).get("parent_id")
+    scope = str(doc.get("scope") or "").strip()
+    if parent_id:
+        # ONE entry, not one per line: the main chat asked for a feature,
+        # not for this chat's working notes. Handing everything back would
+        # rebuild there exactly the bloat splitting the work off avoided.
+        await append_entry(
+            parent_id, completion_as_entry(scope or "a separate chat", doc),
+            source=SOURCE_BRANCH_RESULT,
+        )
+    await set_task_state(conversation_id, {"branch_stage": "closed", "completion": doc})
+    reply = (
+        "Done — sent back to the main chat. This chat is closed; "
+        "anything further belongs there, or in a new one."
+    )
+    await append_message(conversation_id, "navi", reply)
+    return {"text": reply, "provider": None, "model": None, "branch_closed": True}
+
+
+def _is_branch_accept(text: str) -> bool:
+    """The exact button label is the reliable signal — ChoiceButtons sends
+    the clicked option back verbatim. The prefix check under it is a soft
+    fallback for someone who types instead of clicking, and is deliberately
+    narrow: a false accept closes work that isn't finished, while a false
+    miss just means asking again."""
+    t = text.strip()
+    if t == COMPLETE_OPTIONS[0]:
+        return True
+    return t.lower().startswith(("accept", "yes, accept", "looks good, close", "close it"))
+
+
 async def run_stored_mode_chat(
     mode: str, conversation_id: str, text: str, auto_accept: bool = True,
     reasoning_effort: str | None = None, tier: str = "chat", _escalated_from: str | None = None,
@@ -266,6 +349,13 @@ async def run_stored_mode_chat(
     message being appended to history twice, not as a public parameter."""
     if not _escalated_from:
         await append_message(conversation_id, "user", text)
+        # A branch waiting on the user to accept its handover gets first
+        # look at this message. Only ever set on a branch that proposed
+        # completion, so every ordinary conversation skips it on a null
+        # task_state and this costs a dict lookup.
+        settled = await _settle_pending_branch_completion(conversation_id, text)
+        if settled:
+            return settled
 
     brief = get_mode_brief(mode)
     history = await get_messages(conversation_id, limit=RECENT_MESSAGE_WINDOW)
@@ -302,7 +392,17 @@ async def run_stored_mode_chat(
     # rule is "at most one system message, and it must be message[0]," not
     # just "system messages must be consecutively first." Combining into
     # one message satisfies either reading and can't regress anything.
-    tools = schemas_for(brief.tools) if brief.tools else None
+    tool_names = list(brief.tools or [])
+    # Finishing is only a real gesture in a branch: an ordinary chat has no
+    # parent to hand work back to and no acceptance criteria to have met.
+    # Withheld here rather than dropped after the fact, so the model never
+    # sees an option it cannot meaningfully use — the same discipline that
+    # scopes every other mode's tools to what that mode can actually do.
+    if "propose_branch_complete" in tool_names:
+        conversation = await get_conversation(conversation_id)
+        if not (conversation and conversation.get("parent_id")):
+            tool_names.remove("propose_branch_complete")
+    tools = schemas_for(tool_names) if tool_names else None
     base_system_parts = [brief.system_prompt]
     if tools:
         base_system_parts.append(CITATION_STYLE_PROMPT)
@@ -511,6 +611,27 @@ async def run_stored_mode_chat(
                     "text": question, "provider": attempt["provider"], "model": attempt["model"],
                     "choices": options, "suggested_mode": "research",
                 }
+            branch_complete_call = next((tc for tc in response.tool_calls if tc.name == "propose_branch_complete"), None)
+            if branch_complete_call:
+                # Same "propose, don't declare" shape as the two checkpoints
+                # above. The model calling this is a CLAIM that the work is
+                # done; the dispatcher writes the handover and the user
+                # accepts it. A model that certifies its own work is just
+                # marking its own homework.
+                #
+                # Guarded on actually being a branch: a chat with no parent
+                # has nothing to hand back to and no acceptance criteria to
+                # have met, so the call is meaningless there and is dropped
+                # rather than acted on.
+                conversation = await get_conversation(conversation_id)
+                if conversation and conversation.get("parent_id"):
+                    result = await _propose_branch_completion(
+                        conversation_id, attempt["provider"], attempt["model"],
+                    )
+                    if result:
+                        return result
+                response.tool_calls = [tc for tc in response.tool_calls if tc.name != "propose_branch_complete"]
+
             choice_call = next((tc for tc in response.tool_calls if tc.name == "ask_user_choice"), None)
             if choice_call:
                 # Intercepted BEFORE run_tool_loop, not executed through it

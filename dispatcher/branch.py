@@ -184,3 +184,84 @@ async def seed_branch_context(branch_conversation_id: str, spec: dict) -> int:
             )
             written += 1
     return written
+
+
+# ---- Completion -------------------------------------------------------
+#
+# A branch ends the way it began: the worker proposes, the person who
+# wanted the work accepts. Never the model certifying its own output.
+#
+# That split is not a stylistic choice. Responsibility for doing the work
+# and accountability for accepting it are genuinely different roles, and
+# exactly one party holds the second one. Here that is always the user.
+
+COMPLETE_OPTIONS = ("Accept and close this chat", "Not yet — keep working")
+
+COMPLETION_INSTRUCTION = """You are writing the handover for a piece of work that is finishing. It goes back to the wider conversation this work was split out of, and it will be the ONLY record of what happened here — this working session's own history is not carried back.
+
+Reply with ONLY a single JSON object, no prose, no markdown fence, matching exactly this shape:
+{
+  "summary": "string \u2014 what was actually done, in two or three sentences",
+  "delivered": ["string", "..."],
+  "decisions": ["string", "..."],
+  "open": ["string", "..."]
+}
+
+- "summary": what this work set out to do and what state it ended in. Write it for someone who was not here.
+- "delivered": what concretely exists now that did not before. One item per string.
+- "decisions": choices made during the work that the wider conversation needs to know about, each with its reason. A decision without its reason will be reopened later by someone who does not know why.
+- "open": anything still unfinished, unverified, or deliberately left out. Be honest here \u2014 an overstated handover is worse than an incomplete one, because nobody goes back to check a piece of work that was reported as finished.
+
+Judge against the acceptance criteria this work was given, which appear in the context you were provided. If something was NOT achieved, it belongs in "open", never in "delivered"."""
+
+
+def format_completion_markdown(doc: dict) -> str:
+    parts = [str(doc.get("summary") or "").strip()]
+    for key, heading in (("delivered", "Delivered"), ("decisions", "Decisions"), ("open", "Still open")):
+        items = _clean_list(doc, key)
+        if items:
+            parts.append(f"**{heading}:**\n" + "\n".join(f"- {i}" for i in items))
+    return "\n\n".join(p for p in parts if p)
+
+
+def completion_as_entry(scope: str, doc: dict) -> str:
+    """The single entry a finished branch leaves in its parent.
+
+    One entry, not one per line: the parent asked for a feature, not for
+    the branch's working notes. Handing back everything would recreate in
+    the parent exactly the bloat that splitting the work off avoided.
+    """
+    bits = [f"Completed in a separate chat ({scope}): {str(doc.get('summary') or '').strip()}"]
+    decisions = _clean_list(doc, "decisions")
+    if decisions:
+        bits.append("Decisions made there: " + "; ".join(decisions))
+    still_open = _clean_list(doc, "open")
+    if still_open:
+        bits.append("Still open from it: " + "; ".join(still_open))
+    return " ".join(bits)
+
+
+async def draft_completion(branch_conversation_id: str) -> dict | None:
+    """Reads the branch's whole history plus its own context block — the
+    latter is what carries the acceptance criteria, which is the thing the
+    work is supposed to be judged against."""
+    history = await get_messages(branch_conversation_id)
+    real = [m for m in history if not (m["role"] == "navi" and m["content"].startswith("⚠️"))]
+    if not real:
+        return None
+
+    messages = [
+        ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"])
+        for m in real
+    ]
+    context_block, _tokens = await build_context_block(branch_conversation_id)
+    if context_block.strip():
+        messages.insert(0, ChatMessage(
+            role="user",
+            content="This is the brief this work was given, including what it had to achieve:\n\n" + context_block,
+        ))
+
+    doc = await compact_conversation(messages, COMPLETION_INSTRUCTION)
+    if not isinstance(doc, dict) or not str(doc.get("summary") or "").strip():
+        return None
+    return doc

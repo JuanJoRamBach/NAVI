@@ -366,6 +366,32 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "propose_branch_complete",
+            "description": "Call this INSTEAD OF replying when the work this chat "
+                            "was opened to do is finished — when the 'Done when' "
+                            "criteria in your context have actually been met. Do not "
+                            "call it because a lot has been done, or because a "
+                            "milestone feels reached: check each criterion and only "
+                            "call this if every one of them is genuinely satisfied. "
+                            "If any is not, keep working and say what is left. The "
+                            "user reviews and accepts — you are proposing that the "
+                            "work is done, not declaring it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "One or two sentences on what was achieved. "
+                                        "State plainly anything that was NOT achieved.",
+                    },
+                },
+                "required": ["summary"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "propose_plan_ready",
             "description": "Call this once clarification is genuinely done and there's "
                             "enough to draft a research plan — instead of drafting the "
@@ -382,8 +408,9 @@ TOOL_SCHEMAS = [
 ]
 
 # ask_user_choice, propose_research_mode, propose_plan_ready,
-# flag_key_insight and request_stronger_model are deliberately NOT handled
-# in dispatch() below — all five are intercepted earlier, in
+# propose_branch_complete, flag_key_insight and request_stronger_model are
+# deliberately NOT handled in dispatch() below — all six are intercepted
+# earlier, in
 # run_stored_mode_chat/run_devslate_turn/dispatcher/research.py, before a
 # call ever reaches the normal execute-and-continue tool loop.
 #
