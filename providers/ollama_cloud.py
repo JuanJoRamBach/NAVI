@@ -71,22 +71,31 @@ class OllamaCloudProvider(Provider):
                 # nemotron-3-super (120B MoE, free GPU pool, possible cold
                 # start) read-timed-out every time, and the user saw
                 # "couldn't distil this page" for what was only impatience.
-                # 300s. Measured, not guessed (2026-09-13, nemotron-3-super):
+                # 190s, and the number is not ours to choose.
+                #
+                # Ollama Cloud enforces a HARD 182-second server-side
+                # timeout that kills a generation mid-progress
+                # (github.com/ollama/ollama/issues/15973). It is
+                # undocumented, applies to paying subscribers too, and
+                # cannot be extended. Waiting longer than that on our side
+                # buys nothing except a slower failure - the previous 300s
+                # spent two extra minutes on a request Ollama had already
+                # abandoned.
+                #
+                # What we measured before learning that (2026-09-13/14,
+                # nemotron-3-super) explains why this bites so often:
                 #
                 #   cold start ...................... ~80s
                 #   trivial prompt once warm ........  ~11s
-                #   distil a 4,500-token article ....  ~82s warm
+                #   distil an 18,700-token page .....  ~82s warm
                 #
-                # So the FIRST call of a batch pays ~160s before anything
-                # comes back, which is why 60s always failed and 180s sat
-                # right on the edge. The generation itself is large — that
-                # article produced 5,583 output tokens — and that is the
-                # real cost, not network latency.
-                #
-                # Later calls in the same batch are warm and roughly half
-                # that. Nothing here is interactive: every caller is
-                # background, batched, one document at a time.
-                timeout=300,
+                # A first call therefore lands around 160s - inside 20
+                # seconds of a cap it cannot see coming. Two of five
+                # benchmark reps exceeded it. This provider is structurally
+                # unsuited to long generations, and no timeout value here
+                # changes that; 190s simply fails promptly so the fallback
+                # starts sooner.
+                timeout=190,
             )
         except requests.RequestException as e:
             raise ProviderError(f"Ollama Cloud request failed: {e}")
