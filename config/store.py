@@ -337,9 +337,32 @@ DEFAULTS = {
         # still has to read a whole conversation, so context length matters
         # more here than raw capability. Flagged as an open choice in
         # how_to_handle_context.md; revisit if it proves too weak.
+        # FLIPPED 2026-09-14, on measurement rather than preference.
+        #
+        # Ollama Cloud enforces a HARD 182-second server-side timeout that
+        # kills a generation mid-progress (ollama/ollama#15973) —
+        # undocumented, unextendable, and applying to paying subscribers
+        # too. A first call here lands around 160s (≈80s cold start plus
+        # ≈82s to distil an 18,700-token page), which is inside twenty
+        # seconds of that cap. Two of five benchmark reps went over.
+        #
+        # A primary that cannot finish its largest jobs is not a primary.
+        # And a timeout is the most expensive way to fail: the abandoned
+        # call's input tokens are spent in full, then the fallback pays for
+        # the same prompt again. Measured, not inferred — a source
+        # distillation that needed the fallback cost 37,440 input tokens
+        # against 18,719 when the primary answered.
+        #
+        # Mistral leads now: no such cap, 256K context, 100 RPM / 100K TPM,
+        # and it completed the same distillation repeatedly the day Ollama
+        # was timing out on it. Ollama stays as the fallback rather than
+        # being dropped — it is a genuinely separate resource pool (GPU
+        # time, not tokens), and it handles the SMALL jobs on this role
+        # perfectly well: context compaction passed five of five at ~2K
+        # input, comfortably inside the cap.
         "context_synthesis": {
-            "provider": "ollama_cloud", "model": "nemotron-3-super",
-            "fallback": [{"provider": "mistral", "model": "mistral-small-latest"}],
+            "provider": "mistral", "model": "mistral-small-latest",
+            "fallback": [{"provider": "ollama_cloud", "model": "nemotron-3-super"}],
         },
         # agent_work: backs each node of an Agent Work workflow run
         # (dispatcher/agent_work.py) AND Agent Work's own chat
@@ -1224,7 +1247,34 @@ def _migrate_add_context_synthesis_role_2026_09_13():
 _migrate_add_context_synthesis_role_2026_09_13()
 
 
-def _migrate_normal_chat_tiers_2026_09_13():
+def _migrate_normal_chat_tiers_2026_09_13()
+
+
+def _migrate_context_synthesis_primary_2026_09_14():
+    """Flips context_synthesis to Mistral-primary on an already-
+    materialized config.json. Force-overwrite, not fill-if-missing: the
+    stored value is a known-wrong state, not an absent one.
+
+    Ollama Cloud's hard 182-second cap (see DEFAULTS for the full
+    reasoning and the measurements) means its primary could not finish
+    this role's largest jobs, and a timeout is the most expensive failure
+    available — the abandoned call's input is paid in full before the
+    fallback pays for the same prompt again.
+
+    Ollama is kept as the fallback rather than removed: separate resource
+    pool, and it handles this role's small jobs without trouble.
+    """
+    want = {
+        "provider": "mistral", "model": "mistral-small-latest",
+        "fallback": [{"provider": "ollama_cloud", "model": "nemotron-3-super"}],
+    }
+    role = config.get_role("context_synthesis")
+    if role and role.get("provider") == "ollama_cloud":
+        config.set_role("context_synthesis", want["provider"], want["model"], want["fallback"])
+        print("[config] context_synthesis flipped to mistral primary (Ollama's 182s cap)")
+
+
+_migrate_context_synthesis_primary_2026_09_14():
     """Installs Normal Chat's three capability tiers on an already-
     materialized config.json (see DEFAULTS for the full reasoning).
 
