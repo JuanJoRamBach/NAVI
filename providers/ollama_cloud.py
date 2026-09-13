@@ -71,7 +71,22 @@ class OllamaCloudProvider(Provider):
                 # nemotron-3-super (120B MoE, free GPU pool, possible cold
                 # start) read-timed-out every time, and the user saw
                 # "couldn't distil this page" for what was only impatience.
-                timeout=180,
+                # 300s. Measured, not guessed (2026-09-13, nemotron-3-super):
+                #
+                #   cold start ...................... ~80s
+                #   trivial prompt once warm ........  ~11s
+                #   distil a 4,500-token article ....  ~82s warm
+                #
+                # So the FIRST call of a batch pays ~160s before anything
+                # comes back, which is why 60s always failed and 180s sat
+                # right on the edge. The generation itself is large — that
+                # article produced 5,583 output tokens — and that is the
+                # real cost, not network latency.
+                #
+                # Later calls in the same batch are warm and roughly half
+                # that. Nothing here is interactive: every caller is
+                # background, batched, one document at a time.
+                timeout=300,
             )
         except requests.RequestException as e:
             raise ProviderError(f"Ollama Cloud request failed: {e}")
