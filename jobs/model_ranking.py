@@ -123,8 +123,9 @@ TASK_REQUIREMENTS = {
     # Dev Slate's own conversational coding chat (dispatcher/devslate_chat.py,
     # 2026-09-01). min_context is higher than the other tasks': a Dev
     # Slate turn carries a mode brief + task-state block + real
-    # conversation history, not one bare prompt.
-    "devslate": {"tools": False, "min_context": 16000, "tier": "large"},
+    # conversation history, not one bare prompt. Raised 16,000 -> 32,000
+    # on 2026-09-13 for the same reason as normal_chat below.
+    "devslate": {"tools": False, "min_context": 32000, "tier": "large"},
     # Agent Work's own chat (dispatcher/chat.py's run_stored_mode_chat,
     # mode: "agent_work", 2026-09-01) — tools=True since its whole point
     # is calling create_workflow/run_workflow/etc., not optional the way
@@ -140,7 +141,19 @@ TASK_REQUIREMENTS = {
     # real-windowed-history reasoning as devslate/agent_work above, now
     # that run_stored_mode_chat gives this role real multi-turn memory
     # too (2026-09-01), not just a bare single message.
-    "normal_chat": {"tools": True, "min_context": 16000, "tier": "large"},
+    #
+    # Raised 16,000 -> 32,000 on 2026-09-13. Not because today's config
+    # needs it — every model actually routed to is 128K+ — but because
+    # this floor is the only thing that will stand between a small-context
+    # model and the live chain once Stage 2 auto-applies this snapshot to
+    # routing instead of a human reviewing it. 16,000 was set when a turn
+    # was a brief + a 20-message window; a turn now also carries context.md
+    # (up to CONTEXT_TRIGGER_TOKENS, and briefly over it in the turn that
+    # crosses the ceiling) and can hold real tool results in the window.
+    # 32,000 is headroom against that assembled worst case, not a measured
+    # ceiling — it excludes nothing NAVI routes to today, which is exactly
+    # when a guard is cheap to add.
+    "normal_chat": {"tools": True, "min_context": 32000, "tier": "large"},
 }
 
 # Confirmed unreliable at tool-calling despite the catalog's own "tools"
