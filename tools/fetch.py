@@ -42,6 +42,24 @@ except ImportError:
 
 MAX_CHARS = 8000  # keep tool output small enough to not blow the model's context
 
+# Sources reads whole pages, and 8,000 was sized for a different job.
+# That number exists so a fetch_page result dropped into a CHAT turn
+# doesn't swallow the context window — a real constraint there, where the
+# fetch is one of several things competing for room alongside history, a
+# brief and tool schemas.
+#
+# A Source distillation has none of that competition: one call, one page,
+# an instruction of about 600 tokens, on a role whose models carry 128K
+# (nemotron-3-super) and 256K (mistral-small-latest). ~60,000 characters
+# is roughly 15,000 tokens, which reads most articles end to end and
+# still leaves the context overwhelmingly empty.
+#
+# This matters for correctness, not comfort. The Faros article hit the
+# 8,000 cap, so its document was an honest reading of the first third of
+# the page presented as a reading of the page. Truncation is still
+# reported when it happens — it just now happens far less.
+SOURCE_MAX_CHARS = 60_000
+
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
 # Whole-element strip for the containers that are reliably navigation/
 # boilerplate, not article content — <nav>/<header>/<footer>/<aside>/

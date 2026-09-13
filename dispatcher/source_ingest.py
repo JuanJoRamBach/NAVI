@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
 
@@ -55,14 +56,16 @@ from dispatcher.compaction import compact_conversation
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_provider
 from storage.sources import create_batch, create_document, find_by_url, finish_batch
-from tools.fetch import FetchError, fetch_document
+from tools.fetch import SOURCE_MAX_CHARS, FetchError, fetch_document
 from tools.source_document import (
     SOURCE_DOCUMENT_INSTRUCTION,
     apply_verdicts,
     build_grounding_prompt,
     build_structuring_messages,
+    flatten_for_pdf,
     load_grounding_policy,
     parse_grounding_reply,
+    render_source_markdown,
     undecided_points,
     verify_document,
 )
@@ -116,7 +119,7 @@ def _ingest_one(batch_id: str, url: str) -> None:
         return
 
     try:
-        page = fetch_document(url)
+        page = fetch_document(url, max_chars=SOURCE_MAX_CHARS)
     except FetchError as e:
         # A dead link still gets a row. Pasting five URLs and getting three
         # cards with no explanation reads as a bug, not as a bad link.
@@ -159,10 +162,11 @@ def _ingest_one(batch_id: str, url: str) -> None:
         "published": page.get("published"),
     }
     grounding = doc.get("grounding_summary") or {}
+    filen_path = _save_to_knowledge(doc, page)
     create_document(
         batch_id=batch_id, term=None,
         title=page.get("title") or url, url=page.get("url") or url,
-        filen_path=None,
+        filen_path=filen_path,
         status="pending_review",
         document=json.dumps(doc, ensure_ascii=False),
         markdown=markdown,
@@ -261,3 +265,45 @@ def start_ingest(urls: list[str]) -> None:
     background job here uses (a real OS thread, not asyncio — this call
     chain is synchronous top to bottom)."""
     threading.Thread(target=ingest_urls, args=(urls,), daemon=True).start()
+
+
+def _save_to_knowledge(doc: dict, page: dict) -> str | None:
+    """Renders the document to PDF and files it in Knowledge.
+
+    Worth being clear about what this is FOR, because the format cuts
+    against the rest of this module: a PDF is for a person to read, keep
+    or send on. It is NOT how NAVI will read this back — the structured
+    document and the cleaned Markdown are both stored in the database, and
+    those are strictly better for that, since a PDF would have to be
+    parsed back into the structure we already have.
+
+    Best-effort by design. A rendering or upload failure loses a
+    convenience copy, never the document itself, so it must not fail the
+    ingest — same rule as every other optional output here.
+    """
+    try:
+        from tools.documents import DocumentRenderError, render_pdf
+        from storage.filen import save_bytes
+    except ImportError as e:
+        print(f"[sources] no PDF export available: {e}")
+        return None
+
+    title = page.get("title") or page.get("url") or "Source"
+    markdown = render_source_markdown(
+        doc, extractor=page.get("extractor"), truncated=bool(page.get("truncated")),
+    )
+    try:
+        pdf = render_pdf(title, flatten_for_pdf(markdown))
+    except DocumentRenderError as e:
+        print(f"[sources] PDF render failed (document still saved): {e}")
+        return None
+    except Exception as e:  # noqa: BLE001 - a convenience copy must never fail an ingest
+        print(f"[sources] PDF render failed unexpectedly (document still saved): {e}")
+        return None
+
+    slug = re.sub(r"[^a-z0-9]+", "-", (title or "source").lower()).strip("-")[:60] or "source"
+    try:
+        return save_bytes("sources", slug, f"{slug}.pdf", pdf)
+    except Exception as e:  # noqa: BLE001 - same reason
+        print(f"[sources] Knowledge upload failed (document still saved): {e}")
+        return None

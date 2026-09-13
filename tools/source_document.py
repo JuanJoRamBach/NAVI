@@ -406,3 +406,101 @@ def build_structuring_messages(title, url, markdown):
     from providers.base import ChatMessage
     header = f"PAGE: {title or '(untitled)'}\nURL: {url}\n\n"
     return [ChatMessage(role="user", content=header + (markdown or ""))]
+
+
+# ---- Rendering a document for people ----------------------------------
+
+_STATUS_LABEL = {
+    STATUS_VERIFIED: "VERIFIED",
+    STATUS_PARAPHRASE: "PARAPHRASED",
+    STATUS_UNLOCATED: "NOT LOCATED",
+}
+
+
+def render_source_markdown(doc: dict, *, extractor: str | None = None, truncated: bool = False) -> str:
+    """The document as a person reads it.
+
+    The grounding state is printed next to every claim rather than
+    summarised at the top, because the summary is not what anyone acts
+    on: a reader needs to know which SPECIFIC claim is shaky at the
+    moment they read it, not that the document scored 0.75 overall.
+    """
+    src = doc.get("source") or {}
+    g = doc.get("grounding_summary") or {}
+    out: list[str] = []
+
+    out.append(f"# {src.get('title') or 'Untitled source'}\n")
+    out.append(f"{src.get('url') or ''}\n")
+    meta = [
+        f"By {src['author']}" if src.get("author") else None,
+        src.get("published"),
+        f"extracted with {extractor}" if extractor else None,
+        "PAGE WAS TRUNCATED - this reads only the first part of it" if truncated else None,
+    ]
+    out.append(" | ".join(m for m in meta if m) + "\n")
+
+    if g:
+        out.append(
+            f"Grounding: {g.get('verified', 0)} of {g.get('points', 0)} claims verified "
+            f"word-for-word against the page."
+            + (f" {g['disputed']} disputed." if g.get("disputed") else "")
+            + (f" {g['unchecked']} not independently checked." if g.get("unchecked") else "")
+            + ("\nThis document needs a human look before it is trusted." if g.get("needs_review") else "")
+            + "\n"
+        )
+
+    if doc.get("about"):
+        out.append(f"## What this is\n{doc['about']}\n")
+    if doc.get("summary"):
+        out.append(f"## Summary\n{doc['summary']}\n")
+    if doc.get("topics"):
+        out.append("## Topics\n" + ", ".join(str(t) for t in doc["topics"]) + "\n")
+    if doc.get("covers"):
+        out.append("## Questions this page can answer")
+        out.extend(f"- {c}" for c in doc["covers"])
+        out.append("")
+
+    points = doc.get("key_points") or []
+    if points:
+        out.append("## Key points\n")
+        for i, p in enumerate(points, 1):
+            gr = p.get("grounding") or {}
+            verdict = gr.get("verdict") or {}
+            out.append(f"### {i}. {p.get('claim', '')}\n")
+            quote = (p.get("quote") or "").replace("\n", " ")
+            out.append(f'   "{quote}"\n')
+            line = f"   [{_STATUS_LABEL.get(gr.get('status'), 'UNKNOWN')}] match {gr.get('ratio', '-')}"
+            if verdict:
+                line += f" | checked: {verdict.get('verdict')} - {verdict.get('reason', '')}"
+            elif gr.get("status") in (STATUS_PARAPHRASE, STATUS_UNLOCATED):
+                line += " | not independently checked"
+            out.append(line + "\n")
+
+    if doc.get("caveats"):
+        out.append("## Before trusting this")
+        out.extend(f"- {c}" for c in doc["caveats"])
+        out.append("")
+
+    out.append("---")
+    out.append("Produced by NAVI. Every quote above was checked against the page it came from.")
+    return "\n".join(out)
+
+
+_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
+_ITALIC_RE = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
+
+
+def flatten_for_pdf(md: str) -> str:
+    """The PDF renderer understands headings and body text, nothing else
+    (tools/documents.py's render_pdf). Left alone, its output would show
+    literal ** and [](). Strip the syntax it can't draw rather than print
+    the markers at a reader.
+
+    The markdown itself is unaffected \u2014 this only shapes the copy handed
+    to the renderer, so the readable version keeps its formatting.
+    """
+    md = _BOLD_RE.sub(r"\1", md)
+    md = _ITALIC_RE.sub(r"\1", md)
+    md = _LINK_RE.sub(r"\1", md)
+    return md
