@@ -13,3 +13,4 @@ croniter
 mcp>=2,<3
 httpx
 cryptography
+trafilatura
