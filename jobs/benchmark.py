@@ -356,27 +356,17 @@ def _preflight(force: bool = False) -> bool:
     import os
 
     from config.store import config
-    from providers.registry import CHAT_TIERS, get_dispatcher_role
 
     problems: list[str] = []
     seen: set[str] = set()
-    for tier in CHAT_TIERS:
-        try:
-            role = get_dispatcher_role(context=tier)
-        except Exception as e:  # noqa: BLE001
-            problems.append(f"{tier}: no routing configured ({e})")
+    for role, label, name, _model in _chain():
+        if name in seen:
             continue
-        chain = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
-        for position, attempt in enumerate(chain):
-            name = attempt["provider"]
-            if name in seen:
-                continue
-            seen.add(name)
-            label = "primary" if position == 0 else f"fallback {position}"
-            if not config.get_provider_key(name):
-                problems.append(f"{name} ({tier} {label}): no API key in the store or the environment")
-            elif name == "cloudflare" and not os.environ.get("CLOUDFLARE_ACCOUNT_ID"):
-                problems.append(f"cloudflare ({tier} {label}): CLOUDFLARE_ACCOUNT_ID not set")
+        seen.add(name)
+        if not config.get_provider_key(name):
+            problems.append(f"{name} ({role} {label}): no API key in the store or the environment")
+        elif name == "cloudflare" and not os.environ.get("CLOUDFLARE_ACCOUNT_ID"):
+            problems.append(f"cloudflare ({role} {label}): CLOUDFLARE_ACCOUNT_ID not set")
 
     if not problems:
         return True
@@ -393,19 +383,26 @@ def _preflight(force: bool = False) -> bool:
     return bool(force)
 
 
-def _chain() -> list[tuple[str, str, str]]:
-    """(tier, label, provider, model) for every attempt in every chat
-    tier, in the order routing would actually try them."""
-    from providers.registry import CHAT_TIERS, get_dispatcher_role
+def _chain() -> list[tuple[str, str, str, str]]:
+    """(role, label, provider, model) for every attempt in EVERY role, in
+    the order routing would actually try them.
+
+    Every role, not just the chat tiers. Checking only chat is how a dead
+    Mistral account went unnoticed while sitting as the fallback for three
+    separate roles — agent_work, context_synthesis and devslate all had a
+    safety net that had never once worked, and nothing looked at it
+    because nothing chatted through it.
+    """
+    from providers.registry import _ROLE_NAME_FOR_CONTEXT, get_dispatcher_role
     out = []
-    for tier in CHAT_TIERS:
+    for context in sorted(_ROLE_NAME_FOR_CONTEXT):
         try:
-            role = get_dispatcher_role(context=tier)
+            role = get_dispatcher_role(context=context)
         except Exception:  # noqa: BLE001
             continue
         chain = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
         for i, a in enumerate(chain):
-            out.append((tier, "primary" if i == 0 else f"fallback {i}", a["provider"], a["model"]))
+            out.append((context, "primary" if i == 0 else f"fallback {i}", a["provider"], a["model"]))
     return out
 
 
@@ -430,15 +427,17 @@ def check_providers(live: bool = True) -> bool:
 
     rows = _chain()
     seen: dict[str, tuple[str, str]] = {}
-    for tier, label, provider, model in rows:
-        seen.setdefault(provider, (f"{tier} {label}", model))
+    roles_using: dict[str, set[str]] = {}
+    for role, label, provider, model in rows:
+        seen.setdefault(provider, (f"{role} {label}"[:21], model))
+        roles_using.setdefault(provider, set()).add(role)
 
     if _ENV_FILE:
         print(f"Loaded environment from {_ENV_FILE}\n")
     else:
         print("No .env file loaded - relying on whatever is already in this shell.\n")
-    print(f"{'provider':14} {'first used as':22} {'key':10} {'live call':32}")
-    print("-" * 82)
+    print(f"{'provider':14} {'first used as':22} {'key':10} {'live call':26} {'roles depending on it'}")
+    print("-" * 108)
     all_ok = True
     for provider, (where, model) in seen.items():
         has_key = bool(config.get_provider_key(provider))
@@ -461,7 +460,8 @@ def check_providers(live: bool = True) -> bool:
 
         ok = has_key and (not live or result == "ok")
         all_ok = all_ok and ok
-        print(f"{provider:14} {where:22} {key_note:10} {result:32}")
+        roles = ",".join(sorted(roles_using.get(provider, [])))
+        print(f"{provider:14} {where:22} {key_note:10} {result:26} {roles}")
 
     print()
     if all_ok:
