@@ -45,7 +45,7 @@ from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider, next_chat_tier
 from storage.context_store import (
     SOURCE_ASSISTANT, SOURCE_BRANCH_RESULT, append_entry, build_context_block,
-    get_friction_since, record_friction,
+    estimate_tokens, get_friction_since, record_friction,
 )
 from storage.conversations import (
     append_message, get_conversation, get_messages, get_task_state, set_task_state,
@@ -83,6 +83,58 @@ def _collapse_repeated_paragraphs(text: str) -> str:
             seen.add(normalized)
         kept.append(p)
     return "\n\n".join(kept)
+
+
+# A ceiling on how much replayed conversation rides along each turn.
+#
+# RECENT_MESSAGE_WINDOW alone counts MESSAGES, which is the wrong unit and
+# has been a known gap since the window was built: what providers meter,
+# and what actually degrades a model's attention, is tokens. Twenty short
+# exchanges and twenty long structured answers cost wildly different
+# amounts for the same cap. A real turn was observed at 7,393 prompt
+# tokens for a one-line question, most of it replayed history.
+#
+# So both limits apply: at most RECENT_MESSAGE_WINDOW messages, and at
+# most this many tokens of them. A chat of quick back-and-forth keeps all
+# twenty; a chat of long answers keeps fewer, which is the correct
+# behaviour in both cases.
+HISTORY_TOKEN_BUDGET = 2_500
+
+# Never trim below this many of the most recent messages, whatever they
+# cost. Continuity is the window's actual job — the last couple of
+# exchanges are what keep a reply feeling like it belongs to the
+# conversation rather than arriving out of nowhere. A single enormous
+# message is allowed to blow the budget rather than leave the model
+# answering with no idea what was just said.
+HISTORY_MIN_MESSAGES = 4
+
+
+def _trim_history_to_budget(messages: list[ChatMessage]) -> list[ChatMessage]:
+    """Keeps the newest messages that fit HISTORY_TOKEN_BUDGET.
+
+    Walks from the newest backwards, because the newest are the ones that
+    must survive: the final entry is the user's actual question. Dropping
+    happens at the OLD end, which is the same end RECENT_MESSAGE_WINDOW
+    already drops from, so this only ever tightens an existing boundary —
+    it never removes something the previous rule would have kept for a
+    reason of its own.
+
+    Anything dropped here is not lost from the conversation: it stays in
+    storage, and whatever mattered about it should already be in
+    context.md, which is exactly the job context.md was built to do.
+    """
+    kept: list[ChatMessage] = []
+    total = 0
+    for m in reversed(messages):
+        cost = estimate_tokens(m.content)
+        if kept and len(kept) >= HISTORY_MIN_MESSAGES and total + cost > HISTORY_TOKEN_BUDGET:
+            break
+        kept.append(m)
+        total += cost
+    kept.reverse()
+    if len(kept) < len(messages):
+        print(f"[chat] history trimmed {len(messages)} -> {len(kept)} messages ({total} tokens, budget {HISTORY_TOKEN_BUDGET})")
+    return kept
 
 
 async def _maybe_compact_context(conversation_id: str) -> bool:
@@ -459,6 +511,13 @@ async def run_stored_mode_chat(
         conversation = await get_conversation(conversation_id)
         if not (conversation and conversation.get("parent_id")):
             tool_names.remove("propose_branch_complete")
+    # Same rule, same reason: the top tier has nowhere to escalate TO
+    # (next_chat_tier returns None), so shipping this schema there buys a
+    # guaranteed-useless option and pays ~190 prompt tokens per turn for
+    # the privilege. It also removes the only way to reach the
+    # escalation-at-ceiling branch by accident.
+    if "request_stronger_model" in tool_names and not next_chat_tier(tier):
+        tool_names.remove("request_stronger_model")
     tools = schemas_for(tool_names) if tool_names else None
     base_system_parts = [brief.system_prompt]
     if tools:
@@ -474,16 +533,11 @@ async def run_stored_mode_chat(
     #
     # agent_work is excluded by construction — it's deliberately stateless
     # (see below), so durable memory would contradict its whole design.
+    # Fetched here, but attached to the LAST message far below — NOT to
+    # this leading system block. See that call site for why that matters.
+    context_block = ""
     if mode != "agent_work":
         context_block, _context_tokens = await build_context_block(conversation_id)
-        if context_block:
-            base_system_parts.append(
-                "## What you already know about this conversation\n"
-                "Durable memory from earlier in this conversation, distilled. Treat it as "
-                "established background, not as something the user just said — don't "
-                "re-confirm it back to them unprompted.\n\n"
-                + context_block
-            )
     # AGENT_WORK_REVIEW_INSTRUCTION's "confirm on a LATER message" design
     # requires the model to remember its own proposal on a future turn —
     # incompatible with agent_work now being stateless (2026-09-03,
@@ -532,6 +586,7 @@ async def run_stored_mode_chat(
             if m["role"] == "navi" and m["content"].startswith("⚠️"):
                 continue
             history_messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
+        history_messages = _trim_history_to_budget(history_messages)
     # UTC time grounding (JuanJo, 2026-09-01: "if it asks for something
     # close to 'do it in X time', must send the messages with a UTC
     # signal") — the model has no inherent sense of "now," so a request
@@ -551,6 +606,42 @@ async def run_stored_mode_chat(
     # additional for prefix-based caching while keeping every system
     # message genuinely first. The stored copy (already persisted above,
     # via append_message) is untouched — only this outgoing copy changes.
+    # context.md — the conversation's distilled durable memory, so a fact
+    # established 50 messages ago still reaches the model after
+    # RECENT_MESSAGE_WINDOW scrolled past it.
+    #
+    # Attached to the FINAL message rather than the leading system block,
+    # and that placement is the entire point. It first shipped inside the
+    # system message, whose own comment claimed this was cache-safe
+    # because the block "only changes when a compaction pass runs or a new
+    # insight is flagged, not per-turn." That reasoning was wrong in its
+    # conclusion: anything at the FRONT that ever changes invalidates the
+    # prefix for everything behind it, so one flagged insight threw away
+    # the cache for the whole conversation — brief, tool schemas and every
+    # replayed message alike. Observed live 2026-09-13: 7,393 prompt
+    # tokens with ZERO cached, on a turn that should have reused most of
+    # them.
+    #
+    # The UTC line directly below had already established this exact rule
+    # and this exact fix ("which would poison the whole history block's
+    # cache-prefix stability with a value that changes every call"). Same
+    # treatment for the same reason: the final message is already unique
+    # this turn, so riding along on it costs nothing a cache could have
+    # saved.
+    #
+    # Placed before the user's own words rather than after, so the question
+    # itself stays last — the strongest position for the thing actually
+    # being answered.
+    if context_block:
+        history_messages[-1].content = (
+            "## What you already know about this conversation\n"
+            "Durable memory from earlier in this conversation, distilled. Treat it as "
+            "established background, not as something the user just said — don't "
+            "re-confirm it back to them unprompted.\n\n"
+            + context_block
+            + "\n\n---\n\n"
+            + history_messages[-1].content
+        )
     history_messages[-1].content = f"{history_messages[-1].content}\n\n[Current UTC time: {datetime.now(timezone.utc).isoformat()}]"
 
     attempts = config.get_attempts([{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", []))
