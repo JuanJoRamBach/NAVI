@@ -692,6 +692,17 @@ LLM7_ANONYMOUS_DAILY_TOKEN_CAP = 500_000  # real, but unused by NAVI today
 MISTRAL_MONTHLY_CREDIT_USD = 10.0
 OPENROUTER_DAILY_REQUEST_CAP = 50
 
+# Google AI Studio's free tier meters requests-per-day PER MODEL, not per
+# project (providers/gemini.py's docstring carries the full figures and
+# where they came from). Keyed by model FAMILY because that's the level
+# the limit actually applies at, and because a new Flash-Lite release
+# should inherit the right cap without a code change.
+GEMINI_DAILY_REQUEST_CAPS = {
+    "flash-lite": 500,
+    "flash": 20,
+    "pro": 0,  # genuinely zero on free tier — not "unknown"
+}
+
 
 @app.get("/usage/counters")
 def usage_counters() -> dict:
@@ -725,6 +736,23 @@ def usage_counters() -> dict:
     ollama_requests = sum(r["requests"] for r in ollama_rows)
     ollama_tokens = sum(r["tokens"] for r in ollama_rows)
 
+    # Per-model, matching how Google actually meters this. A model NAVI
+    # hasn't called today simply doesn't appear — same honest-absence
+    # convention the Groq card already uses, rather than inventing a zero
+    # row for every model in the catalog.
+    gemini_models = [
+        {
+            "model": row["model"],
+            "requests": row["requests"],
+            "tokens": row["tokens"],
+            "cap": GEMINI_DAILY_REQUEST_CAPS.get(
+                "flash-lite" if "flash-lite" in row["model"] else
+                "pro" if "-pro" in row["model"] else "flash"
+            ),
+        }
+        for row in get_usage_today("gemini")
+    ]
+
     or_rows = get_usage_today("openrouter")
     openrouter_requests = sum(r["requests"] for r in or_rows)
     key = config.get_provider_key("openrouter")
@@ -753,6 +781,13 @@ def usage_counters() -> dict:
         },
         "gmi": {"requests_today": gmi_requests, "status": "checking — promo status unconfirmed past 2026-09-06"},
         "ollama_cloud": {"requests_today": ollama_requests, "tokens_today": ollama_tokens, "cap": None},
+        # Gemini is metered PER MODEL, not per project (providers/gemini.py
+        # documents the real figures) — so this reports per-model counts
+        # the way Groq does, not one project-wide total, which would be
+        # actively misleading: two Flash-Lite models are two independent
+        # 500/day pools, and that separation is exactly why the idle and
+        # exploratory tiers sit on different ones.
+        "gemini": {"models": gemini_models},
     }
 
 
