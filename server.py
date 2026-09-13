@@ -1144,6 +1144,11 @@ async def chat_send(request: Request) -> JSONResponse:
             # sending the click back as plain text and hoping it's read as
             # consent. Never set outside that one flow.
             "suggested_mode": reply.get("suggested_mode"),
+            # Set only on the one turn a conversation is judged to have
+            # stopped being compactable (dispatcher/chat.py's
+            # _hit_the_floor). Carries the notice text so the client can
+            # render it with a "start a focused chat" action attached.
+            "branch_suggestion": reply.get("branch_suggestion"),
             # How full this conversation's own memory is, 0..1 against the
             # compaction ceiling — read AFTER the turn, so a turn that
             # triggered compaction reports the post-compaction value and the

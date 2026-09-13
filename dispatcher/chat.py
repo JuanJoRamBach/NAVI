@@ -44,7 +44,8 @@ from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider, next_chat_tier
 from storage.context_store import (
-    SOURCE_ASSISTANT, SOURCE_BRANCH_RESULT, append_entry, build_context_block, record_friction,
+    SOURCE_ASSISTANT, SOURCE_BRANCH_RESULT, append_entry, build_context_block,
+    get_friction_since, record_friction,
 )
 from storage.conversations import (
     append_message, get_conversation, get_messages, get_task_state, set_task_state,
@@ -84,7 +85,7 @@ def _collapse_repeated_paragraphs(text: str) -> str:
     return "\n\n".join(kept)
 
 
-async def _maybe_compact_context(conversation_id: str) -> None:
+async def _maybe_compact_context(conversation_id: str) -> bool:
     """Fires a compaction pass if context.md has crossed its token ceiling.
 
     Runs INLINE, at the end of the turn that crossed the line, after the
@@ -104,11 +105,15 @@ async def _maybe_compact_context(conversation_id: str) -> None:
     Never raises: a failed compaction leaves the existing context in place
     and the conversation keeps working, slightly over budget, rather than
     the turn blowing up over housekeeping.
+
+    Returns True on the one turn a conversation is judged to have hit the
+    floor — see _hit_the_floor below. False every other time, including
+    every turn where nothing compacted at all.
     """
     try:
         _block, tokens = await build_context_block(conversation_id)
         if tokens < CONTEXT_TRIGGER_TOKENS:
-            return
+            return False
         print(f"[chat] context.md at {tokens} tokens (ceiling {CONTEXT_TRIGGER_TOKENS}) — compacting")
         report = await compact_context(conversation_id)
         if not report.get("ok"):
@@ -117,17 +122,69 @@ async def _maybe_compact_context(conversation_id: str) -> None:
                 detail=str(report.get("reason")),
             )
         elif report.get("still_above_target"):
-            # The "hit the floor" signal (how_to_handle_context.md's open
-            # escape-valve question) — compaction ran but couldn't get
-            # under target. Recorded so the eventual spin-off-a-new-chat
-            # rule has real data to be designed against, rather than
-            # guessing a threshold now.
             await record_friction(
                 "compaction_above_target", severity=2, conversation_id=conversation_id,
                 detail=f"{report.get('after_tokens')} tokens after compaction",
             )
+            return await _hit_the_floor(conversation_id)
     except Exception as e:
         print(f"[chat] context compaction check failed (non-fatal): {e}")
+    return False
+
+
+# How many times a conversation has to fail to compact under target before
+# it counts as having hit the floor.
+#
+# Two, not one. A single pass can miss target for a mundane reason — a
+# weak model call, an unlucky run. Twice means the material is genuinely
+# irreducible: the first pass already took out what was takeable and the
+# second still couldn't get under. One is noise, two is a pattern.
+#
+# The cost asymmetry points the same way. Suggesting a fresh chat too
+# eagerly trains people to dismiss the suggestion, which destroys it as a
+# signal; suggesting it one pass late costs almost nothing.
+FLOOR_FAILURES = 2
+
+# What the user actually reads when the floor is hit. Says what is
+# happening and what to do about it, and deliberately does not say
+# anything is wrong — nothing is. A conversation that has accumulated
+# more than it can compress is one that has been used a lot.
+FLOOR_NOTICE = (
+    "This chat is carrying about as much as it usefully can — tidying it up isn't "
+    "buying much room any more. If the next thing you want is a distinct piece of "
+    "work, it'll go better in its own chat, started with a brief from this one."
+)
+
+
+async def _hit_the_floor(conversation_id: str) -> bool:
+    """Has this conversation stopped being compactable?
+
+    The escape valve from the original compaction design: past some point
+    everything left is genuinely load-bearing, and further passes can only
+    shrink it by destroying something real. That is not a compaction bug
+    to fix by compacting harder — it means the conversation is done
+    growing, and the next piece of work belongs in its own chat.
+
+    Counted cumulatively rather than consecutively, deliberately. A
+    conversation that has missed target twice at all is one where
+    compaction is not keeping up, and whether a luckier pass happened to
+    land between them does not change that. It is also the version that
+    can be computed correctly from what is actually recorded — only
+    failures are, so "consecutive" would be inferred rather than known.
+
+    Offered once per conversation, never repeated: a suggestion that
+    reappears every turn is nagging, and gets dismissed reflexively.
+    """
+    events = await get_friction_since(0, conversation_id)
+    if any(e["kind"] == "context_floor_reached" for e in events):
+        return False
+    if sum(1 for e in events if e["kind"] == "compaction_above_target") < FLOOR_FAILURES:
+        return False
+    await record_friction(
+        "context_floor_reached", severity=3, conversation_id=conversation_id,
+        detail=f"{FLOOR_FAILURES} compaction passes could not reach target",
+    )
+    return True
 
 
 def _extract_created_workflow_id(sent_messages: list[ChatMessage]) -> str | None:
@@ -750,12 +807,21 @@ async def run_stored_mode_chat(
             # Ceiling check, AFTER the reply is persisted — see
             # _maybe_compact_context's own docstring for why compaction
             # runs inline here rather than as a background job.
+            hit_floor = False
             if mode != "agent_work":
-                await _maybe_compact_context(conversation_id)
+                hit_floor = await _maybe_compact_context(conversation_id)
+            if hit_floor:
+                # The escape valve, surfaced. Its own persisted message,
+                # not text appended to the reply: the user asked something
+                # and still gets their answer intact, and a note about the
+                # conversation reads as exactly that. Persisting it also
+                # means it survives a reload, unlike usage_note/choices.
+                await append_message(conversation_id, "navi", FLOOR_NOTICE)
             return {
                 "text": reply, "provider": attempt["provider"], "model": attempt["model"],
                 "usage_note": response.usage_note,
                 **({"created_workflow_id": created_workflow_id} if created_workflow_id else {}),
+                **({"branch_suggestion": FLOOR_NOTICE} if hit_floor else {}),
             }
         except ProviderError as e:
             last_error = str(e)
