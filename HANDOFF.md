@@ -14,6 +14,78 @@ project's history. `IDEAS.md` and `how_to_handle_context.md` (both gitignored,
 auto-loaded via `CLAUDE.md`) remain the authoritative running indexes for
 everything outside this scope; this file is the on-ramp for this one thread.
 
+## Deploying — read this before every backend deploy (added 2026-09-13, after a real outage)
+
+**The deploy step is NOT just `git pull && systemctl restart`.** That was
+the documented step, it skips dependency installation, and it cost a real
+multi-day outage: `docxtpl` entered `requirements.txt` on 2026-09-11 and
+was never installed on the box. Nothing failed at first, because nothing
+imported it. It became fatal on 2026-09-12 when `dispatcher/research.py`
+started importing `tools.report_render` at module scope — `server.py`
+imports research, so the whole API died at startup and systemd
+crash-looped it **366 times** before anyone noticed. Chat was down because
+a document library nobody had asked to use wasn't installed.
+
+### Backend (AWS Lightsail, `api.getnavi.online`, systemd unit `navi`)
+
+```bash
+cd /opt/navi && git pull && sudo -u navi venv/bin/pip install -r requirements.txt && sudo systemctl restart navi
+```
+
+Confirm it actually came up — do not assume, this is the exact failure
+mode that went unnoticed for days:
+
+```bash
+sudo systemctl is-active navi && curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/
+```
+
+`active` plus `200` means it is genuinely serving. Anything else:
+
+```bash
+sudo journalctl -u navi -n 60 --no-pager
+```
+
+A line reading `Scheduled restart job, restart counter is at N` with N
+climbing IS the signature of this failure: the service is crash-looping at
+import time, and the traceback immediately above it names the cause.
+
+Check `systemctl cat navi` if the user/venv path above doesn't match — the
+unit file is the source of truth for which interpreter actually runs.
+
+### Frontend (`navi-pwa`, GitHub Pages at `getnavi.online`)
+
+Pushing to `main` is the deploy — `.github/workflows/deploy-pages.yml`
+builds and publishes automatically. Nothing manual. A hard refresh may be
+needed to get past the service worker after a deploy.
+
+### Why the import-time crash class is now mostly closed
+
+Commit `ccbc785` made every optional renderer a soft import — `docxtpl`,
+`python-docx`, `fpdf2`, `python-pptx`, `matplotlib`. A missing one now
+raises at CALL time with a message naming the fix, instead of killing the
+process at import. Verified by simulating each library absent in turn: all
+five boot the server.
+
+That is a safety net, not a licence to skip the pip install. It means a
+missed dependency degrades one feature instead of taking chat down with
+it — the standard `tools/report_render.py`'s Gotenberg path always had
+("unset means the PDF path is unavailable, not a crash") and which the
+rest of the renderers should have had from the start.
+
+**A NEW dependency still needs installing.** If a change adds one to
+`requirements.txt`, the deploy above handles it; a deploy that skips the
+pip install will now quietly lose a feature rather than loudly lose the
+server, which is better but still wrong.
+
+### Still genuinely open: nothing surfaces a dead backend
+
+366 failed starts produced no alert anywhere. This is the same shape as
+the 2026-09-12 stale-snapshot incident — something silently not working,
+with nothing making it visible. The PWA makes it worse by rendering any
+`/config/models` failure as a permanent "Loading…" rather than an error,
+so a dead backend looks like a slow one. Not fixed. Worth a real health
+signal somewhere JuanJo would actually see it.
+
 ## Where Agent Work actually stands right now (verified by reading the real code, not memory)
 
 Backend: `dispatcher/agent_work.py` (899 lines) + `storage/agent_work.py`

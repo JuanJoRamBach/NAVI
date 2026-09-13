@@ -987,12 +987,23 @@ async def webhook_discord() -> PlainTextResponse:
 
 async def _context_fill(conversation_id: str | None) -> float | None:
     """This conversation's memory usage as a fraction of the compaction
-    ceiling, for the PWA's fullness bar. None when there is nothing stored
-    yet, so a brand-new chat shows no bar at all rather than an empty one.
+    ceiling, for the PWA's fullness bar.
+
+    Reports a real 0.0 for a conversation that exists but hasn't stored
+    anything yet — which is most new conversations, since insights are
+    flagged sparingly by design. An earlier version returned None there
+    and hid the bar, which meant the gauge was invisible in exactly the
+    common case it was asked for. "Nearly empty" is the honest reading of
+    a fresh chat and worth showing; it is also what makes the fill visibly
+    climb from nothing rather than appearing mid-way out of nowhere.
+
+    None means genuinely UNKNOWN — no conversation, or the read failed.
+    That distinction is the whole reason this isn't "0 on any problem":
+    zero is a claim that the conversation holds nothing, and making that
+    claim when the lookup broke would be a confident lie.
 
     Never raises: a gauge must not be able to fail a turn that already
-    succeeded. A broken reading is reported as absent, not as zero — zero
-    would be a confident claim that the conversation holds nothing.
+    succeeded.
     """
     if not conversation_id:
         return None
@@ -1000,8 +1011,6 @@ async def _context_fill(conversation_id: str | None) -> float | None:
         _block, tokens = await build_context_block(conversation_id)
     except Exception as e:  # noqa: BLE001 - see docstring
         print(f"[chat_send] context_fill unavailable: {e}")
-        return None
-    if not tokens:
         return None
     return round(tokens / CONTEXT_TRIGGER_TOKENS, 3)
 
