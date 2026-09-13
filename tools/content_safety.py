@@ -65,11 +65,52 @@ from providers.registry import get_provider
 PROMPT_GUARD_MODEL = "meta-llama/llama-prompt-guard-2-86m"
 PROMPT_GUARD_FALLBACK_MODEL = "meta-llama/llama-prompt-guard-2-22m"
 
-# Real limit per Meta's own model card (512-token context window) —
-# screening more than this per call wastes tokens on content the model
-# was never designed to weigh usefully anyway. Truncate, don't reject
-# outright just for being long.
-_MAX_SCREEN_CHARS = 2000
+# Prompt Guard 2 has a 512-TOKEN context window (Meta's own model card).
+#
+# This used to cap at 2,000 CHARACTERS, which is a character budget
+# defending a token limit — and the ratio between them is not a constant.
+# Measured against the live endpoint 2026-09-13, all at exactly 2,000
+# characters:
+#
+#   plain English ...... 445 tokens  -> 200 OK
+#   accented Spanish ... 492 tokens  -> 200 OK
+#   code ............... 529 tokens  -> 400 context_length_exceeded
+#   markdown + links ... 693 tokens  -> 400 context_length_exceeded
+#
+# Both 400s then failed the 22m fallback the same way, and screen_content
+# fails OPEN — so screening silently did nothing for exactly the content
+# most likely to be scraped and structured. Worse, tools/fetch.py started
+# returning Markdown with inline links that same day, which moved ordinary
+# fetched pages into the failing band.
+#
+# Budgeted in tokens now, with real headroom: cl100k_base is not Llama's
+# tokenizer, so the count here is an estimate of a different tokenizer's
+# answer and must not sit near the ceiling.
+_MAX_SCREEN_TOKENS = 380
+
+# Characters per token, used only when tiktoken is unavailable. 2.5 is
+# deliberately pessimistic — denser than any of the samples above —
+# because under-estimating here means a 400 and a silent fail-open.
+_FALLBACK_CHARS_PER_TOKEN = 2.5
+
+
+def _truncate_for_screening(text: str, max_tokens: int = _MAX_SCREEN_TOKENS) -> str:
+    """Cuts `text` to something Prompt Guard will actually accept.
+
+    Only the START of a long page is screened, which is a real limitation
+    and not a new one: an injection buried on page nine goes unscreened.
+    Chunking the whole document is the honest fix and is not built. What
+    IS fixed is the case where nothing was screened at all.
+    """
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        tokens = enc.encode(text)
+        if len(tokens) <= max_tokens:
+            return text
+        return enc.decode(tokens[:max_tokens])
+    except Exception:  # noqa: BLE001 - tiktoken missing or failing must not stop screening
+        return text[:int(max_tokens * _FALLBACK_CHARS_PER_TOKEN)]
 
 # Live-verified 2026-09-12 — see module docstring for the real scores
 # this sits between.
@@ -93,12 +134,30 @@ def _is_flagged(raw_output: str) -> bool:
 
 
 def _run_prompt_guard(model: str, text: str) -> str:
+    """One screening call, with a single shrink-and-retry.
+
+    The retry exists because the token budget above is an estimate made
+    with the wrong tokenizer. If it is ever slightly optimistic the result
+    is a 400 and, through screen_content's fail-open, no screening at all
+    — so it is worth one cheap halving before giving up rather than
+    letting a rounding error disable a safety check.
+    """
     provider = get_provider("groq")
-    response = provider.chat(
-        model=model,
-        messages=[ChatMessage(role="user", content=text[:_MAX_SCREEN_CHARS])],
-    )
-    return (response.text or "").strip()
+    budget = _MAX_SCREEN_TOKENS
+    for attempt in range(2):
+        try:
+            response = provider.chat(
+                model=model,
+                messages=[ChatMessage(role="user", content=_truncate_for_screening(text, budget))],
+            )
+            return (response.text or "").strip()
+        except Exception as e:  # noqa: BLE001 - re-raised below if the retry also fails
+            if attempt == 0 and "context_length" in str(e).lower():
+                budget //= 2
+                print(f"[content_safety] {model} rejected the length; retrying at {budget} tokens")
+                continue
+            raise
+    return ""
 
 
 def screen_content(text: str) -> tuple[bool, str | None]:
