@@ -490,7 +490,18 @@ def _line(task: str, run: dict) -> str:
     most useful for.
     """
     if run.get("error") or run.get("failed_calls"):
-        reason = run.get("error") or "provider call failed"
+        # Prefer the PROVIDER's own error over a generic label. Most
+        # failures here never reach the scenario as an exception -
+        # compact_conversation catches ProviderError and returns None - so
+        # run["error"] is empty and the only record of what actually went
+        # wrong is on the failed call itself. Printing "provider call
+        # failed" while holding the real reason is the same silent-failure
+        # habit this whole tool exists to break.
+        failed = next((c for c in run.get("calls_detail") or [] if not c.get("ok")), None)
+        reason = run.get("error") or (
+            f"{failed['provider']}/{failed['model']}: {failed['error']}" if failed
+            else "no provider answered"
+        )
         return f"Task: {task}; Rep: {run['rep']}; FAILED: {reason}"
     cached = run["cached"] if run.get("cached") is not None else "-"
     models = ", ".join(run.get("models") or []) or "-"
