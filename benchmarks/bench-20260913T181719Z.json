@@ -1,0 +1,84 @@
+{
+  "run_at": "20260913T181719Z",
+  "reps": 3,
+  "results": [
+    {
+      "scenario": "chat_idle",
+      "description": "One short question, idle tier — the most common turn there is",
+      "runs": [
+        {
+          "rep": 1,
+          "seconds": 0.3,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 1,
+          "prompt": 0,
+          "cached": null,
+          "completion": 0,
+          "total": 0,
+          "models": [
+            "cloudflare/@cf/openai/gpt-oss-20b"
+          ],
+          "calls_detail": [
+            {
+              "provider": "cloudflare",
+              "model": "@cf/openai/gpt-oss-20b",
+              "ok": false,
+              "error": "CLOUDFLARE_ACCOUNT_ID not set",
+              "seconds": 0.02
+            }
+          ]
+        },
+        {
+          "rep": 2,
+          "seconds": 0.07,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 1,
+          "prompt": 0,
+          "cached": null,
+          "completion": 0,
+          "total": 0,
+          "models": [
+            "cloudflare/@cf/openai/gpt-oss-20b"
+          ],
+          "calls_detail": [
+            {
+              "provider": "cloudflare",
+              "model": "@cf/openai/gpt-oss-20b",
+              "ok": false,
+              "error": "CLOUDFLARE_ACCOUNT_ID not set",
+              "seconds": 0.01
+            }
+          ]
+        },
+        {
+          "rep": 3,
+          "seconds": 0.07,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 1,
+          "prompt": 0,
+          "cached": null,
+          "completion": 0,
+          "total": 0,
+          "models": [
+            "cloudflare/@cf/openai/gpt-oss-20b"
+          ],
+          "calls_detail": [
+            {
+              "provider": "cloudflare",
+              "model": "@cf/openai/gpt-oss-20b",
+              "ok": false,
+              "error": "CLOUDFLARE_ACCOUNT_ID not set",
+              "seconds": 0.01
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "ok_runs": 0
+      }
+    }
+  ]
+}

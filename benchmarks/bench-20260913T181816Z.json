@@ -1,0 +1,93 @@
+{
+  "run_at": "20260913T181816Z",
+  "reps": 3,
+  "results": [
+    {
+      "scenario": "content_safety",
+      "description": "Screening one fetched page through Prompt Guard",
+      "runs": [
+        {
+          "rep": 1,
+          "seconds": 0.77,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 22,
+          "cached": null,
+          "completion": 0,
+          "total": 0,
+          "models": [
+            "groq/meta-llama/llama-prompt-guard-2-86m"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "meta-llama/llama-prompt-guard-2-86m",
+              "ok": true,
+              "seconds": 0.77,
+              "prompt": 22,
+              "cached": null,
+              "completion": 0,
+              "total": 0
+            }
+          ]
+        },
+        {
+          "rep": 2,
+          "seconds": 0.72,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 22,
+          "cached": null,
+          "completion": 0,
+          "total": 0,
+          "models": [
+            "groq/meta-llama/llama-prompt-guard-2-86m"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "meta-llama/llama-prompt-guard-2-86m",
+              "ok": true,
+              "seconds": 0.72,
+              "prompt": 22,
+              "cached": null,
+              "completion": 0,
+              "total": 0
+            }
+          ]
+        },
+        {
+          "rep": 3,
+          "seconds": 0.78,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 22,
+          "cached": null,
+          "completion": 0,
+          "total": 0,
+          "models": [
+            "groq/meta-llama/llama-prompt-guard-2-86m"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "meta-llama/llama-prompt-guard-2-86m",
+              "ok": true,
+              "seconds": 0.78,
+              "prompt": 22,
+              "cached": null,
+              "completion": 0,
+              "total": 0
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "ok_runs": 0
+      }
+    }
+  ]
+}

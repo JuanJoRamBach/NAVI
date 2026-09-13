@@ -1,0 +1,154 @@
+{
+  "run_at": "20260913T181752Z",
+  "reps": 3,
+  "results": [
+    {
+      "scenario": "content_safety",
+      "description": "Screening one fetched page through Prompt Guard",
+      "runs": [
+        {
+          "rep": 1,
+          "seconds": 0.81,
+          "error": null,
+          "calls": 0,
+          "failed_calls": 0,
+          "prompt": 0,
+          "cached": null,
+          "completion": 0,
+          "total": 0,
+          "models": [],
+          "calls_detail": []
+        },
+        {
+          "rep": 2,
+          "seconds": 0.77,
+          "error": null,
+          "calls": 0,
+          "failed_calls": 0,
+          "prompt": 0,
+          "cached": null,
+          "completion": 0,
+          "total": 0,
+          "models": [],
+          "calls_detail": []
+        },
+        {
+          "rep": 3,
+          "seconds": 0.75,
+          "error": null,
+          "calls": 0,
+          "failed_calls": 0,
+          "prompt": 0,
+          "cached": null,
+          "completion": 0,
+          "total": 0,
+          "models": [],
+          "calls_detail": []
+        }
+      ],
+      "summary": {
+        "ok_runs": 0
+      }
+    },
+    {
+      "scenario": "source_grounding",
+      "description": "One claim adjudicated by safeguard-20b against its passage",
+      "runs": [
+        {
+          "rep": 1,
+          "seconds": 0.83,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 554,
+          "cached": 512,
+          "completion": 96,
+          "total": 650,
+          "models": [
+            "groq/openai/gpt-oss-safeguard-20b"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "openai/gpt-oss-safeguard-20b",
+              "ok": true,
+              "seconds": 0.82,
+              "prompt": 554,
+              "cached": 512,
+              "completion": 96,
+              "total": 650
+            }
+          ]
+        },
+        {
+          "rep": 2,
+          "seconds": 0.96,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 554,
+          "cached": 512,
+          "completion": 110,
+          "total": 664,
+          "models": [
+            "groq/openai/gpt-oss-safeguard-20b"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "openai/gpt-oss-safeguard-20b",
+              "ok": true,
+              "seconds": 0.96,
+              "prompt": 554,
+              "cached": 512,
+              "completion": 110,
+              "total": 664
+            }
+          ]
+        },
+        {
+          "rep": 3,
+          "seconds": 0.85,
+          "error": null,
+          "calls": 1,
+          "failed_calls": 0,
+          "prompt": 554,
+          "cached": 512,
+          "completion": 108,
+          "total": 662,
+          "models": [
+            "groq/openai/gpt-oss-safeguard-20b"
+          ],
+          "calls_detail": [
+            {
+              "provider": "groq",
+              "model": "openai/gpt-oss-safeguard-20b",
+              "ok": true,
+              "seconds": 0.85,
+              "prompt": 554,
+              "cached": 512,
+              "completion": 108,
+              "total": 662
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "ok_runs": 3,
+        "tokens_min": 650,
+        "tokens_max": 664,
+        "tokens_mean": 658.7,
+        "tokens_stdev": 7.6,
+        "variance_ratio": 1.02,
+        "seconds_mean": 0.9,
+        "seconds_max": 0.96,
+        "prompt_mean": 554,
+        "completion_mean": 104.7,
+        "cached_mean": 512,
+        "models": [
+          "groq/openai/gpt-oss-safeguard-20b"
+        ]
+      }
+    }
+  ]
+}
