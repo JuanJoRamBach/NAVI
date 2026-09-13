@@ -266,12 +266,12 @@ DEFAULTS = {
         # Serious leads with Cloudflare because its Neurons budget absorbs
         # volume, keeping Gemini 3.8 Flash (1M ctx but only 20 RPD) as the
         # backup rather than the thing that runs out first.
-        # UNVERIFIED as of writing: nemotron's tool calling on Cloudflare
-        # (no CLOUDFLARE_ACCOUNT_ID available where this was written).
-        # Check with `python -m jobs.test_tool_calling cloudflare
-        # @cf/nvidia/nemotron-3-120b-a12b` — if it fails, swap primary and
-        # first fallback, since gemini-3.8-flash is in Google's own
-        # documented tool-supporting list.
+        # Nemotron's tool calling on Cloudflare is VERIFIED (2026-09-13,
+        # live: `python -m jobs.test_tool_calling cloudflare
+        # @cf/nvidia/nemotron-3-120b-a12b` — a real tool call with real
+        # arguments, 22.07 Neurons). This tier carries the tool-heavy work
+        # (research execution), so it was the one that actually had to be
+        # checked rather than assumed.
         "normal_chat_serious": {
             "provider": "cloudflare", "model": "@cf/nvidia/nemotron-3-120b-a12b",
             "fallback": [
