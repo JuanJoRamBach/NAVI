@@ -5,9 +5,9 @@ A small persistent JSON store for everything that used to live in env vars:
 provider API keys, which model is pinned to which role, and misc settings.
 
 Why this exists: on Render, changing an env var means a redeploy. That's the
-exact friction JuanJo wanted to avoid — "here's my Groq key" typed into chat
+exact friction JuanJo wanted to avoid â€” "here's my Groq key" typed into chat
 should just work, not require a dashboard trip. So this store lives on disk
-(fine, since Render's disk is scratch-only anyway — this file gets rewritten
+(fine, since Render's disk is scratch-only anyway â€” this file gets rewritten
 whenever a value changes, and if the service restarts, the config should be
 re-synced from Filen at startup, see restore_from_backup below).
 """
@@ -32,14 +32,14 @@ _fernet_cache = None
 
 def _get_fernet():
     """Lazily builds the Fernet cipher used to encrypt MCP connection
-    credentials (bearer tokens) at rest — these are third-party secrets
+    credentials (bearer tokens) at rest â€” these are third-party secrets
     (GitHub/Google/Slack/etc tokens) NAVI holds on the company's behalf,
     a different risk class than the plaintext-JSON pattern the rest of
     this store already uses for its own provider keys (that's a known,
-    separately-flagged gap — see IDEAS.md — not fixed here).
+    separately-flagged gap â€” see IDEAS.md â€” not fixed here).
 
     Prefers NAVI_MCP_SECRET_KEY (set once on Lightsail, never written to
-    disk or backed up to Filen) over a locally-generated key file — a key
+    disk or backed up to Filen) over a locally-generated key file â€” a key
     that lives on the same disk as the data it encrypts only protects
     against a narrower set of leaks (e.g. the Filen backup, since
     backup_to_filen() ships this file's plaintext bytes as-is), which is
@@ -55,7 +55,7 @@ def _get_fernet():
             _fernet_cache = Fernet(key_env.encode())
         except Exception:
             # Accept a human-typed passphrase, not just a properly-formed
-            # Fernet key — derive a valid 32-byte urlsafe-base64 key from it.
+            # Fernet key â€” derive a valid 32-byte urlsafe-base64 key from it.
             digest = hashlib.sha256(key_env.encode()).digest()
             _fernet_cache = Fernet(base64.urlsafe_b64encode(digest))
         return _fernet_cache
@@ -67,7 +67,7 @@ def _get_fernet():
     key = Fernet.generate_key()
     _MCP_KEY_PATH.write_bytes(key)
     print(
-        f"[config.store] WARNING: NAVI_MCP_SECRET_KEY not set — generated a local key file "
+        f"[config.store] WARNING: NAVI_MCP_SECRET_KEY not set â€” generated a local key file "
         f"at {_MCP_KEY_PATH}. Set the env var in production so the key isn't stored on the "
         f"same disk (and same Filen backup) as the data it protects."
     )
@@ -90,13 +90,13 @@ def _decrypt_secret(value: str | None) -> str | None:
         return _get_fernet().decrypt(value.encode()).decode()
     except InvalidToken:
         # Either the wrong/rotated key, or a value saved before this
-        # encryption existed — treat as legacy plaintext rather than
+        # encryption existed â€” treat as legacy plaintext rather than
         # silently breaking every connection saved before this change.
         return value
 
 # Fallback environment variable per provider, consulted by
 # get_provider_key when the config store has nothing (see its docstring).
-# The names match what's actually set in the server's .env — notably
+# The names match what's actually set in the server's .env â€” notably
 # Google's own credential name (GOOGLE_AI_API_KEY) differs from NAVI's
 # internal provider name ("gemini", since every model is gemini-*), and
 # this is the one place those two names are reconciled.
@@ -121,14 +121,14 @@ DEFAULTS = {
         # Google AI Studio (2026-09-13). Key comes from GOOGLE_AI_API_KEY
         # in .env via PROVIDER_KEY_ENV above, not stored in config.json.
         # NOT usable for client data unless the EEA/UK/CH paid-tier data
-        # policy applies to the account — see providers/gemini.py's own
+        # policy applies to the account â€” see providers/gemini.py's own
         # docstring on why that gate matters.
         "gemini": {"api_key": None, "enabled": True},
         # nvidia_nim stays disabled and unbuilt ON PURPOSE (re-confirmed
-        # 2026-09-13): NVIDIA's API Trial Terms of Service §1.2/§1.4
+        # 2026-09-13): NVIDIA's API Trial Terms of Service Â§1.2/Â§1.4
         # restrict the free hosted API to "internal testing and evaluation
-        # purposes, not in production", and §1.2 extends that to the
-        # Generated Content as well — so NAVI could not ship outputs
+        # purposes, not in production", and Â§1.2 extends that to the
+        # Generated Content as well â€” so NAVI could not ship outputs
         # produced with it either. Verified against NVIDIA's own legal PDF,
         # not a blog summary. Don't enable this without a paid NVIDIA AI
         # Enterprise subscription.
@@ -138,7 +138,7 @@ DEFAULTS = {
         # Two SEPARATE dispatcher roles, deliberately not sharing a quota bucket.
         #
         # dispatcher_chat: handles live, interactive messages (whatever you
-        # type). Pinned to the officially-supported model only — no fallback
+        # type). Pinned to the officially-supported model only â€” no fallback
         # to the deprecated one, since this is the role you'll actually
         # notice and feel if something's wrong.
         #
@@ -152,12 +152,12 @@ DEFAULTS = {
         # stronger instruction-following (it has to reliably refuse to
         # speculate, not just summarize).
         #
-        # Current free-tier numbers (2026-08-17, verify in Groq console —
+        # Current free-tier numbers (2026-08-17, verify in Groq console â€”
         # these move):
         #   openai/gpt-oss-20b:    30 RPM / 1,000 RPD / 200K TPD
         #   openai/gpt-oss-120b:   30 RPM / 1,000 RPD / 200K TPD
         #   llama-3.1-8b-instant:  30 RPM / 14,400 RPD / 500K TPD (deprecated)
-        # Tried DeepSeek-V4-Flash-0731 via LLM7 (2026-08-26) — benchmarks
+        # Tried DeepSeek-V4-Flash-0731 via LLM7 (2026-08-26) â€” benchmarks
         # clearly ahead of gpt-oss-20b/120b on paper (52 vs 24 Artificial
         # Analysis Intelligence Index, 1M context vs 130k), but real
         # traffic that same day hit rate-limit + 503 "model temporarily
@@ -165,24 +165,24 @@ DEFAULTS = {
         # reliable Groq, and a real upgrade over the original 20b) rather
         # than leave chat flaky on a *different* model.
         #
-        # 2026-08-28: hit a real "Groq rate limited" hard failure live —
+        # 2026-08-28: hit a real "Groq rate limited" hard failure live â€”
         # Groq's own status page showed no outage, so this was ordinary
         # free-tier rate-limiting (30 RPM / 1,000 RPD on gpt-oss-120b),
         # not a broken model choice. Added a same-model fallback to
         # LLM7's "gpt-oss" (same family, 131k context, tools+reasoning,
-        # 100% recent availability, free-tier covered) — this is
+        # 100% recent availability, free-tier covered) â€” this is
         # deliberately NOT the earlier "different model, might silently
         # degrade" risk, just a second door to the same room when Groq's
         # free tier is briefly saturated.
-        # Renamed from "dispatcher_chat" to "normal_chat" (2026-09-01) —
+        # Renamed from "dispatcher_chat" to "normal_chat" (2026-09-01) â€”
         # "dispatcher" in the name was confusing once NAVI had multiple
         # named chat modes (Normal/Research/Brainstorm/Plan); this role
         # specifically backs Normal Chat, which is what the name should
-        # say. dispatcher_autonomous keeps its name — it isn't a chat
+        # say. dispatcher_autonomous keeps its name â€” it isn't a chat
         # mode, it backs the two GitHub Actions jobs, "dispatcher" still
         # fits there.
         # Groq/OpenRouter deliberately excluded, primary or fallback
-        # (2026-09-01) — same reasoning dev_slate_chat below already
+        # (2026-09-01) â€” same reasoning dev_slate_chat below already
         # established: Groq's free tier caps at 8K tokens/minute, and
         # now that run_stored_mode_chat (dispatcher/chat.py) replays a
         # real 20-message window every turn instead of one bare message,
@@ -191,38 +191,38 @@ DEFAULTS = {
         # primary; Mistral's free tier is far more generous on tokens/
         # minute (~500K TPM) and mistral-small-latest is already a known
         # free-tier general-purpose model in this repo (see
-        # jobs/model_ranking.py's free-tier prefix list) — not
+        # jobs/model_ranking.py's free-tier prefix list) â€” not
         # code-specific like Codestral, which is why dev_slate_chat's own
         # fallback isn't reused here as-is.
         # Fallback chain widened 2026-09-04 (JuanJo): Cloudflare added as a
-        # second door before Mistral — llama-3.1-8b-instruct-fp8-fast has
+        # second door before Mistral â€” llama-3.1-8b-instruct-fp8-fast has
         # real native tool-calling support and is cheap (4,119/34,868
-        # neurons per M in/out — a typical exchange costs ~50 neurons, well
+        # neurons per M in/out â€” a typical exchange costs ~50 neurons, well
         # inside the shared 10,000/day budget alongside dev_slate_chat's
-        # coding role). No prior reason ruled Cloudflare out here — it
+        # coding role). No prior reason ruled Cloudflare out here â€” it
         # just hadn't been considered when this role was first wired.
         # Fallback swapped from @cf/meta/llama-3.1-8b-instruct-fp8-fast to
-        # @cf/openai/gpt-oss-120b (2026-09-06) — a real repetition-loop
+        # @cf/openai/gpt-oss-120b (2026-09-06) â€” a real repetition-loop
         # bug hit live (a reply repeated the same paragraph 4 times), and
         # a small 8B model is exactly the class more prone to that. Groq's
         # gpt-oss-120b was ruled out for this role already (8K TPM cap vs
-        # a real 20-message replay window) — but Cloudflare's own hosted
+        # a real 20-message replay window) â€” but Cloudflare's own hosted
         # gpt-oss-120b (verified live on Cloudflare's own model catalog,
         # 2026-08 GA) sidesteps that entirely: it's Cloudflare's Neuron-
         # based free tier, not Groq's per-minute-token one, so this is a
         # real quality upgrade with no new quota risk, not a tradeoff.
         # Real, live-confirmed break (2026-09-12): LLM7 retired "gpt-oss"
-        # from its catalog entirely — GET /v1/models (keyless, checked
+        # from its catalog entirely â€” GET /v1/models (keyless, checked
         # directly) no longer lists it at all. This role's primary WAS
         # llm7/gpt-oss; every normal_chat request was failing outright on
         # primary. Promoted to Cloudflare's own gpt-oss-120b (already
-        # trusted here — verified live on Cloudflare's catalog, 2026-08
+        # trusted here â€” verified live on Cloudflare's catalog, 2026-08
         # GA, was already this role's first fallback) rather than pick a
         # new, unverified LLM7 model under incident pressure.
         # ---- Normal Chat's three capability tiers (2026-09-13) ----
         #
-        # Replaces a single normal_chat role that sent EVERY message —
-        # "what's the weather" included — to a 120B model, which was
+        # Replaces a single normal_chat role that sent EVERY message â€”
+        # "what's the weather" included â€” to a 120B model, which was
         # flagged in IDEAS.md as "a mistake, we MUST fix" and directly
         # contradicted NAVI's own "smallest model that clears the bar"
         # pitch. Every turn now starts on `normal_chat` (idle) and
@@ -236,13 +236,13 @@ DEFAULTS = {
         #
         # FALLBACK RULE, JuanJo 2026-09-13: every hop changes PROVIDER.
         # A chain exists to survive provider-level failure (quota
-        # exhaustion, outage) — Cloudflare -> Cloudflare would waste the
+        # exhaustion, outage) â€” Cloudflare -> Cloudflare would waste the
         # first hop on the most likely failure mode. Quality is also held
         # level or upward at each hop, never degraded.
         #
         # Model picks are verified, not assumed. Both Gemini primaries had
         # tool calling confirmed with real calls (jobs/test_gemini.py,
-        # 2026-09-13) — that mattered because the idle tier has the
+        # 2026-09-13) â€” that mattered because the idle tier has the
         # HEAVIEST tool dependency (flag_key_insight,
         # propose_research_mode, request_stronger_model) and a model that
         # silently doesn't call tools fails invisibly. RPD is metered
@@ -268,7 +268,7 @@ DEFAULTS = {
         # backup rather than the thing that runs out first.
         # Nemotron's tool calling on Cloudflare is VERIFIED (2026-09-13,
         # live: `python -m jobs.test_tool_calling cloudflare
-        # @cf/nvidia/nemotron-3-120b-a12b` — a real tool call with real
+        # @cf/nvidia/nemotron-3-120b-a12b` â€” a real tool call with real
         # arguments, 22.07 Neurons). This tier carries the tool-heavy work
         # (research execution), so it was the one that actually had to be
         # checked rather than assumed.
@@ -281,16 +281,16 @@ DEFAULTS = {
         },
         "dispatcher_autonomous": {"provider": "groq", "model": "openai/gpt-oss-120b"},
         # dev_slate_chat: backs Dev Slate's own chat (dispatcher/devslate_chat.py).
-        # Cloudflare's qwen2.5-coder stays primary — a real coding model,
+        # Cloudflare's qwen2.5-coder stays primary â€” a real coding model,
         # still the right pick. Fallback changed 2026-09-11 (JuanJo:
         # Dev Slate's real scope narrowed to "HTML/CSS/JS (or React/
-        # Tailwind)" — see DEV_SLATE_CHAT.md's own Goals section — so a
+        # Tailwind)" â€” see DEV_SLATE_CHAT.md's own Goals section â€” so a
         # heavyweight multi-language coding specialist like Codestral is
         # overkill, and burning Mistral's scarce ~1B-tokens/MONTH free
         # tier on a job that no longer needs specialization is a bad
         # trade (same "monthly-reset is precious, reserve it for the
         # undisputed-best case" principle just applied to source_fetch
-        # below). LLM7's gpt-oss instead — already normal_chat's PRIMARY,
+        # below). LLM7's gpt-oss instead â€” already normal_chat's PRIMARY,
         # so already proven live to handle the same "replays real
         # conversation history every turn" shape Dev Slate has; resets
         # DAILY not monthly; and a genuinely separate quota pool from
@@ -300,7 +300,7 @@ DEFAULTS = {
         # excluded, primary or fallback: its 8K-tokens/minute cap is
         # realistically exceeded by Dev Slate's baseline turn (mode brief
         # + task-state block + real conversation history) before any
-        # file content even enters the picture — unchanged reasoning from
+        # file content even enters the picture â€” unchanged reasoning from
         # before this fallback swap, still applies regardless of which
         # model ends up in the fallback slot.
         "dev_slate_chat": {
@@ -308,13 +308,13 @@ DEFAULTS = {
             "fallback": [{"provider": "llm7", "model": "gpt-oss"}],
         },
         # context_synthesis (2026-09-13): every whole-conversation
-        # synthesis job — context.md compaction (dispatcher/compaction.py's
+        # synthesis job â€” context.md compaction (dispatcher/compaction.py's
         # compact_context) and Research mode's plan drafting. Deliberately
         # its OWN role rather than reusing normal_chat's, for two real
         # reasons:
         #
         # 1. Quota shape. Ollama Cloud's free tier is GPU-time/session-
-        #    metered (5h sessions, weekly windows — see providers/
+        #    metered (5h sessions, weekly windows â€” see providers/
         #    ollama_cloud.py's own docstring), NOT token-metered like
         #    Groq/Cloudflare/Mistral. Compaction is infrequent and bursty,
         #    which fits a session budget well, and routing it here means it
@@ -325,7 +325,7 @@ DEFAULTS = {
         #    keeping), not cheap extraction. Real benchmark check
         #    (Artificial Analysis, 2026-09-13): Nemotron 3 Super scores
         #    91.75 on RULER long-context retrieval at 1M tokens vs
-        #    gpt-oss-120b's 22.30 — a very large gap on precisely the skill
+        #    gpt-oss-120b's 22.30 â€” a very large gap on precisely the skill
         #    this job needs. Super is also only 12B ACTIVE params (of 120B,
         #    MoE), so it's cheaper per token than a denser 120b despite
         #    matching or beating it on quality. Nemotron 3 Ultra was
@@ -333,7 +333,7 @@ DEFAULTS = {
         #    compute for a job Super already appears to dominate.
         #
         # Fallback is mistral-small-latest specifically for its 256K
-        # context — when Ollama's session window is exhausted this job
+        # context â€” when Ollama's session window is exhausted this job
         # still has to read a whole conversation, so context length matters
         # more here than raw capability. Flagged as an open choice in
         # how_to_handle_context.md; revisit if it proves too weak.
@@ -367,7 +367,7 @@ DEFAULTS = {
         # agent_work: backs each node of an Agent Work workflow run
         # (dispatcher/agent_work.py) AND Agent Work's own chat
         # (run_stored_mode_chat). Moved BACK onto Groq's gpt-oss-120b as
-        # primary (2026-09-04, JuanJo) — the reasoning that excluded Groq
+        # primary (2026-09-04, JuanJo) â€” the reasoning that excluded Groq
         # here on 2026-09-01 (a real 20-message history replay blowing
         # past Groq's 8K tokens/minute cap) no longer applies: agent_work
         # went deliberately stateless on 2026-09-03 (see dispatcher/
@@ -376,7 +376,7 @@ DEFAULTS = {
         # prompt per node/turn. gpt-oss-120b over 20b since agent_work's
         # job (planning workflow steps, deciding branches) benefits from
         # the bigger model, and both share the same 30 RPM/1,000 RPD/
-        # 200K TPD free-tier ceiling — no quota cost to picking the
+        # 200K TPD free-tier ceiling â€” no quota cost to picking the
         # stronger one. Fallback: same Cloudflare model as normal_chat's
         # fallback (see that role's comment), then Mistral's Ministral as
         # a second door.
@@ -395,10 +395,10 @@ DEFAULTS = {
         # chain. When one fails, the executor rotates through the fallback
         # list and flags the step as degraded in the final reply.
         "graph-data": {
-            # Verified against OpenRouter's live /api/v1/models on 2026-08-17 —
+            # Verified against OpenRouter's live /api/v1/models on 2026-08-17 â€”
             # free pricing AND supports the "tools" param (required for the
             # forced render_chart call). The two originally hardcoded here
-            # went stale within the same day they were written — exactly
+            # went stale within the same day they were written â€” exactly
             # the churn problem the daily-ranking job is meant to solve.
             "primary": {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
             "fallback": [{"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}],
@@ -408,12 +408,12 @@ DEFAULTS = {
             # dispatcher_chat: a plain digest call is frequent and cheap
             # enough that it shouldn't compete with dispatcher_chat's
             # (no-fallback, felt-immediately) quota. gpt-oss-20b rather
-            # than 120b — summarization doesn't need the bigger model.
+            # than 120b â€” summarization doesn't need the bigger model.
             "primary": {"provider": "groq", "model": "openai/gpt-oss-20b"},
             "fallback": [],
         },
         "recap": {
-            # Same reasoning as /summarize's routing — own quota, small
+            # Same reasoning as /summarize's routing â€” own quota, small
             # model, single-phase call.
             "primary": {"provider": "groq", "model": "openai/gpt-oss-20b"},
             "fallback": [],
@@ -424,18 +424,18 @@ DEFAULTS = {
         },
         "remind": {
             # Needs a forced tool_choice call (same requirement as
-            # graph-data's render_chart) — reusing the same openrouter
+            # graph-data's render_chart) â€” reusing the same openrouter
             # models already verified to support that.
             "primary": {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
             "fallback": [{"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}],
         },
-        # source_fetch: the Sources tab's "Batch Dispatch" — searches each
+        # source_fetch: the Sources tab's "Batch Dispatch" â€” searches each
         # term against the user's Trusted Sites registry (enforced in
         # tools/registry.py's dispatch(), not left to the model), fetches
         # relevant hits, saves one document per real find.
         #
         # Chain revised 2026-09-06 after a real batch burned 6 OpenRouter
-        # requests finding zero documents (JuanJo caught it live) — a
+        # requests finding zero documents (JuanJo caught it live) â€” a
         # multi-term batch with several tool-loop round-trips per term
         # eats OpenRouter's scarce daily request cap fast, so it's out of
         # this role entirely (JuanJo: "openrouter shouldn't be used in
@@ -444,7 +444,7 @@ DEFAULTS = {
         # backing normal_chat/agent_work's fallback) is primary.
         # Fallback order corrected 2026-09-11 (JuanJo: "monthly usage
         # reset LLMs should be last fallback, unless they are the
-        # undisputed best for a specific work") — the 2026-09-06 chain put
+        # undisputed best for a specific work") â€” the 2026-09-06 chain put
         # Mistral (ministral-8b-latest, ~1B tokens/MONTH, see
         # providers/mistral.py) ahead of Groq (8K tokens/MINUTE, resets
         # constantly) with no quality reason, just "same size class as
@@ -452,10 +452,10 @@ DEFAULTS = {
         # only recovers once a month is a far more precious resource than
         # one that recovers within the hour, so it belongs LAST unless a
         # model is genuinely the best fit for the job (dev_slate_chat's
-        # Codestral fallback below is that exception — a real
+        # Codestral fallback below is that exception â€” a real
         # coding-specialized model, not "similarly sized"). Groq now
         # second, Mistral last. Groq's own per-minute-cap concern (why it
-        # wasn't primary/second in the first place — this role's tool
+        # wasn't primary/second in the first place â€” this role's tool
         # loop can pull in full fetched-page content across several
         # round-trips) still applies to SUSTAINED use, but a second-
         # fallback door is inherently occasional, not sustained.
@@ -466,7 +466,7 @@ DEFAULTS = {
                 {"provider": "mistral", "model": "ministral-8b-latest"},
             ],
         },
-        # No "brainstorm" entry — retired as a standalone command (2026-08-27):
+        # No "brainstorm" entry â€” retired as a standalone command (2026-08-27):
         # Brainstorm mode's own conversational chat (dispatcher/modes/
         # BRAINSTORM.md) does its job better, since the command was a
         # one-shot fire with no continuity while the mode explicitly
@@ -475,31 +475,31 @@ DEFAULTS = {
     "storage": {
         "filen_configured": False,
     },
-    # MCP connections — server_name -> connection config + per-tool
+    # MCP connections â€” server_name -> connection config + per-tool
     # security baseline. Separate from "providers" above on purpose:
     # provider keys authenticate NAVI's own LLM calls, mcp_connections
     # authenticate NAVI's dispatcher to a real third-party system on the
     # company's behalf (see dispatcher/mcp_client.py's own docstring for
-    # the full security model — rug-pull hash pinning, read/write
+    # the full security model â€” rug-pull hash pinning, read/write
     # classification, tool poisoning defense).
     #
     # server_name -> {
     #   "transport": "stdio" | "http",
     #   "command": str | None, "args": list[str] | None,  # stdio only
     #   "url": str | None,                                 # http only
-    #   "auth_header": str | None,   # e.g. "Bearer <token>" — encrypted at
+    #   "auth_header": str | None,   # e.g. "Bearer <token>" â€” encrypted at
     #                                 # rest (see _encrypt_secret above),
     #                                 # decrypted only by get_mcp_connection
     #   "connected": bool,
     #   "tools": {
     #     tool_name: {
     #       "hash": str,             # sha256 of name+description+inputSchema at approval time
-    #       "description": str,      # sanitized, pinned at approval time — schema-building
+    #       "description": str,      # sanitized, pinned at approval time â€” schema-building
     #       "input_schema": dict,    # reads this instead of re-fetching live every call
     #       "read_only": bool,       # NAVI's own effective classification, seeded from
     #                                 # the server's readOnlyHint but not blindly trusted after
     #       "destructive": bool,     # seeded from destructiveHint (MCP spec default: True
-    #                                 # for anything not read-only) — the ONE tier that still
+    #                                 # for anything not read-only) â€” the ONE tier that still
     #                                 # needs per-call confirmation; read-only and plain-write
     #                                 # tools run autonomously once approved here
     #       "approved_at": float,    # epoch seconds
@@ -507,13 +507,13 @@ DEFAULTS = {
     #   }
     # }
     "mcp_connections": {},
-    # Standard 5-field Unix cron syntax — dispatcher/scheduler.py parses
+    # Standard 5-field Unix cron syntax â€” dispatcher/scheduler.py parses
     # this (via croniter) to fire check_due_workflows() in-process, no
     # external ping/crontab entry needed (2026-09-01, JuanJo's call:
     # "a python function that saves the cron... and it's fire per the
     # syntax" instead of an OS-level cron job on the Lightsail box).
     # Real setting, not hardcoded, same reasoning as everything else in
-    # this store — changeable without a redeploy.
+    # this store â€” changeable without a redeploy.
     "agent_work_due_check_cron": "*/5 * * * *",
 }
 
@@ -527,7 +527,7 @@ class ConfigStore:
     def _load(self) -> dict:
         if not self.path.exists():
             # Local file is gone (fresh clone, or a Render restart on the
-            # free tier's scratch-only disk) — try Filen before giving up
+            # free tier's scratch-only disk) â€” try Filen before giving up
             # to DEFAULTS, so a restart doesn't silently forget every key
             # and routing choice that was configured via chat.
             restore_from_backup(self.path)
@@ -546,7 +546,7 @@ class ConfigStore:
             backup_to_filen(self.path)
             self.last_backup_error = None
         except BackupError as e:
-            # Local write already succeeded — don't raise into callers that
+            # Local write already succeeded â€” don't raise into callers that
             # just wanted to save a key. Stash the error so a chat reply
             # can disclose "saved, but Filen backup failed" if it wants to.
             self.last_backup_error = str(e)
@@ -615,17 +615,17 @@ class ConfigStore:
     # ---- Rate-limit cooldowns (2026-09-06) ----
     #
     # Every provider already raises ProviderError(is_rate_limit=True) on a
-    # 429 (providers/*.py) — but until now nothing acted on that signal
+    # 429 (providers/*.py) â€” but until now nothing acted on that signal
     # differently from any other failure: every caller's fallback loop
     # just rotated to the next static entry in its own chain for that one
     # call, and the next call started right back at the same primary,
     # hitting the same wall again. JuanJo: "if it's an error about HARD
-    # LIMITS on an LLM, it changes the routing" — this is that mechanism.
+    # LIMITS on an LLM, it changes the routing" â€” this is that mechanism.
     #
     # Cooldown length revised same day it shipped: originally a same-UTC-
     # day cooldown, reasoned from this file's own 2026-08-28 Groq incident
     # (a real RPD/TPD exhaustion). That reasoning didn't hold for every
-    # provider — LLM7 returned a 429 that JuanJo confirmed wasn't real
+    # provider â€” LLM7 returned a 429 that JuanJo confirmed wasn't real
     # usage exhaustion, and a full-day cooldown on a SPURIOUS 429 silently
     # sidelines a role's primary for hours over one bad response. A short,
     # fixed cooldown is the safer default absent a real per-provider
@@ -642,7 +642,7 @@ class ConfigStore:
     def get_attempts(self, candidates: list[dict]) -> list[dict]:
         """Reorders a primary+fallback attempt list (each {"provider",
         "model", ...}) so any entry currently cooling down from a prior
-        mark_rate_limited() call sorts AFTER everything that isn't —
+        mark_rate_limited() call sorts AFTER everything that isn't â€”
         demoted, not dropped, so a chain where every entry happens to be
         cooling down still gets tried in its original order rather than
         failing outright. Callers build the flat attempts list exactly as
@@ -668,11 +668,11 @@ class ConfigStore:
         url: str | None = None, auth_header: str | None = None,
     ):
         """Registers or updates a connection's transport config. Does NOT
-        mark it connected or touch its tool baseline — that happens once
+        mark it connected or touch its tool baseline â€” that happens once
         dispatcher/mcp_client.py actually completes a handshake and lists
         tools, via set_mcp_tool_baseline below. `env` is extra environment
         variables for a stdio server beyond what mcp_client.py already
-        forces (PYTHONUNBUFFERED) — most connections won't need this."""
+        forces (PYTHONUNBUFFERED) â€” most connections won't need this."""
         existing = self._data.setdefault("mcp_connections", {}).get(name, {})
         self._data["mcp_connections"][name] = {
             **existing,
@@ -686,10 +686,10 @@ class ConfigStore:
 
     def get_mcp_connection(self, name: str) -> dict | None:
         """Decrypts auth_header for actual use (dispatcher/mcp_client.py's
-        live handshake) — list_mcp_connections below stays encrypted since
+        live handshake) â€” list_mcp_connections below stays encrypted since
         nothing reads auth_header off it (the REST list route never echoes
         it to the client either way). oauth_refresh_token/oauth_client_secret
-        decrypt the same way, for the same reason — dispatcher/mcp_oauth.py's
+        decrypt the same way, for the same reason â€” dispatcher/mcp_oauth.py's
         ensure_fresh_access_token is the one real reader of either."""
         conn = self._data.get("mcp_connections", {}).get(name)
         if conn is None:
@@ -711,7 +711,7 @@ class ConfigStore:
         token all the time is a huge pain point that we must not make the
         users go through"). Called both right after the initial OAuth
         exchange (server.py's /mcp/oauth/callback) and after every
-        successful refresh — refresh_token is passed through unchanged on
+        successful refresh â€” refresh_token is passed through unchanged on
         a refresh call since Google doesn't issue a new one each time.
         Merges into whatever set_mcp_connection already stored (url,
         transport, etc.), same **existing pattern that method uses."""
@@ -745,14 +745,14 @@ class ConfigStore:
         self, server: str, tool_name: str, tool_hash: str, description: str, input_schema: dict,
         read_only: bool, destructive: bool,
     ):
-        """Pins a tool's approved definition — the rug-pull defense. Called
+        """Pins a tool's approved definition â€” the rug-pull defense. Called
         once per tool, right after its description has been sanitized and
         hashed at connect/re-approval time (never from inside a live call).
         Stores description/input_schema alongside the hash so schema-
         building (tools/mcp_registry.py) reads the pinned snapshot instead
         of a live server round-trip on every request. `destructive` is the
         one tier that still needs a per-call confirmation gate (see
-        tools/mcp_registry.py's dispatch()) — read-only and plain-write
+        tools/mcp_registry.py's dispatch()) â€” read-only and plain-write
         tools run autonomously the moment they're approved here."""
         import time
         conn = self._data.setdefault("mcp_connections", {}).setdefault(server, {"tools": {}})
@@ -778,7 +778,7 @@ class ConfigStore:
         return json.loads(json.dumps(self._data))
 
 
-# Module-level singleton — the rest of the app imports this directly.
+# Module-level singleton â€” the rest of the app imports this directly.
 config = ConfigStore()
 
 
@@ -786,7 +786,7 @@ def _migrate_dispatcher_chat_to_llm7():
     """
     One-time switch (2026-08-26) for instances that already had
     dispatcher_chat persisted (via Filen backup) before DEFAULTS changed
-    above — editing DEFAULTS alone only affects a brand new store, not
+    above â€” editing DEFAULTS alone only affects a brand new store, not
     one already materialized on disk. Guarded so it only runs once; if
     dispatcher_chat gets manually reassigned later, this won't fight it.
     """
@@ -801,7 +801,7 @@ _migrate_dispatcher_chat_to_llm7()
 
 def _migrate_dispatcher_chat_off_llm7():
     """
-    One-time revert (same day, 2026-08-26) — the LLM7 switch above hit
+    One-time revert (same day, 2026-08-26) â€” the LLM7 switch above hit
     rate-limit + repeated 503 "model temporarily busy" under real traffic
     within hours of shipping. dispatcher_chat has no fallback on purpose,
     so this needs to be felt and fixed immediately, not left flaky. Own
@@ -822,11 +822,11 @@ def _migrate_dispatcher_chat_add_fallback():
     """
     One-time addition (2026-08-29) for instances whose dispatcher_chat
     role was already persisted (via Filen backup) before the "fallback"
-    key existed on this role at all — editing DEFAULTS alone only affects
+    key existed on this role at all â€” editing DEFAULTS alone only affects
     a brand-new store. Adds LLM7's "gpt-oss" as a same-model-family
     fallback after a real "Groq rate limited" hard failure in production
     (ordinary free-tier rate-limiting per Groq's own status page, not an
-    outage — see the dispatcher_chat comment above). Guarded so a manual
+    outage â€” see the dispatcher_chat comment above). Guarded so a manual
     reassignment later isn't fought by this.
     """
     if config.get("migrated_dispatcher_chat_add_fallback"):
@@ -846,12 +846,12 @@ _migrate_dispatcher_chat_add_fallback()
 def _migrate_dispatcher_chat_to_normal_chat():
     """
     One-time rename (2026-09-01) for instances that already had
-    dispatcher_chat persisted under its old name — editing DEFAULTS alone
+    dispatcher_chat persisted under its old name â€” editing DEFAULTS alone
     only affects a brand-new store. Copies the fully-formed role
-    (including whatever provider/model/fallback it currently has — this
+    (including whatever provider/model/fallback it currently has â€” this
     runs after the three migrations above, so it picks up the real
     current state, not a stale default) to "normal_chat" and leaves the
-    old "dispatcher_chat" key in place rather than deleting it — harmless
+    old "dispatcher_chat" key in place rather than deleting it â€” harmless
     dead data, and safer than risking a delete bug on a live server's
     only copy of this config. Guarded so a manual reassignment to
     "normal_chat" later isn't fought by this.
@@ -873,7 +873,7 @@ _migrate_dispatcher_chat_to_normal_chat()
 def _migrate_add_summarize_routing():
     """
     One-time addition (2026-08-26) for instances whose config.json already
-    existed before /summarize's task_routing entry was added to DEFAULTS —
+    existed before /summarize's task_routing entry was added to DEFAULTS â€”
     editing DEFAULTS alone only materializes for a brand-new store.
     """
     if config.get("migrated_add_summarize_routing"):
@@ -889,7 +889,7 @@ _migrate_add_summarize_routing()
 
 
 def _migrate_add_recap_note_routing():
-    """One-time addition (2026-08-26) — same reasoning as
+    """One-time addition (2026-08-26) â€” same reasoning as
     _migrate_add_summarize_routing, for /recap and /note."""
     if config.get("migrated_add_recap_note_routing"):
         return
@@ -904,7 +904,7 @@ _migrate_add_recap_note_routing()
 
 
 def _migrate_add_remind_routing():
-    """One-time addition (2026-08-26) — same reasoning as
+    """One-time addition (2026-08-26) â€” same reasoning as
     _migrate_add_summarize_routing, for /remind."""
     if config.get("migrated_add_remind_routing"):
         return
@@ -921,7 +921,7 @@ _migrate_add_remind_routing()
 
 
 def _migrate_add_tailor_routing():
-    """One-time addition (2026-08-26) — same reasoning as
+    """One-time addition (2026-08-26) â€” same reasoning as
     _migrate_add_summarize_routing, for /tailor."""
     if config.get("migrated_add_tailor_routing"):
         return
@@ -934,7 +934,7 @@ _migrate_add_tailor_routing()
 
 
 def _migrate_add_design_read_routing():
-    """One-time addition (2026-08-26) — same reasoning as
+    """One-time addition (2026-08-26) â€” same reasoning as
     _migrate_add_summarize_routing, for /design-read."""
     if config.get("migrated_add_design_read_routing"):
         return
@@ -948,7 +948,7 @@ _migrate_add_design_read_routing()
 
 def _migrate_add_dev_slate_chat_role():
     """One-time addition (2026-09-01) for instances whose config.json
-    already existed before dev_slate_chat was added to DEFAULTS — editing
+    already existed before dev_slate_chat was added to DEFAULTS â€” editing
     DEFAULTS alone only materializes for a brand-new store, same reasoning
     as every migration above."""
     if config.get("migrated_add_dev_slate_chat_role"):
@@ -966,7 +966,7 @@ _migrate_add_dev_slate_chat_role()
 
 def _migrate_add_agent_work_role():
     """One-time addition (2026-09-01) for instances whose config.json
-    already existed before agent_work was added to DEFAULTS — same
+    already existed before agent_work was added to DEFAULTS â€” same
     reasoning as _migrate_add_dev_slate_chat_role above."""
     if config.get("migrated_add_agent_work_role"):
         return
@@ -985,7 +985,7 @@ def _migrate_chat_roles_off_groq():
     """One-time correction (2026-09-01): normal_chat and agent_work both
     switched primary+fallback away from Groq/OpenRouter in DEFAULTS
     above, but a role that already exists in a saved config.json isn't
-    touched by a DEFAULTS change — same reasoning as every other
+    touched by a DEFAULTS change â€” same reasoning as every other
     migration here. Unlike those, this one force-overwrites an existing
     value rather than only filling in a missing one, since the whole
     point is correcting roles that already exist. Guarded by the usual
@@ -1003,12 +1003,12 @@ _migrate_chat_roles_off_groq()
 
 def _migrate_remove_retired_commands():
     """One-time cleanup (2026-09-04): /code, /tailor, /create-image, and
-    /design-read are retired — /code is redundant with dev_slate_chat
+    /design-read are retired â€” /code is redundant with dev_slate_chat
     (same model, real conversational chat instead of a one-shot command);
     the other three were JuanJo's call for a commercial-harness MVP
-    ("this will be a commercial harness... no placeholders for a MVP" —
+    ("this will be a commercial harness... no placeholders for a MVP" â€”
     design-read was already shipped disabled in the PWA). Editing
-    DEFAULTS alone only affects a brand-new store — an existing
+    DEFAULTS alone only affects a brand-new store â€” an existing
     config.json (this server included, live on Lightsail) keeps whatever
     it already had until this runs once. Guarded so a manual re-add later
     isn't fought by this."""
@@ -1023,7 +1023,7 @@ _migrate_remove_retired_commands()
 
 
 def _migrate_remove_research_command():
-    """One-time cleanup (2026-09-11): the /research command is retired —
+    """One-time cleanup (2026-09-11): the /research command is retired â€”
     JuanJo's call, redundant with Research chat mode and repeatedly
     conflated with it in discussion. Same pattern as
     _migrate_remove_retired_commands above."""
@@ -1038,7 +1038,7 @@ _migrate_remove_research_command()
 
 def _migrate_add_source_fetch_routing():
     """One-time addition (2026-09-06) for instances whose config.json
-    already existed before source_fetch was added to DEFAULTS — same
+    already existed before source_fetch was added to DEFAULTS â€” same
     reasoning as every other _migrate_add_* function above. Backs the
     Sources tab's Batch Dispatch (dispatcher/source_fetch.py)."""
     if config.get("migrated_add_source_fetch_routing"):
@@ -1061,13 +1061,13 @@ _migrate_add_source_fetch_routing()
 
 def _migrate_widen_chat_fallbacks_2026_09_04():
     """One-time correction (2026-09-04) for an already-materialized
-    config.json (this server's live one included) — DEFAULTS above now
+    config.json (this server's live one included) â€” DEFAULTS above now
     has normal_chat/agent_work on their new fallback chains, but that
     only affects a brand-new store. Force-overwrites both roles (not a
     fill-in-if-missing migration) since the whole point is correcting
     values that already exist, same pattern as
     _migrate_chat_roles_off_groq. agent_work also moves its primary back
-    to Groq's gpt-oss-120b — see that role's DEFAULTS comment for why
+    to Groq's gpt-oss-120b â€” see that role's DEFAULTS comment for why
     that's safe now (agent_work went stateless 2026-09-03)."""
     if config.get("migrated_widen_chat_fallbacks_2026_09_04"):
         return
@@ -1093,13 +1093,13 @@ _migrate_widen_chat_fallbacks_2026_09_04()
 
 def _migrate_source_fetch_off_openrouter_2026_09_06():
     """One-time correction for an already-materialized config.json (this
-    server's live one included) — a real batch burned 6 OpenRouter
+    server's live one included) â€” a real batch burned 6 OpenRouter
     requests to save zero documents (JuanJo caught it live testing
     Sources), and OpenRouter's daily request cap is scarce enough that
     using it as source_fetch's primary isn't sustainable for a role that
     can run several tool-loop round-trips per search term. Force-
     overwrites the existing routing (not a fill-in-if-missing migration),
-    same pattern as _migrate_widen_chat_fallbacks_2026_09_04 — see
+    same pattern as _migrate_widen_chat_fallbacks_2026_09_04 â€” see
     source_fetch's DEFAULTS comment above for the full reasoning on why
     Cloudflare/Mistral are primary/second and Groq is last-resort only."""
     if config.get("migrated_source_fetch_off_openrouter_2026_09_06"):
@@ -1120,7 +1120,7 @@ _migrate_source_fetch_off_openrouter_2026_09_06()
 
 def _migrate_normal_chat_fallback_off_small_model_2026_09_06():
     """One-time correction for an already-materialized config.json (this
-    server's live one included) — a real normal_chat reply repeated the
+    server's live one included) â€” a real normal_chat reply repeated the
     same paragraph 4 times (JuanJo, live), traced to the fallback firing
     on Cloudflare's small llama-3.1-8b-instruct-fp8-fast, exactly the
     class of model more prone to repetition-looping. See normal_chat's
@@ -1144,7 +1144,7 @@ _migrate_normal_chat_fallback_off_small_model_2026_09_06()
 
 def _migrate_source_fetch_reset_cadence_order_2026_09_11():
     """One-time correction for an already-materialized config.json (this
-    server's live one included) — see source_fetch's DEFAULTS comment
+    server's live one included) â€” see source_fetch's DEFAULTS comment
     above for the full reasoning: the 2026-09-06 migration put Mistral
     (monthly-reset) ahead of Groq (per-minute-reset) in this role's
     fallback with no quality justification, just size-class similarity.
@@ -1168,7 +1168,7 @@ _migrate_source_fetch_reset_cadence_order_2026_09_11()
 
 def _migrate_dev_slate_chat_off_codestral_2026_09_11():
     """One-time correction for an already-materialized config.json (this
-    server's live one included) — see dev_slate_chat's DEFAULTS comment
+    server's live one included) â€” see dev_slate_chat's DEFAULTS comment
     above for the full reasoning: Dev Slate's real scope narrowed to
     HTML/CSS/JS (or React/Tailwind), so Codestral's multi-language coding
     specialization is no longer the deciding factor, and burning
@@ -1189,18 +1189,18 @@ _migrate_dev_slate_chat_off_codestral_2026_09_11()
 
 def _migrate_off_dead_llm7_gpt_oss_2026_09_12():
     """Real, live-confirmed incident (2026-09-12): LLM7 retired "gpt-oss"
-    from its catalog — GET /v1/models (keyless, checked directly against
+    from its catalog â€” GET /v1/models (keyless, checked directly against
     api.llm7.io) no longer lists it at all. This was normal_chat's actual
-    PRIMARY model (not just a fallback) — every normal_chat request was
+    PRIMARY model (not just a fallback) â€” every normal_chat request was
     failing outright. It was also the fallback for dev_slate_chat,
     dispatcher_chat, and agent_work, so their safety net was silently
     dead too, even though those roles weren't failing outright yet.
 
-    Editing DEFAULTS above only affects a brand-new store — this server's
+    Editing DEFAULTS above only affects a brand-new store â€” this server's
     already-materialized config.json keeps the dead references until
     this runs once. Force-overwrites every affected role unconditionally
     (not a fill-in-if-missing migration), same pattern as
-    _migrate_dev_slate_chat_off_codestral_2026_09_11 above — a manual
+    _migrate_dev_slate_chat_off_codestral_2026_09_11 above â€” a manual
     reassignment later isn't fought by this, since it only ever runs
     once per instance."""
     if config.get("migrated_off_dead_llm7_gpt_oss_2026_09_12"):
@@ -1217,7 +1217,7 @@ def _migrate_off_dead_llm7_gpt_oss_2026_09_12():
         current = config.get_role(role_name) or role
         # Only touch the fallback, keep whatever primary is already
         # live (a prior manual pin on primary is a real, intentional
-        # choice — this migration's job is fixing the dead SAFETY NET,
+        # choice â€” this migration's job is fixing the dead SAFETY NET,
         # not overriding an unrelated deliberate pick).
         config.set_role(
             role_name, current.get("provider", role["provider"]), current.get("model", role["model"]),
@@ -1233,7 +1233,7 @@ def _migrate_add_context_synthesis_role_2026_09_13():
     """Adds the context_synthesis role (see DEFAULTS above for the full
     reasoning) to an already-materialized config.json. Fill-in-if-missing,
     NOT a force-overwrite: unlike the dead-model migration above there's no
-    broken state to correct here — if this role already exists because
+    broken state to correct here â€” if this role already exists because
     someone pinned it by hand, that pin is a real choice and this must not
     stomp it."""
     if config.get_role("context_synthesis"):
@@ -1247,43 +1247,16 @@ def _migrate_add_context_synthesis_role_2026_09_13():
 _migrate_add_context_synthesis_role_2026_09_13()
 
 
-def _migrate_normal_chat_tiers_2026_09_13()
-
-
-def _migrate_context_synthesis_primary_2026_09_14():
-    """Flips context_synthesis to Mistral-primary on an already-
-    materialized config.json. Force-overwrite, not fill-if-missing: the
-    stored value is a known-wrong state, not an absent one.
-
-    Ollama Cloud's hard 182-second cap (see DEFAULTS for the full
-    reasoning and the measurements) means its primary could not finish
-    this role's largest jobs, and a timeout is the most expensive failure
-    available — the abandoned call's input is paid in full before the
-    fallback pays for the same prompt again.
-
-    Ollama is kept as the fallback rather than removed: separate resource
-    pool, and it handles this role's small jobs without trouble.
-    """
-    want = {
-        "provider": "mistral", "model": "mistral-small-latest",
-        "fallback": [{"provider": "ollama_cloud", "model": "nemotron-3-super"}],
-    }
-    role = config.get_role("context_synthesis")
-    if role and role.get("provider") == "ollama_cloud":
-        config.set_role("context_synthesis", want["provider"], want["model"], want["fallback"])
-        print("[config] context_synthesis flipped to mistral primary (Ollama's 182s cap)")
-
-
-_migrate_context_synthesis_primary_2026_09_14():
+def _migrate_normal_chat_tiers_2026_09_13():
     """Installs Normal Chat's three capability tiers on an already-
     materialized config.json (see DEFAULTS for the full reasoning).
 
     Force-overwrites normal_chat's primary, unlike the context_synthesis
-    migration above — that one was purely additive, this is fixing a
+    migration above â€” that one was purely additive, this is fixing a
     known-wrong state. normal_chat was pinned to a 120B model for EVERY
     message including trivial ones, flagged in IDEAS.md as "a mistake, we
     MUST fix" and left untouched for days. A fill-in-if-missing migration
-    would leave every existing install on that wrong primary forever —
+    would leave every existing install on that wrong primary forever â€”
     the exact failure mode the dead-LLM7-model incident already taught
     (editing DEFAULTS alone never touches a running server)."""
     if config.get("migrated_normal_chat_tiers_2026_09_13"):
@@ -1313,3 +1286,30 @@ _migrate_context_synthesis_primary_2026_09_14():
 
 
 _migrate_normal_chat_tiers_2026_09_13()
+
+
+def _migrate_context_synthesis_primary_2026_09_14():
+    """Flips context_synthesis to Mistral-primary on an already-
+    materialized config.json. Force-overwrite, not fill-if-missing: the
+    stored value is a known-wrong state rather than an absent one.
+
+    Ollama Cloud's hard 182-second cap (see DEFAULTS for the full
+    reasoning and the measurements behind it) meant its primary could not
+    finish this role's largest jobs. A timeout is also the most expensive
+    failure available here — the abandoned call's input is paid in full
+    before the fallback pays for the same prompt again.
+
+    Ollama stays as the fallback rather than being removed: a genuinely
+    separate resource pool, and perfectly capable of this role's small
+    jobs.
+    """
+    role = config.get_role("context_synthesis")
+    if role and role.get("provider") == "ollama_cloud":
+        config.set_role(
+            "context_synthesis", "mistral", "mistral-small-latest",
+            [{"provider": "ollama_cloud", "model": "nemotron-3-super"}],
+        )
+        print("[config] context_synthesis flipped to mistral primary (Ollama's 182s cap)")
+
+
+_migrate_context_synthesis_primary_2026_09_14()
