@@ -56,6 +56,17 @@ GMI_MODELS_URL = "https://api.gmi-serving.com/v1/models"
 # Native endpoint on purpose — Gemini's OpenAI-compat layer (what
 # providers/gemini.py actually calls for chat) has no catalog listing.
 GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+# Gemini's models endpoint reports generateContent for a lot of things
+# that are emphatically NOT text-chat candidates — caught 2026-09-13 by
+# actually reading a live pull instead of trusting the method flag: TTS
+# voices (8K ctx), image generators, a transcription model, a robotics
+# model and a computer-use agent all came back as eligible. Same shape of
+# filter GROQ_EXCLUDE_PATTERNS above already applies for the same reason.
+# "omni" is excluded deliberately though it can technically chat: those
+# are audio/video-first at 131K ctx, and Gemini offers pure-text Flash
+# models at 1M ctx, so there's no case for routing chat to one.
+GEMINI_EXCLUDE_PATTERNS = ("tts", "image", "transcribe", "robotics", "computer-use", "omni", "embedding")
 CLOUDFLARE_MODELS_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search"
 AA_BULK_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
 
@@ -302,6 +313,8 @@ def fetch_gemini_models(api_key: str | None) -> list[dict]:
         lowered = mid.lower()
         if "gemini" not in lowered:
             continue  # skip embedding models and any non-Gemini entries
+        if any(p in lowered for p in GEMINI_EXCLUDE_PATTERNS):
+            continue  # TTS/image/transcribe/robotics/computer-use — see the constant
         out.append({
             "provider": "gemini", "id": mid,
             "context_length": m.get("inputTokenLimit"),
