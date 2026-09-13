@@ -280,6 +280,33 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "request_stronger_model",
+            "description": "Call this INSTEAD OF answering when this request is genuinely "
+                            "beyond you — it needs deeper reasoning, more careful analysis, "
+                            "or more capability than you can give a good answer with. A "
+                            "stronger model will then take over this same message and "
+                            "answer it properly. Recognising your own limit is the whole "
+                            "job here: it is far better to hand off than to produce a "
+                            "shallow or wrong answer confidently. But don't reach for it "
+                            "on anything you can genuinely handle — most messages are "
+                            "ordinary and you should just answer them.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "One short sentence on what makes this beyond you — "
+                                        "used for routing diagnostics, never shown to the "
+                                        "user.",
+                    },
+                },
+                "required": ["reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "flag_key_insight",
             "description": "Records ONE durable fact from this exchange into the "
                             "conversation's long-term memory, so it survives after the "
@@ -354,11 +381,19 @@ TOOL_SCHEMAS = [
     },
 ]
 
-# ask_user_choice, propose_research_mode, propose_plan_ready and
-# flag_key_insight are deliberately NOT handled in dispatch() below — all
-# four are intercepted earlier, in run_stored_mode_chat/run_devslate_turn/
-# dispatcher/research.py, before a call ever reaches the normal
-# execute-and-continue tool loop.
+# ask_user_choice, propose_research_mode, propose_plan_ready,
+# flag_key_insight and request_stronger_model are deliberately NOT handled
+# in dispatch() below — all five are intercepted earlier, in
+# run_stored_mode_chat/run_devslate_turn/dispatcher/research.py, before a
+# call ever reaches the normal execute-and-continue tool loop.
+#
+# request_stronger_model (2026-09-13) is how NAVI does capability tiering
+# without paying for a separate classifier call on every turn: each turn
+# starts on the cheap idle model, and escalation only happens when the
+# model itself says it can't handle the message. Recognising "this is
+# beyond me" is a much easier task than answering, which is why a small
+# model can be trusted with it. Cost is one cheap call on the common
+# path, one cheap + one real call when it escalates.
 #
 # flag_key_insight (2026-09-13) differs from the other three in one
 # important way: it is NON-TERMINAL. The other three ARE the turn's

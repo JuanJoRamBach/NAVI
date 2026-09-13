@@ -290,7 +290,13 @@ async def _run_execution(conversation_id: str, plan: dict) -> dict:
     )
 
     try:
-        role = get_dispatcher_role(context="chat")
+        # Serious tier, not the idle default (2026-09-13). Research
+        # execution is the definition of a serious job — it reads a whole
+        # plan, runs a real gathering loop and has to produce a
+        # client-facing deliverable in one pass. The planning stage above
+        # stays on the idle tier deliberately: that half is ordinary
+        # clarifying conversation.
+        role = get_dispatcher_role(context="chat_serious")
     except ProviderNotConfigured as e:
         error_text = f"⚠️ Can't research right now — research isn't configured: {e}"
         await append_message(conversation_id, "navi", error_text)

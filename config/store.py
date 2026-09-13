@@ -219,10 +219,64 @@ DEFAULTS = {
         # trusted here — verified live on Cloudflare's catalog, 2026-08
         # GA, was already this role's first fallback) rather than pick a
         # new, unverified LLM7 model under incident pressure.
+        # ---- Normal Chat's three capability tiers (2026-09-13) ----
+        #
+        # Replaces a single normal_chat role that sent EVERY message —
+        # "what's the weather" included — to a 120B model, which was
+        # flagged in IDEAS.md as "a mistake, we MUST fix" and directly
+        # contradicted NAVI's own "smallest model that clears the bar"
+        # pitch. Every turn now starts on `normal_chat` (idle) and
+        # escalates only when the model itself says it needs to (see
+        # request_stronger_model in tools/registry.py).
+        #
+        # `normal_chat` KEEPS its name as the idle tier deliberately:
+        # every existing caller of get_dispatcher_role(context="chat")
+        # then gets the cheap tier by default, which is the desired
+        # behaviour, and nothing else in the codebase has to change.
+        #
+        # FALLBACK RULE, JuanJo 2026-09-13: every hop changes PROVIDER.
+        # A chain exists to survive provider-level failure (quota
+        # exhaustion, outage) — Cloudflare -> Cloudflare would waste the
+        # first hop on the most likely failure mode. Quality is also held
+        # level or upward at each hop, never degraded.
+        #
+        # Model picks are verified, not assumed. Both Gemini primaries had
+        # tool calling confirmed with real calls (jobs/test_gemini.py,
+        # 2026-09-13) — that mattered because the idle tier has the
+        # HEAVIEST tool dependency (flag_key_insight,
+        # propose_research_mode, request_stronger_model) and a model that
+        # silently doesn't call tools fails invisibly. RPD is metered
+        # per-model on Gemini's free tier, so idle and exploratory sit on
+        # two DIFFERENT Flash-Lite models to get two independent 500/day
+        # pools rather than sharing one. Both are 1M context.
         "normal_chat": {
-            "provider": "cloudflare", "model": "@cf/openai/gpt-oss-120b",
+            "provider": "gemini", "model": "gemini-3.1-flash-lite",
             "fallback": [
-                {"provider": "mistral", "model": "mistral-small-latest"},
+                {"provider": "cloudflare", "model": "@cf/openai/gpt-oss-20b"},
+                {"provider": "llm7", "model": "minimax-m2.7"},
+            ],
+        },
+        "normal_chat_exploratory": {
+            "provider": "gemini", "model": "gemini-3.5-flash-lite",
+            "fallback": [
+                {"provider": "cloudflare", "model": "@cf/qwen/qwen3.8-27b"},
+                {"provider": "llm7", "model": "minimax-m2.7"},
+            ],
+        },
+        # Serious leads with Cloudflare because its Neurons budget absorbs
+        # volume, keeping Gemini 3.8 Flash (1M ctx but only 20 RPD) as the
+        # backup rather than the thing that runs out first.
+        # UNVERIFIED as of writing: nemotron's tool calling on Cloudflare
+        # (no CLOUDFLARE_ACCOUNT_ID available where this was written).
+        # Check with `python -m jobs.test_tool_calling cloudflare
+        # @cf/nvidia/nemotron-3-120b-a12b` — if it fails, swap primary and
+        # first fallback, since gemini-3.8-flash is in Google's own
+        # documented tool-supporting list.
+        "normal_chat_serious": {
+            "provider": "cloudflare", "model": "@cf/nvidia/nemotron-3-120b-a12b",
+            "fallback": [
+                {"provider": "gemini", "model": "gemini-3.8-flash"},
+                {"provider": "llm7", "model": "minimax-m2.7"},
             ],
         },
         "dispatcher_autonomous": {"provider": "groq", "model": "openai/gpt-oss-120b"},
@@ -1168,3 +1222,44 @@ def _migrate_add_context_synthesis_role_2026_09_13():
 
 
 _migrate_add_context_synthesis_role_2026_09_13()
+
+
+def _migrate_normal_chat_tiers_2026_09_13():
+    """Installs Normal Chat's three capability tiers on an already-
+    materialized config.json (see DEFAULTS for the full reasoning).
+
+    Force-overwrites normal_chat's primary, unlike the context_synthesis
+    migration above — that one was purely additive, this is fixing a
+    known-wrong state. normal_chat was pinned to a 120B model for EVERY
+    message including trivial ones, flagged in IDEAS.md as "a mistake, we
+    MUST fix" and left untouched for days. A fill-in-if-missing migration
+    would leave every existing install on that wrong primary forever —
+    the exact failure mode the dead-LLM7-model incident already taught
+    (editing DEFAULTS alone never touches a running server)."""
+    if config.get("migrated_normal_chat_tiers_2026_09_13"):
+        return
+    config.set_role(
+        "normal_chat", "gemini", "gemini-3.1-flash-lite",
+        fallback=[
+            {"provider": "cloudflare", "model": "@cf/openai/gpt-oss-20b"},
+            {"provider": "llm7", "model": "minimax-m2.7"},
+        ],
+    )
+    config.set_role(
+        "normal_chat_exploratory", "gemini", "gemini-3.5-flash-lite",
+        fallback=[
+            {"provider": "cloudflare", "model": "@cf/qwen/qwen3.8-27b"},
+            {"provider": "llm7", "model": "minimax-m2.7"},
+        ],
+    )
+    config.set_role(
+        "normal_chat_serious", "cloudflare", "@cf/nvidia/nemotron-3-120b-a12b",
+        fallback=[
+            {"provider": "gemini", "model": "gemini-3.8-flash"},
+            {"provider": "llm7", "model": "minimax-m2.7"},
+        ],
+    )
+    config.set("migrated_normal_chat_tiers_2026_09_13", True)
+
+
+_migrate_normal_chat_tiers_2026_09_13()

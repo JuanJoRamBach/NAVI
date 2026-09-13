@@ -78,7 +78,25 @@ _ROLE_NAME_FOR_CONTEXT = {
     # config/store.py's own comment on the role for why it's primaried on
     # Ollama Cloud specifically.
     "context_synthesis": "context_synthesis",
+    # Normal Chat's capability tiers (2026-09-13). "chat" -> normal_chat
+    # is the IDLE tier, so every existing caller gets the cheap model by
+    # default and escalation is opt-in. See config/store.py's own comment.
+    "chat_exploratory": "normal_chat_exploratory",
+    "chat_serious": "normal_chat_serious",
 }
+
+# The escalation ladder, in order. dispatcher/chat.py walks this when a
+# model calls request_stronger_model; the last entry is the ceiling.
+CHAT_TIERS = ("chat", "chat_exploratory", "chat_serious")
+
+
+def next_chat_tier(current: str) -> str | None:
+    """The next tier up, or None if already at the ceiling."""
+    try:
+        idx = CHAT_TIERS.index(current)
+    except ValueError:
+        return None
+    return CHAT_TIERS[idx + 1] if idx + 1 < len(CHAT_TIERS) else None
 
 
 def get_dispatcher_role(context: str = "chat") -> dict:

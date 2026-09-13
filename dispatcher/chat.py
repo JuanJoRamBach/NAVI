@@ -39,7 +39,7 @@ from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, classify_family
 from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ProviderError
-from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
+from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider, next_chat_tier
 from storage.context_store import SOURCE_ASSISTANT, append_entry, build_context_block, record_friction
 from storage.conversations import append_message, get_messages
 from tools.registry import schemas_for
@@ -235,7 +235,8 @@ def run_mode_chat(mode: str, text: str) -> str:
 
 
 async def run_stored_mode_chat(
-    mode: str, conversation_id: str, text: str, auto_accept: bool = True, reasoning_effort: str | None = None,
+    mode: str, conversation_id: str, text: str, auto_accept: bool = True,
+    reasoning_effort: str | None = None, tier: str = "chat", _escalated_from: str | None = None,
 ) -> dict:
     """Persisted sibling of run_mode_chat above — appends the user's
     message, replays a windowed slice of REAL history (not just this one
@@ -252,13 +253,24 @@ async def run_stored_mode_chat(
     adapt_request_params, which only actually applies it for a non-Groq
     gpt-oss attempt (see that function's own docstring). Harmless no-op
     for every other family/provider, so callers that never send it
-    (typed /commands, older clients) are unaffected."""
-    await append_message(conversation_id, "user", text)
+    (typed /commands, older clients) are unaffected.
+
+    tier (2026-09-13): which capability tier answers this turn — "chat"
+    (idle, the default and where every turn starts), "chat_exploratory",
+    or "chat_serious". Escalation is NOT decided by a classifier: the
+    idle model calls request_stronger_model when it judges a message
+    beyond it, and this function re-runs itself one tier up. Recognising
+    "this is beyond me" is a far easier task than answering it, which is
+    what makes it safe to hand a small model. `_escalated_from` is set
+    only on those internal re-runs — it exists to prevent the user's
+    message being appended to history twice, not as a public parameter."""
+    if not _escalated_from:
+        await append_message(conversation_id, "user", text)
 
     brief = get_mode_brief(mode)
     history = await get_messages(conversation_id, limit=RECENT_MESSAGE_WINDOW)
 
-    role_context = "agent_work" if mode == "agent_work" else "chat"
+    role_context = "agent_work" if mode == "agent_work" else tier
     try:
         role = get_dispatcher_role(context=role_context)
     except ProviderNotConfigured as e:
@@ -439,6 +451,38 @@ async def run_stored_mode_chat(
                         # a user-stated fact. See storage/context_store.py.
                         await append_entry(conversation_id, insight, source=SOURCE_ASSISTANT)
                         print(f"[run_stored_mode_chat] flagged key insight: {insight[:120]!r}")
+
+            # Capability escalation (2026-09-13). Checked before every
+            # other interception: if the model says it can't handle this,
+            # nothing else it produced this turn is worth acting on.
+            escalate_call = next((tc for tc in response.tool_calls if tc.name == "request_stronger_model"), None)
+            if escalate_call:
+                higher = next_chat_tier(tier)
+                reason = (_parse_tool_args(escalate_call.arguments).get("reason") or "").strip()
+                if higher:
+                    print(f"[run_stored_mode_chat] escalating {tier} -> {higher}: {reason[:120]!r}")
+                    await record_friction(
+                        "tier_escalation", severity=1, conversation_id=conversation_id,
+                        detail=f"{tier} -> {higher} ({attempt['provider']}/{attempt['model']}): {reason[:200]}",
+                    )
+                    # Re-run the same turn one tier up. _escalated_from
+                    # stops the user's message being appended twice —
+                    # it's already in history from the first pass.
+                    return await run_stored_mode_chat(
+                        mode, conversation_id, text, auto_accept=auto_accept,
+                        reasoning_effort=reasoning_effort, tier=higher, _escalated_from=tier,
+                    )
+                # Already at the ceiling. Don't loop, don't fail — let the
+                # top-tier model answer as best it can, which is strictly
+                # better than telling the user nothing. Logged at higher
+                # severity because it means the strongest tier declared
+                # itself insufficient, which is worth knowing about.
+                print(f"[run_stored_mode_chat] escalation requested at ceiling tier {tier} — answering anyway")
+                await record_friction(
+                    "escalation_at_ceiling", severity=3, conversation_id=conversation_id,
+                    detail=f"{tier}: {reason[:200]}",
+                )
+                response.tool_calls = [tc for tc in response.tool_calls if tc.name != "request_stronger_model"]
 
             research_mode_call = next((tc for tc in response.tool_calls if tc.name == "propose_research_mode"), None)
             if research_mode_call:
