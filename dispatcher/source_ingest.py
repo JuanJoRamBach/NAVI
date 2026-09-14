@@ -273,8 +273,6 @@ def _ask_grounding(policy: str, claim: str, passages: list[str]) -> dict | None:
                 ],
             )
         except ProviderError as e:
-            if e.is_rate_limit:
-                config.mark_rate_limited(attempt["provider"], attempt["model"])
             print(f"[sources] grounding attempt failed on {attempt['provider']}: {e}")
             continue
         parsed = parse_grounding_reply(response.text or "")

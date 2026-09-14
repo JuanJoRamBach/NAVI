@@ -531,8 +531,6 @@ def _run_text_transform_step(
             )
         except ProviderError as e:
             last_error = str(e)
-            if e.is_rate_limit:
-                config.mark_rate_limited(attempt["provider"], model)
             continue
 
     return StepResult(step=step, text="", error=last_error or f"All {command} providers failed")
@@ -624,8 +622,6 @@ def _run_remind_step(step: Step, prior_context: str | None) -> StepResult:
             )
         except (ProviderError, KeyError, ValueError) as e:
             last_error = str(e)
-            if isinstance(e, ProviderError) and e.is_rate_limit:
-                config.mark_rate_limited(attempt["provider"], model)
             continue
 
     return StepResult(step=step, text="", error=last_error or "Couldn't set the reminder — all providers failed")
@@ -713,8 +709,6 @@ def _run_single_step(step: Step, prior_context: str | None) -> StepResult:
             )
         except (ProviderError, ChartError) as e:
             last_error = str(e)
-            if isinstance(e, ProviderError) and e.is_rate_limit:
-                config.mark_rate_limited(attempt["provider"], model)
             continue
 
     return StepResult(step=step, text="", error=last_error or "All providers failed")

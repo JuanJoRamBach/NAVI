@@ -74,10 +74,27 @@ class ChatResponse:
 
 
 class ProviderError(Exception):
-    """Raised for any provider failure. Callers decide whether to rotate."""
-    def __init__(self, message: str, is_rate_limit: bool = False):
+    """Raised for any provider failure. Callers decide whether to rotate.
+
+    Two flags, deliberately separate, because they mean different things
+    and must be treated differently (2026-09-14, after a real Gemini 503):
+
+    is_rate_limit — YOU have hit a limit. Routine on free tiers, expected,
+        and absorbed by the fallback chain by design.
+    is_overloaded — THEY are having a bad minute: any 5xx. Not about your
+        quota at all, and unlike a 429 it says something about the
+        provider's reliability that is worth recording and eventually
+        ranking on.
+
+    Both should cool the endpoint down; only one should be treated as
+    routine. Collapsing them into a single flag would either lose the
+    backoff for 5xx (what happened before this) or hide provider outages
+    inside the "routine, don't record" bucket.
+    """
+    def __init__(self, message: str, is_rate_limit: bool = False, is_overloaded: bool = False):
         super().__init__(message)
         self.is_rate_limit = is_rate_limit
+        self.is_overloaded = is_overloaded
 
 
 # Which provider-call outcomes are worth a friction row, and how heavily.
@@ -96,9 +113,46 @@ class ProviderError(Exception):
 # mismatch between the work and the model, not a busy minute.
 _FRICTION_FOR_ERROR: dict[str, int] = {
     "timeout": 3,
+    # A provider 5xx. Recorded, unlike a 429, precisely because it is NOT
+    # routine: it says the provider could not serve anyone, which is a
+    # reliability fact about them worth accumulating — and it is what the
+    # trust index needs in order to eventually demote a model that is
+    # unavailable more often than its benchmark score suggests.
+    "overloaded": 2,
     "error": 2,
     "empty_response": 2,
 }
+
+
+def _cool_down(kind: str, provider_name: str, model: str) -> None:
+    """Demotes an endpoint that just told us it cannot serve us.
+
+    Done HERE rather than at each call site, for the same reason the
+    friction record is: this is the one point every provider call in NAVI
+    passes through, so a new caller inherits the behaviour instead of
+    having to remember it. Before this, the cooldown was hand-written at
+    ten call sites and checked only is_rate_limit — so a 503 never cooled
+    anything down, and Gemini stayed first in the chain while Google was
+    overloaded, paying a wasted call on every single turn.
+
+    Silent on every other kind. A timeout is ambiguous (it can be one slow
+    request rather than a sick endpoint) and a malformed response is a
+    bug, not a capacity signal — neither justifies sidelining a role's
+    primary, and over-eager demotion would quietly route good traffic to
+    weaker models.
+    """
+    from config.store import config
+
+    windows = {
+        "rate_limit": None,  # None = the default rate-limit window
+        "overloaded": config.OVERLOADED_COOLDOWN_SECONDS,
+    }
+    if kind not in windows:
+        return
+    try:
+        config.mark_rate_limited(provider_name, model, seconds=windows[kind])
+    except Exception as e:  # noqa: BLE001
+        print(f"[Provider.chat] cooldown marking failed (non-fatal): {e}")
 
 
 def _outgoing_tokens(messages: list["ChatMessage"]) -> int:
@@ -190,6 +244,10 @@ def _classify_error(exc: BaseException) -> str:
         return "cancelled"
     if isinstance(exc, ProviderError) and exc.is_rate_limit:
         return "rate_limit"
+    # Checked after rate_limit: a provider that sets both means the 429
+    # reading, which is the more specific claim.
+    if isinstance(exc, ProviderError) and exc.is_overloaded:
+        return "overloaded"
     text = str(exc).lower()
     if "timeout" in text or "timed out" in text:
         return "timeout"
@@ -299,6 +357,7 @@ class Provider(ABC):
                 kind, self.name, model, call_ctx, str(e),
                 wasted_tokens=_outgoing_tokens(messages), estimated=True,
             )
+            _cool_down(kind, self.name, model)
             raise
 
         # Generic, provider-agnostic real TOKEN persistence (2026-09-10) —

@@ -117,7 +117,13 @@ class GroqProvider(Provider):
             # not spent a penny, with nothing to explain it.
             raise ProviderError(f"Groq rate limited: {resp.text[:300]}", is_rate_limit=True)
         if resp.status_code >= 400:
-            raise ProviderError(f"Groq error {resp.status_code}: {resp.text[:300]}")
+            raise ProviderError(
+                f"Groq error {resp.status_code}: {resp.text[:300]}",
+                # Any 5xx is the provider failing, not us. Cools the
+                # endpoint down like a 429 does, but stays visible in
+                # friction where a 429 deliberately does not.
+                is_overloaded=resp.status_code >= 500,
+            )
 
         data = resp.json()
         choices = data.get("choices") or []

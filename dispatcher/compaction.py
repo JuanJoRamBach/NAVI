@@ -324,8 +324,6 @@ async def compact_conversation(messages: list[ChatMessage], instruction: str) ->
             with call_context(role="context_synthesis", attempt=i):
                 response = await asyncio.to_thread(provider.chat, model=attempt["model"], messages=call_messages)
         except ProviderError as e:
-            if e.is_rate_limit:
-                config.mark_rate_limited(attempt["provider"], attempt["model"])
             print(f"[compact_conversation] {label}: call failed — {e}")
             continue
         text = strip_code_fence(response.text or "")

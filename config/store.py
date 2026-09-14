@@ -634,9 +634,29 @@ class ConfigStore:
     # that a wrong guess costs minutes, not most of a day.
     RATE_LIMIT_COOLDOWN_SECONDS = 300
 
-    def mark_rate_limited(self, provider: str, model: str):
+    # A provider 5xx cools down for less time than a 429 does.
+    #
+    # The two are different failures. A rate limit means a budget is spent
+    # and will not refill for a known-ish period; an overload means the
+    # provider is momentarily out of capacity, which typically clears in
+    # seconds to a minute or two. Demoting a role's primary for a full
+    # five minutes over one bad response would hand several turns to a
+    # weaker model for no reason — and since this demotes rather than
+    # drops, guessing short is cheap: if the provider is still overloaded,
+    # the very next call re-marks it.
+    OVERLOADED_COOLDOWN_SECONDS = 60
+
+    def mark_rate_limited(self, provider: str, model: str, seconds: float | None = None):
+        """Demotes this (provider, model) in get_attempts for a while.
+
+        `seconds` defaults to the rate-limit window. The name predates
+        there being more than one reason to cool an endpoint down — what
+        it actually means is "this endpoint cannot serve us right now",
+        which covers a 429 and a 503 equally.
+        """
         key = f"{provider}:{model}"
-        self._data.setdefault("rate_limit_cooldowns", {})[key] = time.time() + self.RATE_LIMIT_COOLDOWN_SECONDS
+        window = self.RATE_LIMIT_COOLDOWN_SECONDS if seconds is None else seconds
+        self._data.setdefault("rate_limit_cooldowns", {})[key] = time.time() + window
         self._save()
 
     def get_attempts(self, candidates: list[dict]) -> list[dict]:

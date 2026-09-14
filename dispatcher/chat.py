@@ -353,8 +353,6 @@ def run_mode_chat(mode: str, text: str) -> str:
             return reply
         except ProviderError as e:
             last_error = str(e)
-            if e.is_rate_limit:
-                config.mark_rate_limited(attempt["provider"], attempt["model"])
             continue
 
     return f"⚠️ normal_chat failed on every configured provider: {last_error}"
@@ -948,8 +946,6 @@ async def run_stored_mode_chat(
         except ProviderError as e:
             last_error = str(e)
             print(f"[run_stored_mode_chat] attempt {i}: DECISION = retry next fallback (ProviderError: {last_error})")
-            if e.is_rate_limit:
-                config.mark_rate_limited(attempt["provider"], attempt["model"])
             await asyncio.to_thread(
                 save_failed_exchange, role_context, attempt["provider"], attempt["model"], messages, last_error,
             )
@@ -1056,8 +1052,6 @@ async def run_agent_vault_chat(agent: dict, conversation_id: str, text: str) -> 
             return {"text": reply, "provider": attempt["provider"], "model": attempt["model"], "usage_note": response.usage_note}
         except ProviderError as e:
             last_error = str(e)
-            if e.is_rate_limit:
-                config.mark_rate_limited(attempt["provider"], attempt["model"])
             await asyncio.to_thread(
                 save_failed_exchange, "agent_vault", attempt["provider"], attempt["model"], messages, last_error,
             )

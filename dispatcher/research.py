@@ -263,8 +263,6 @@ async def _run_planning_turn(conversation_id: str) -> dict:
             return {"text": reply, "provider": attempt["provider"], "model": attempt["model"], "usage_note": response.usage_note}
         except ProviderError as e:
             last_error = str(e)
-            if e.is_rate_limit:
-                config.mark_rate_limited(attempt["provider"], attempt["model"])
             continue
 
     error_text = f"⚠️ research failed on every configured provider: {last_error}"
@@ -364,8 +362,6 @@ async def _run_execution(conversation_id: str, plan: dict) -> dict:
             return await _finish_research(conversation_id, attempt, report)
         except ProviderError as e:
             last_error = str(e)
-            if e.is_rate_limit:
-                config.mark_rate_limited(attempt["provider"], attempt["model"])
             continue
         except Exception as e:
             # Broad on purpose, scoped to just this call: a mid-gathering

@@ -105,8 +105,6 @@ def run_source_fetch_batch(terms: list[str], trusted_sites: list[str]) -> str:
             return batch_id
         except ProviderError as e:
             last_error = str(e)
-            if e.is_rate_limit:
-                config.mark_rate_limited(attempt["provider"], model)
             continue
 
     finish_batch(batch_id, error=last_error or "Every configured provider failed.")

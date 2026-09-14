@@ -473,7 +473,8 @@ def record_friction_sync(
 
 async def get_friction_since(since: float, conversation_id: str | None = None) -> list[dict]:
     query = (
-        "SELECT id, conversation_id, message_id, kind, severity, detail, created_at, wasted_tokens "
+        "SELECT id, conversation_id, message_id, kind, severity, detail, created_at, "
+        "wasted_tokens, provider, model "
         "FROM friction_events WHERE created_at > ?"
     )
     params: tuple = (since,)
