@@ -32,6 +32,7 @@ which is the consolidation-time half of the prompt-injection concern
 """
 
 import json
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -54,6 +55,85 @@ SOURCE_BRANCH_BRIEF = "branch_brief"
 # single entry. Same direction discipline as Agent_Work_Context.md: the
 # parent receives the result, never the branch's whole history.
 SOURCE_BRANCH_RESULT = "branch_result"
+
+# Defined separately from _SCHEMA below, and then appended to it, because
+# the SYNC writer (record_friction_sync) has to be able to create this one
+# table on its own: a provider call can be the very first thing in a
+# process to touch this database, before any async path has run the full
+# schema script. One definition, two users — interpolated rather than
+# copied so the two can't drift apart.
+_FRICTION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS friction_events (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT,
+    message_id TEXT,
+    kind TEXT NOT NULL,
+    severity INTEGER NOT NULL,
+    detail TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_friction_conversation
+    ON friction_events(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_friction_kind
+    ON friction_events(kind, created_at);
+"""
+
+# `wasted_tokens` — what this friction actually COST, in the only unit
+# that is comparable across kinds.
+#
+# `severity` is a hand-assigned 1/2/3, decided by whoever wrote the call
+# site. That is a judgement, and this codebase's standing rule is to
+# measure rather than judge wherever a measurement exists. Tokens that
+# were paid for and returned nothing usable is that measurement: a
+# timeout on a 5,000-token prompt is genuinely five thousand tokens
+# burned, and it is meaningfully worse than one on a 200-token prompt in
+# a way no severity integer can express.
+#
+# NULL means "not measurable here", which is deliberately distinct from
+# 0 ("measured, and nothing was wasted"). A failed call has no usage
+# object to read, so those rows carry an ESTIMATE from the outgoing
+# payload — flagged as such in `detail`, same honesty rule estimate_tokens
+# itself follows. Severity is kept rather than replaced: it still
+# captures how much a kind MATTERS, which is not the same question as
+# what it cost.
+#
+# `provider` / `model` — WHICH model this happened on.
+#
+# Added 2026-09-14 so live evidence can reach jobs/model_ranking.py. Model
+# attribution was the missing half: usage_calls already knows which model
+# failed a CALL, but the quality signals that matter most for ranking a
+# model — it repeated itself, it answered with nothing, it declared itself
+# insufficient at the top tier — live here, and a kind with no model on it
+# can describe a problem without ever identifying the thing to change.
+# Nullable: a friction event that genuinely isn't about a model (a
+# compaction pass that missed target, a user rejecting a plan) leaves both
+# NULL rather than pretending to an attribution it doesn't have.
+_FRICTION_MIGRATIONS = (
+    "ALTER TABLE friction_events ADD COLUMN wasted_tokens INTEGER",
+    "ALTER TABLE friction_events ADD COLUMN provider TEXT",
+    "ALTER TABLE friction_events ADD COLUMN model TEXT",
+)
+
+# The kinds that say something about the MODEL, as opposed to the
+# conversation or the user's judgement of it.
+#
+# A model that repeats itself, returns nothing, burns the whole tool loop
+# or declares itself insufficient at the ceiling is telling you something
+# about that model. A compaction pass that missed target, or a user
+# sending a plan back, is not — the first is about how much material the
+# conversation holds, the second is about whether a draft was right, and
+# scoring a model down for either would be attributing a result to the
+# wrong cause. fallback_used is excluded for a different reason: it
+# describes the model that was SKIPPED, and the row is attributed to the
+# one that answered.
+MODEL_QUALITY_FRICTION = (
+    "repetition_loop",
+    "empty_response",
+    "escalation_at_ceiling",
+    "tool_loop_exhausted",
+    "provider_timeout",
+    "provider_error",
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS context_entries (
@@ -78,18 +158,7 @@ CREATE TABLE IF NOT EXISTS context_snapshots (
 CREATE INDEX IF NOT EXISTS idx_context_snapshots_live
     ON context_snapshots(conversation_id, superseded_at);
 
-CREATE TABLE IF NOT EXISTS friction_events (
-    id TEXT PRIMARY KEY,
-    conversation_id TEXT,
-    message_id TEXT,
-    kind TEXT NOT NULL,
-    severity INTEGER NOT NULL,
-    detail TEXT,
-    created_at REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_friction_conversation
-    ON friction_events(conversation_id, created_at);
-"""
+""" + _FRICTION_SCHEMA
 
 _initialized = False
 
@@ -114,7 +183,7 @@ async def _ensure_schema(db: aiosqlite.Connection) -> None:
         # criteria ARE the definition of finished — lose them and the
         # branch can no longer tell whether it is done.
         "ALTER TABLE context_entries ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
-    ):
+    ) + _FRICTION_MIGRATIONS:
         try:
             await db.execute(stmt)
         except Exception:
@@ -325,6 +394,8 @@ async def build_context_block(conversation_id: str) -> tuple[str, int]:
 async def record_friction(
     kind: str, severity: int = 1, conversation_id: str | None = None,
     message_id: str | None = None, detail: str | None = None,
+    wasted_tokens: int | None = None,
+    provider: str | None = None, model: str | None = None,
 ) -> None:
     """Logs one friction event. Written now, consumed later — see this
     module's own docstring. Never raises: a friction-logging failure must
@@ -335,19 +406,74 @@ async def record_friction(
         async with aiosqlite.connect(DB_PATH) as db:
             await _ensure_schema(db)
             await db.execute(
-                "INSERT INTO friction_events (id, conversation_id, message_id, kind, severity, detail, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO friction_events (id, conversation_id, message_id, kind, severity, detail, created_at, wasted_tokens, provider, model) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (str(uuid.uuid4()), conversation_id, message_id, kind, severity,
-                 json.dumps(detail) if isinstance(detail, (dict, list)) else detail, time.time()),
+                 json.dumps(detail) if isinstance(detail, (dict, list)) else detail, time.time(),
+                 wasted_tokens, provider, model),
             )
             await db.commit()
     except Exception as e:
         print(f"[context_store] friction logging failed (non-fatal): {e}")
 
 
+def record_friction_sync(
+    kind: str, severity: int = 1, conversation_id: str | None = None,
+    message_id: str | None = None, detail: str | None = None,
+    wasted_tokens: int | None = None,
+    provider: str | None = None, model: str | None = None,
+) -> None:
+    """Same row, written from synchronous code.
+
+    WHY THIS EXISTS. The friction signal's most valuable sources are in
+    the synchronous layer — providers/base.py's Provider.chat() and
+    dispatcher/executor.py's run_tool_loop, both plain functions running
+    inside asyncio.to_thread. Neither can await the async writer above,
+    and executor.py carried a comment saying exactly that: the tool loop
+    hitting its ceiling "is a real friction signal, but it's recorded by
+    the CALLER... this function is sync". That workaround is why only ONE
+    of run_tool_loop's five callers ever logged it, and why four of
+    NAVI's five subsystems could fail in silence.
+
+    Concurrency: this writes to the same file aiosqlite writes to, from a
+    worker thread. SQLite serializes writers itself; the busy timeout
+    below is what turns "another writer holds the lock" from an error
+    into a short wait. Five seconds is far beyond what a single-row
+    insert into a tiny table needs, and on the rare occasion it is not
+    enough, the except swallows it and one auxiliary row is lost — which
+    is the correct trade for a signal that must never break the request
+    that produced it.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5.0)
+        try:
+            # The full schema script is owned by the async path; this one
+            # table is created here too so a sync-first process (a
+            # provider call before any chat turn) doesn't hit a missing
+            # table. Both use _FRICTION_SCHEMA, so they cannot diverge.
+            conn.executescript(_FRICTION_SCHEMA)
+            for stmt in _FRICTION_MIGRATIONS:
+                try:
+                    conn.execute(stmt)
+                except sqlite3.Error:
+                    pass  # already applied
+            conn.execute(
+                "INSERT INTO friction_events (id, conversation_id, message_id, kind, severity, detail, created_at, wasted_tokens, provider, model) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), conversation_id, message_id, kind, severity,
+                 json.dumps(detail) if isinstance(detail, (dict, list)) else detail, time.time(),
+                 wasted_tokens, provider, model),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[context_store] sync friction logging failed (non-fatal): {e}")
+
+
 async def get_friction_since(since: float, conversation_id: str | None = None) -> list[dict]:
     query = (
-        "SELECT id, conversation_id, message_id, kind, severity, detail, created_at "
+        "SELECT id, conversation_id, message_id, kind, severity, detail, created_at, wasted_tokens "
         "FROM friction_events WHERE created_at > ?"
     )
     params: tuple = (since,)
@@ -361,3 +487,94 @@ async def get_friction_since(since: float, conversation_id: str | None = None) -
         async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
     return [dict(r) for r in rows]
+
+
+async def get_friction_summary(days: int = 7) -> list[dict]:
+    """Friction grouped by kind over the last `days`, worst first.
+
+    Ordered by wasted tokens rather than by count, deliberately. Sorting
+    by frequency puts the cheapest, most routine signal at the top and
+    buries the one that actually cost something — the exact failure this
+    column exists to avoid. `unmeasured` says how many rows in a kind
+    carry no cost figure at all, so a small wasted_tokens total is never
+    mistaken for a cheap problem when it is really an unmeasured one.
+    """
+    since = time.time() - days * 86_400
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT kind,
+                   COUNT(*) AS events,
+                   MAX(severity) AS severity,
+                   COALESCE(SUM(wasted_tokens), 0) AS wasted_tokens,
+                   SUM(CASE WHEN wasted_tokens IS NULL THEN 1 ELSE 0 END) AS unmeasured,
+                   COUNT(DISTINCT conversation_id) AS conversations,
+                   MAX(created_at) AS last_seen
+            FROM friction_events
+            WHERE created_at >= ?
+            GROUP BY kind
+            ORDER BY wasted_tokens DESC, events DESC
+            """,
+            (since,),
+        ) as cursor:
+            return [dict(r) for r in await cursor.fetchall()]
+
+
+def get_model_friction_sync(days: int = 30) -> dict[tuple[str, str], dict]:
+    """Model-quality friction per (provider, model) over the last `days`.
+
+    Sync because its consumer is jobs/model_ranking.py, which is a plain
+    script with no event loop — the same reason record_friction_sync
+    exists, in the other direction.
+
+    Only MODEL_QUALITY_FRICTION kinds are counted: this number is about to
+    be used to move a model down a ranking, so a kind that describes the
+    conversation rather than the model would put the blame in the wrong
+    place. Rows with no attribution are skipped entirely rather than
+    pooled into an "unknown" bucket that nothing could act on.
+    """
+    since = time.time() - days * 86_400
+    placeholders = ",".join("?" for _ in MODEL_QUALITY_FRICTION)
+    out: dict[tuple[str, str], dict] = {}
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5.0)
+        try:
+            # Create-if-missing before reading, exactly as the sync writer
+            # does. Without it, a box where no friction has EVER been
+            # recorded raises "no such table" and logs it as a failure —
+            # printing an alarm for the healthiest possible state, and
+            # making a genuine read error indistinguishable from an empty
+            # one. That confusion is the whole reason this log sat unread.
+            conn.executescript(_FRICTION_SCHEMA)
+            for stmt in _FRICTION_MIGRATIONS:
+                try:
+                    conn.execute(stmt)
+                except sqlite3.Error:
+                    pass  # already applied
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT provider, model, kind, COUNT(*) AS events,
+                       COALESCE(SUM(wasted_tokens), 0) AS wasted_tokens
+                FROM friction_events
+                WHERE created_at >= ? AND provider IS NOT NULL AND model IS NOT NULL
+                  AND kind IN ({placeholders})
+                GROUP BY provider, model, kind
+                """,
+                (since, *MODEL_QUALITY_FRICTION),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[context_store] model friction read failed (non-fatal): {e}")
+        return {}
+
+    for r in rows:
+        key = (r["provider"], r["model"])
+        entry = out.setdefault(key, {"events": 0, "wasted_tokens": 0, "by_kind": {}})
+        entry["events"] += r["events"]
+        entry["wasted_tokens"] += r["wasted_tokens"]
+        entry["by_kind"][r["kind"]] = r["events"]
+    return out

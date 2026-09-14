@@ -56,6 +56,9 @@ from dispatcher.compaction import compact_conversation
 from providers.base import ChatMessage, ProviderError
 from providers.registry import ProviderNotConfigured, get_provider
 from storage.sources import create_batch, create_document, find_by_url, finish_batch
+# Same reasoning as dispatcher/source_fetch.py: ingestion runs on its own
+# worker thread, which starts from a fresh context.
+from storage.usage import set_call_context
 from tools.fetch import SOURCE_MAX_CHARS, FetchError, fetch_document
 from tools.source_document import (
     SOURCE_DOCUMENT_INSTRUCTION,
@@ -255,12 +258,13 @@ def _adjudicate(doc: dict) -> dict:
 
 def _ask_grounding(policy: str, claim: str, passages: list[str]) -> dict | None:
     prompt = build_grounding_prompt(claim, passages)
-    for attempt in config.get_attempts(GROUNDING_ATTEMPTS):
+    for i, attempt in enumerate(config.get_attempts(GROUNDING_ATTEMPTS)):
         try:
             provider = get_provider(attempt["provider"])
         except (ProviderNotConfigured, Exception):  # noqa: BLE001
             continue
         try:
+            set_call_context(role="quote_grounding", mode="sources", attempt=i, provider=attempt["provider"], model=attempt["model"])
             response = provider.chat(
                 model=attempt["model"],
                 messages=[

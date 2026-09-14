@@ -46,7 +46,7 @@ AA_CACHE_MAX_AGE_S = 7 * 24 * 3600  # weekly — benchmark quality doesn't shift
 # stale cached data again. Deliberately just a manually-bumped int, not
 # a content hash — this file changes rarely enough that remembering to
 # bump it is a fine tradeoff for the simplicity.
-SNAPSHOT_SCHEMA_VERSION = 2  # 2 (2026-09-13): Gemini added as a catalog source
+SNAPSHOT_SCHEMA_VERSION = 3  # 3 (2026-09-14): live trust index folded into ranking
 
 GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
@@ -634,6 +634,121 @@ TASK_QUALITY_DIMENSION = {
 }
 
 
+# ---- Live trust: what actually happened, as a ranking input ----
+#
+# Everything above this point ranks a model on what it is CLAIMED to be —
+# a published benchmark index, an advertised context length, a parameter
+# count. This is the counterweight: what the model actually did in this
+# deployment, on this traffic.
+#
+# The "Fluent, But Unsafe" lesson (IDEAS.md) is the whole reason it
+# exists: 150 supposedly finished tasks and perfect model scores hid a
+# weak benchmark, and only real review found what the metrics missed. A
+# ranking driven purely by published scores has exactly that shape.
+#
+# DEMOTION ONLY, NEVER PROMOTION. Live evidence can push a model down; it
+# can never push one up. A model that has answered a thousand calls
+# cleanly has proven it works, not that it is better than a model nobody
+# has tried — and letting incumbency raise a score would quietly lock in
+# whatever is already configured, which is the opposite of what a ranking
+# job is for.
+
+# Below this many observed calls, there is no verdict. Two failures out of
+# three calls is noise; two hundred out of three hundred is a finding.
+# Deliberately not a small number: jobs/eval_gate.py's five fixed tasks
+# are already a standing reminder that a small sample can read perfect (or
+# terrible) while proving very little.
+MIN_CALLS_FOR_TRUST = 25
+
+# A model is demoted when EITHER rate crosses its line.
+#
+# Failures are calls that errored outright. A tenth of all calls failing
+# is well beyond what a fallback chain should be quietly absorbing.
+MAX_FAILURE_RATE = 0.10
+# Quality friction is per successful call: it repeated itself, answered
+# with nothing, burned the whole tool loop, or declared itself
+# insufficient at the top tier. Set lower than the failure line because
+# these are worse — a hard failure rotates to a fallback and the user
+# still gets an answer, while a fluent, empty or looping reply reaches
+# them as if it were real work.
+MAX_QUALITY_FRICTION_RATE = 0.05
+
+# How far back live evidence is read. Long enough to accumulate a real
+# sample on a free tier's traffic, short enough that a model which was bad
+# two months ago and has since been fixed upstream is not held to it
+# forever.
+TRUST_WINDOW_DAYS = 30
+
+
+def build_trust_index(days: int = TRUST_WINDOW_DAYS) -> dict[str, dict]:
+    """Observed behaviour per "provider/model", for ranking to read.
+
+    Joins the two halves that live in different databases: per-call
+    outcomes (usage.db — how many calls, how many failed) and model-quality
+    friction (conversations.db — how many produced something unusable).
+    Neither alone is enough, which is why this is a join and not a lookup:
+    failure rate misses a model that always answers and always answers
+    badly; friction rate has no denominator without the call count.
+
+    Returns {} on any failure. A ranking job that cannot read live
+    evidence must still produce a ranking from published data — degrading
+    to "no opinion" is correct, refusing to rank is not.
+    """
+    try:
+        from storage.context_store import get_model_friction_sync
+        from storage.usage import get_call_stats
+
+        calls = {g["grp"]: g for g in get_call_stats(days=days, group_by="model")}
+        friction = get_model_friction_sync(days=days)
+    except Exception as e:  # noqa: BLE001
+        print(f"[model_ranking] live trust unavailable, ranking on published data alone: {e}")
+        return {}
+
+    index: dict[str, dict] = {}
+    for key, stats in calls.items():
+        provider, _, model = key.partition("/")
+        fr = friction.get((provider, model), {})
+        quality_events = fr.get("events", 0)
+        total = stats["calls"]
+        entry = {
+            "calls": total,
+            "failure_rate": stats["failure_rate"],
+            "quality_friction_rate": round(quality_events / total, 4) if total else 0.0,
+            "quality_events": quality_events,
+            "wasted_tokens": fr.get("wasted_tokens", 0),
+            "by_kind": fr.get("by_kind", {}),
+        }
+        entry["trusted"], entry["reason"] = _trust_verdict(entry)
+        index[key] = entry
+    return index
+
+
+def _trust_verdict(e: dict) -> tuple[bool, str]:
+    """True = no reason to demote. The default for anything unproven."""
+    if e["calls"] < MIN_CALLS_FOR_TRUST:
+        return True, f"only {e['calls']} calls observed — not enough to judge"
+    if e["failure_rate"] > MAX_FAILURE_RATE:
+        return False, f"{e['failure_rate']:.0%} of {e['calls']} calls failed"
+    if e["quality_friction_rate"] > MAX_QUALITY_FRICTION_RATE:
+        worst = max(e["by_kind"], key=e["by_kind"].get) if e["by_kind"] else "quality friction"
+        return False, f"{e['quality_friction_rate']:.0%} of {e['calls']} calls hit quality friction (mostly {worst})"
+    return True, f"healthy across {e['calls']} calls"
+
+
+def _trust_score(m: dict, trust_index: dict[str, dict] | None) -> int:
+    """1 unless there is real evidence against this model.
+
+    Same shape as _tier_fit below, and for the same reason: an unknown is
+    never punished for being unknown. A model nobody has run yet scores
+    exactly like one that has run well, so live evidence only ever moves
+    a model that has actually earned the demotion.
+    """
+    if not trust_index:
+        return 1
+    entry = trust_index.get(f"{m['provider']}/{m['id']}")
+    return 1 if entry is None or entry["trusted"] else 0
+
+
 def _tier_fit(m: dict, tier: str) -> int:
     """1 if this candidate's size fits the task's tier preference, or if
     its size is simply unknown (extract_param_billions can't find a
@@ -657,15 +772,31 @@ def _tier_fit(m: dict, tier: str) -> int:
     return 1 if (fits_small if tier == "small" else not fits_small) else 0
 
 
-def _score_candidate(m: dict, aa_index: dict, tier: str, quality_dim: str) -> tuple:
-    """Sort key, HIGHER is better. Order: tier fit, then task-specific
-    quality dimension (0 if unmatched — an unranked model doesn't get
-    penalized to the bottom, just treated as a tie at the "no signal"
-    level), then output speed as a cheap reliability/latency tiebreak."""
+def _score_candidate(
+    m: dict, aa_index: dict, tier: str, quality_dim: str,
+    trust_index: dict[str, dict] | None = None,
+) -> tuple:
+    """Sort key, HIGHER is better. Order: tier fit, then observed trust,
+    then task-specific quality dimension (0 if unmatched — an unranked
+    model doesn't get penalized to the bottom, just treated as a tie at
+    the "no signal" level), then output speed as a cheap reliability/
+    latency tiebreak.
+
+    Trust sits ABOVE the benchmark score deliberately. A model with a
+    published intelligence index of 40 that fails a tenth of its real
+    calls or repeats itself on one in twenty is worse, in this
+    deployment, than a model scoring 30 that works — and no benchmark
+    number can know that, because the benchmark was not run here. It sits
+    BELOW tier fit because a model that doesn't fit the task's size
+    profile was never a candidate in the first place.
+
+    trust_index is optional and defaults to no opinion, so every existing
+    caller keeps its exact previous behaviour.
+    """
     bench = aa_index.get(normalize_name(m["id"])) or {}
     quality = bench.get(quality_dim) or 0
     speed = bench.get("output_tokens_per_second") or 0
-    return (_tier_fit(m, tier), quality, speed)
+    return (_tier_fit(m, tier), _trust_score(m, trust_index), quality, speed)
 
 
 def _qualifying_candidates(task: str, catalog: list[dict]) -> tuple[list[dict], dict]:
@@ -691,22 +822,48 @@ def _qualifying_candidates(task: str, catalog: list[dict]) -> tuple[list[dict], 
     return candidates, reqs
 
 
-def rank_for_task(task: str, catalog: list[dict], aa_index: dict) -> dict:
+def rank_for_task(
+    task: str, catalog: list[dict], aa_index: dict,
+    trust_index: dict[str, dict] | None = None,
+) -> dict:
     candidates, reqs = _qualifying_candidates(task, catalog)
     if not candidates:
         return {"primary": None, "fallback": [], "candidate_count": 0}
 
     tier = reqs.get("tier", "large")
     quality_dim = TASK_QUALITY_DIMENSION.get(task, "intelligence_index")
-    ranked = sorted(candidates, key=lambda m: _score_candidate(m, aa_index, tier, quality_dim), reverse=True)
-    return {
+    ranked = sorted(
+        candidates,
+        key=lambda m: _score_candidate(m, aa_index, tier, quality_dim, trust_index),
+        reverse=True,
+    )
+    result = {
         "primary": {"provider": ranked[0]["provider"], "model": ranked[0]["id"]},
         "fallback": [{"provider": m["provider"], "model": m["id"]} for m in ranked[1:3]],
         "candidate_count": len(candidates),
     }
+    # Say WHICH models live evidence pushed down, and why. The snapshot is
+    # human-reviewed before it ever changes routing (see this module's own
+    # docstring and IDEAS.md's Stage 2) — a demotion the reviewer can't
+    # see the reason for is one they can only rubber-stamp, and a ranking
+    # nobody can audit is exactly the "fluent but unsafe" failure this
+    # signal was added to catch.
+    if trust_index:
+        demoted = [
+            {"provider": m["provider"], "model": m["id"],
+             "reason": trust_index[f"{m['provider']}/{m['id']}"]["reason"]}
+            for m in candidates
+            if not _trust_score(m, trust_index)
+        ]
+        if demoted:
+            result["demoted_on_evidence"] = demoted
+    return result
 
 
-def list_candidates(task: str, catalog: list[dict], aa_index: dict) -> list[dict]:
+def list_candidates(
+    task: str, catalog: list[dict], aa_index: dict,
+    trust_index: dict[str, dict] | None = None,
+) -> list[dict]:
     """Like rank_for_task, but returns EVERY qualifying candidate, sorted
     best-first, instead of just a primary + top-2 fallback — for a manual
     model-switch picker (GET /config/models) rather than automatic
@@ -719,11 +876,23 @@ def list_candidates(task: str, catalog: list[dict], aa_index: dict) -> list[dict
     candidates, reqs = _qualifying_candidates(task, catalog)
     tier = reqs.get("tier", "large")
     quality_dim = TASK_QUALITY_DIMENSION.get(task, "intelligence_index")
-    ranked = sorted(candidates, key=lambda m: _score_candidate(m, aa_index, tier, quality_dim), reverse=True)
+    ranked = sorted(
+        candidates,
+        key=lambda m: _score_candidate(m, aa_index, tier, quality_dim, trust_index),
+        reverse=True,
+    )
     for m in ranked:
-        _tier_fit_score, quality, speed = _score_candidate(m, aa_index, tier, quality_dim)
+        _fit, trusted, quality, speed = _score_candidate(m, aa_index, tier, quality_dim, trust_index)
         m["_quality"] = quality
         m["_speed"] = speed
+        # Surfaced rather than silently applied. This is the MANUAL picker
+        # — the user is deliberately overriding automatic routing, and a
+        # model quietly sunk to the bottom of their list with no
+        # explanation is worse than one shown with the reason attached.
+        # They keep the right to pick it anyway.
+        entry = (trust_index or {}).get(f"{m['provider']}/{m['id']}")
+        if entry and not trusted:
+            m["_demoted_reason"] = entry["reason"]
     return ranked
 
 
@@ -753,8 +922,14 @@ def build_ranking_snapshot() -> dict:
     catalog += fetch_gemini_models(config.get_provider_key("gemini"))
 
     aa_index = fetch_aa_benchmarks(os.environ.get("AANALYSIS_API_KEY"))
+    # Read once, not per task — it is the same evidence for all of them,
+    # and it touches two SQLite databases.
+    trust_index = build_trust_index()
 
-    rankings = {task: rank_for_task(task, catalog, aa_index) for task in TASK_REQUIREMENTS}
+    rankings = {
+        task: rank_for_task(task, catalog, aa_index, trust_index)
+        for task in TASK_REQUIREMENTS
+    }
 
     # NOTE: catalog holds every model each fetcher returned, not just free
     # ones — fetch_groq/openrouter/llm7_models only ever append free-
@@ -779,6 +954,12 @@ def build_ranking_snapshot() -> dict:
             for p in ("groq", "openrouter", "llm7", "mistral", "gmi", "cloudflare", "gemini")
         },
         "rankings": rankings,
+        # The evidence the rankings above were scored against, persisted
+        # WITH them. Kept so a reviewer can check a demotion rather than
+        # take it on faith, and so a later snapshot can be compared
+        # against what was actually known at the time rather than against
+        # a live query whose answer has since moved.
+        "trust_index": trust_index,
     }
 
 

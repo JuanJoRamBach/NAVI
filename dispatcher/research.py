@@ -57,7 +57,11 @@ from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, classify_family
 from dispatcher.slugify import slugify
 from providers.base import ChatMessage, ProviderError
-from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
+from providers.registry import (
+    ProviderNotConfigured, get_dispatcher_role, get_provider, role_name_for_context,
+)
+from storage.context_store import record_friction
+from storage.usage import set_call_context
 from storage.conversations import append_message, get_messages, get_task_state, set_task_state
 from storage.filen import StorageError, file_download_url, save_bytes
 from tools.registry import schemas_for
@@ -157,13 +161,30 @@ async def run_research_chat(conversation_id: str, text: str) -> dict:
             await set_task_state(conversation_id, {"stage": STAGE_PLANNING, "plan": None})
             stage = STAGE_PLANNING
         elif t := text.strip():
+            # THE CHEAPEST LABELLED SIGNAL IN THE PRODUCT. The user was
+            # shown a drafted plan and did not accept it — which is a
+            # human telling us, deterministically and for free, that the
+            # draft was wrong. No classifier, no LLM judgment, no
+            # heuristic: the checkpoint NAVI already built produces
+            # ground-truth labels as a side effect of being used, and
+            # until now every one of them was discarded at the click.
             if t == PLAN_CONFIRM_OPTIONS[2] or t.lower().startswith("cancel"):
+                await record_friction(
+                    "checkpoint_rejected", severity=3, conversation_id=conversation_id,
+                    detail="research plan cancelled outright",
+                )
                 await set_task_state(conversation_id, {"stage": STAGE_PLANNING, "plan": None})
                 reply = "Okay, cancelled. Let me know what you'd like to research and we'll start fresh."
                 await append_message(conversation_id, "navi", reply)
                 return {"text": reply, "provider": None, "model": None}
             # "Let me adjust something" or any other written feedback —
             # back to clarifying, with this message as the next input.
+            # Lower severity than an outright cancel: the goal survived,
+            # only the draft of it missed.
+            await record_friction(
+                "checkpoint_revised", severity=2, conversation_id=conversation_id,
+                detail=f"research plan sent back: {t[:200]}",
+            )
             await set_task_state(conversation_id, {"stage": STAGE_PLANNING, "plan": task_state.get("plan")})
             stage = STAGE_PLANNING
 
@@ -187,6 +208,10 @@ async def _run_planning_turn(conversation_id: str) -> dict:
         history_messages = [ChatMessage(role="user", content="")]
     history_messages[-1].content = f"{history_messages[-1].content}\n\n[Current UTC time: {datetime.now(timezone.utc).isoformat()}]"
 
+    set_call_context(
+        role=role_name_for_context("chat"), mode="research", tier="chat",
+        conversation_id=conversation_id,
+    )
     try:
         role = get_dispatcher_role(context="chat")
     except ProviderNotConfigured as e:
@@ -197,6 +222,7 @@ async def _run_planning_turn(conversation_id: str) -> dict:
     attempts = config.get_attempts([{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", []))
     last_error = None
     for i, attempt in enumerate(attempts):
+        set_call_context(attempt=i, provider=attempt["provider"], model=attempt["model"])
         try:
             provider = get_provider(attempt["provider"])
         except Exception as e:
@@ -302,9 +328,14 @@ async def _run_execution(conversation_id: str, plan: dict) -> dict:
         await append_message(conversation_id, "navi", error_text)
         return {"text": error_text, "provider": None, "model": None}
 
+    set_call_context(
+        role=role_name_for_context("chat_serious"), mode="research_execute",
+        tier="chat_serious", conversation_id=conversation_id,
+    )
     attempts = config.get_attempts([{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", []))
     last_error = None
-    for attempt in attempts:
+    for i, attempt in enumerate(attempts):
+        set_call_context(attempt=i, provider=attempt["provider"], model=attempt["model"])
         try:
             provider = get_provider(attempt["provider"])
         except Exception as e:

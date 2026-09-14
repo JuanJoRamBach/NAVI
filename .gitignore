@@ -88,4 +88,21 @@ llm7_models.json
 # jobs/model_ranking.py's own generated output — a live snapshot
 # regenerated on every run, not app data, goes stale immediately.
 model_ranking_snapshot.json
-aa_benchmarks_cache.jsonbenchmarks/
+aa_benchmarks_cache.json
+
+# jobs/benchmark.py's own result files — one per run, timestamped. Same
+# reasoning as the snapshot above. NOTE: this line and the one above it
+# were previously joined into a single broken pattern
+# ("aa_benchmarks_cache.jsonbenchmarks/") by a missing newline, so
+# NEITHER was ignored — which is how the existing bench-*.json files came
+# to be committed. Separating them stops NEW ones being offered; the ones
+# already tracked stay tracked until someone decides whether those
+# measurements are worth keeping in history.
+benchmarks/
+
+# The "what is NAVI" handoff written for a separate chat exploring a
+# game-dev/designer harness (2026-09-14) — cross-project continuity
+# notes, same reasoning as IDEAS.md and MARKET_RESEARCH.md above: written
+# for a conversation, not for this repo's documentation.
+HANDOFF_WHAT_IS_NAVI.md
+

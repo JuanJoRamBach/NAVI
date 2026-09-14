@@ -31,6 +31,10 @@ from dispatcher.executor import run_tool_loop
 from providers.base import ChatMessage, ProviderError
 from providers.registry import get_provider
 from storage.sources import create_batch, finish_batch
+# set_call_context, not the block form: this module runs its batch on its
+# own worker thread, and a thread starts with a fresh context — so there
+# is no caller's tag here to leak back into.
+from storage.usage import set_call_context
 from tools.registry import schemas_for
 
 _SOURCE_FETCH_TOOLS = ["web_search", "fetch_page", "save_source"]
@@ -75,10 +79,11 @@ def run_source_fetch_batch(terms: list[str], trusted_sites: list[str]) -> str:
     term_list = "\n".join(f"- {t}" for t in terms)
     last_error = None
 
-    for attempt in attempts:
+    for i, attempt in enumerate(attempts):
         model = attempt.get("model")
         if not model:
             continue
+        set_call_context(role="source_fetch", mode="sources", attempt=i, provider=attempt["provider"], model=model)
         try:
             provider = get_provider(attempt["provider"])
         except Exception as e:

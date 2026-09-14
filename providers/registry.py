@@ -85,6 +85,19 @@ _ROLE_NAME_FOR_CONTEXT = {
     "chat_serious": "normal_chat_serious",
 }
 
+def role_name_for_context(context: str) -> str:
+    """The config role a context key resolves to — "chat_serious" ->
+    "normal_chat_serious".
+
+    Exists so per-call usage rows can be tagged with the same string
+    config/store.py's `roles` is keyed by, rather than the caller-facing
+    context alias. That makes the recorded data joinable straight onto
+    the routing config it came from, which is what lets a future reader
+    (jobs/model_ranking.py) say "this ROLE's primary keeps failing"
+    instead of "some chat somewhere did"."""
+    return _ROLE_NAME_FOR_CONTEXT.get(context, context)
+
+
 # The escalation ladder, in order. dispatcher/chat.py walks this when a
 # model calls request_stronger_model; the last entry is the ceiling.
 CHAT_TIERS = ("chat", "chat_exploratory", "chat_serious")

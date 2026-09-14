@@ -57,6 +57,7 @@ Two real gaps closed here:
    reference model is a data addition, not a schema migration.
 """
 
+import contextvars
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -116,7 +117,37 @@ CREATE TABLE IF NOT EXISTS tool_calls_daily (
     calls INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (tool_name, day_utc)
 );
+CREATE TABLE IF NOT EXISTS usage_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    day_utc TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    role TEXT,
+    mode TEXT,
+    tier TEXT,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    ok INTEGER NOT NULL DEFAULT 1,
+    error_kind TEXT,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    conversation_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usage_calls_day ON usage_calls(day_utc);
+CREATE INDEX IF NOT EXISTS idx_usage_calls_role ON usage_calls(role, day_utc);
+CREATE INDEX IF NOT EXISTS idx_usage_calls_model ON usage_calls(provider, model, day_utc);
 """
+
+# How long a per-call row is kept. usage_daily is an aggregate and lives
+# forever at a few rows a day; usage_calls is one row PER CALL, so it has
+# to be bounded or it grows without limit for a table whose whole purpose
+# is recent-window rates and percentiles. 90 days is long enough to see a
+# seasonal pattern and to compare a routing change against the month
+# before it, and short enough that the table stays small.
+CALL_RETENTION_DAYS = 90
 
 _initialized = False
 
@@ -136,6 +167,20 @@ def _connect():
             for col in ("prompt_tokens", "completion_tokens"):
                 if col not in cols:
                     conn.execute(f"ALTER TABLE usage_daily ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+            # Prune usage_calls once per process rather than on every
+            # write. A DELETE on every insert would make the hot path pay
+            # for housekeeping it doesn't need — the table is read in
+            # recent-window queries, so a row a few hours past retention
+            # costs nothing, and this process restarts often enough in
+            # practice (see IDEAS.md's scheduler incident) that once per
+            # start is a real cadence, not a theoretical one.
+            try:
+                conn.execute(
+                    "DELETE FROM usage_calls WHERE created_at < ?",
+                    (time.time() - CALL_RETENTION_DAYS * 86_400,),
+                )
+            except sqlite3.Error:
+                pass  # table may not exist yet on the very first run
             conn.commit()
             _initialized = True
         yield conn
@@ -191,6 +236,205 @@ def record_usage(
                     (provider, model, day, ref, usd),
                 )
         conn.commit()
+
+
+# ---- Per-call rows, and the ambient context that tags them ----
+#
+# WHY A CONTEXTVAR AND NOT AN ARGUMENT. Who is calling (which role, which
+# mode, which capability tier) is known high up — in run_stored_mode_chat,
+# in compact_conversation, in a workflow node — and consumed at the very
+# bottom, in Provider.chat(). Threading it through every frame in between
+# would mean touching ~20 call sites across 12 files AND every future one,
+# and the codebase already has a rule about exactly this shape of problem:
+# Provider.chat() is concrete rather than abstract specifically so request
+# counting "can't be reimplemented per-transport without someone
+# eventually forgetting to" (providers/base.py's own docstring). Same
+# reasoning applies to tagging. An untagged call still records a row — it
+# just lands with NULL role/mode, which is visible in the data as a gap
+# rather than silently absent.
+#
+# asyncio.to_thread propagates the caller's context into the worker
+# thread (it copies the current contextvars.Context), which is the whole
+# reason this works: every real provider call in NAVI is made through
+# to_thread from an async dispatcher, and the tool loop's continuation
+# calls inherit the same context without being tagged again.
+_CALL_CONTEXT: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "navi_call_context", default=None
+)
+
+
+@contextmanager
+def call_context(**fields):
+    """Tags every provider call made inside this block.
+
+    Nests: inner fields win, outer fields survive, so a dispatcher can set
+    role/mode/tier once around a fallback loop and each iteration can add
+    its own `attempt=i` without repeating the rest. None values are
+    dropped rather than overwriting an outer value with nothing.
+
+    Recognized fields: role, mode, tier, attempt, conversation_id.
+    Anything else is accepted and ignored by record_call — deliberately
+    permissive, so adding a new dimension later means changing the schema
+    and the reader, not auditing every caller.
+    """
+    parent = _CALL_CONTEXT.get() or {}
+    merged = {**parent, **{k: v for k, v in fields.items() if v is not None}}
+    token = _CALL_CONTEXT.set(merged)
+    try:
+        yield merged
+    finally:
+        _CALL_CONTEXT.reset(token)
+
+
+def set_call_context(**fields) -> None:
+    """Tags every subsequent provider call in THIS task, with no block.
+
+    The `with` form above needs the calls it covers to sit inside it.
+    NAVI's dispatchers are long functions whose provider call sits deep
+    in a fallback loop, and wrapping those bodies would mean re-indenting
+    a few hundred lines of working code to record a label — a diff whose
+    risk is out of all proportion to what it buys.
+
+    Safe because a contextvar set inside a coroutine is scoped to that
+    coroutine's TASK: asyncio copies the context when a Task is created,
+    so one request cannot leak its tags into another, and asyncio.to_thread
+    copies it again into the worker thread that makes the actual call.
+    Within a single request, carrying forward IS the intent — a tag set
+    before a fallback loop should still apply on the third attempt.
+
+    Use `call_context` instead when the tag genuinely must stop at the end
+    of a block — a job that makes calls for several different roles in
+    one process, say.
+    """
+    parent = _CALL_CONTEXT.get() or {}
+    _CALL_CONTEXT.set({**parent, **{k: v for k, v in fields.items() if v is not None}})
+
+
+def current_call_context() -> dict:
+    """What the ambient tag is right now. Empty dict when untagged."""
+    return dict(_CALL_CONTEXT.get() or {})
+
+
+def record_call(
+    provider: str, model: str, *, ok: bool = True,
+    prompt_tokens: int = 0, completion_tokens: int = 0,
+    cached_tokens: int = 0, total_tokens: int = 0,
+    latency_ms: int = 0, error_kind: str | None = None,
+    context: dict | None = None,
+) -> None:
+    """One row per real provider call, attributed to whoever asked for it.
+
+    This is the denominator usage_daily can't provide. That table is
+    aggregated by (provider, model, day) — enough to answer "how many
+    tokens today", useless for "how often does the serious tier have to
+    fall back", because it knows nothing about roles, modes or tiers and
+    keeps no per-call granularity to compute a rate or a percentile from.
+
+    FAILED CALLS ARE RECORDED TOO, and that is the point rather than a
+    nicety: a table of successes only would make every rate wrong in the
+    flattering direction. `ok=0` rows are what make "3 failures out of
+    412 calls" expressible at all.
+
+    Never raises — usage tracking must never break a real chat request,
+    the same rule record_usage and tools/registry.py's per-tool counter
+    already follow.
+    """
+    ctx = context if context is not None else current_call_context()
+    try:
+        with _connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO usage_calls (
+                    created_at, day_utc, provider, model, role, mode, tier, attempt,
+                    ok, error_kind, prompt_tokens, completion_tokens, cached_tokens,
+                    total_tokens, latency_ms, conversation_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    time.time(), _today_utc(), provider, model,
+                    ctx.get("role"), ctx.get("mode"), ctx.get("tier"),
+                    int(ctx.get("attempt") or 0),
+                    1 if ok else 0, error_kind,
+                    prompt_tokens, completion_tokens, cached_tokens, total_tokens,
+                    latency_ms, ctx.get("conversation_id"),
+                ),
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[usage] per-call recording failed (non-fatal): {e}")
+
+
+def get_call_stats(days: int = 7, group_by: str = "role") -> list[dict]:
+    """Rates and latency percentiles per group over the last `days`.
+
+    `group_by` is one of "role", "mode", "tier", or "model" (provider+
+    model together). Returns, per group: calls, failures, fallback_calls
+    (attempt > 0), failure_rate, fallback_rate, tokens, and p50/p95
+    latency in ms.
+
+    Rates, not counts, deliberately. A count answers "how much happened",
+    which is a function of traffic; a rate answers "how often does this go
+    wrong", which is the only form of the number that can be compared
+    between two models with very different volumes — and comparing models
+    is what this data exists to eventually do.
+    """
+    columns = {
+        "role": "COALESCE(role, '(untagged)')",
+        "mode": "COALESCE(mode, '(untagged)')",
+        "tier": "COALESCE(tier, '(none)')",
+        "model": "provider || '/' || model",
+    }
+    if group_by not in columns:
+        raise ValueError(f"group_by must be one of {sorted(columns)}")
+    expr = columns[group_by]
+    since = time.time() - days * 86_400
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT {expr} AS grp,
+                   COUNT(*) AS calls,
+                   SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failures,
+                   SUM(CASE WHEN attempt > 0 THEN 1 ELSE 0 END) AS fallback_calls,
+                   COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                   COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                   COALESCE(SUM(cached_tokens), 0) AS cached_tokens
+            FROM usage_calls WHERE created_at >= ?
+            GROUP BY grp ORDER BY calls DESC
+            """,
+            (since,),
+        ).fetchall()
+        out = []
+        for row in rows:
+            d = dict(row)
+            # Percentiles computed per group in Python rather than in SQL:
+            # SQLite has no PERCENTILE_CONT, and the alternatives (a
+            # window function over a self-join, or NTILE) are markedly
+            # harder to read for a table this size. The latency list is
+            # bounded by one group's calls in the window, not the whole
+            # table.
+            latencies = [
+                r[0] for r in conn.execute(
+                    f"SELECT latency_ms FROM usage_calls "
+                    f"WHERE created_at >= ? AND {expr} = ? AND ok = 1 AND latency_ms > 0 "
+                    f"ORDER BY latency_ms",
+                    (since, d["grp"]),
+                ).fetchall()
+            ]
+            d["p50_latency_ms"] = _percentile(latencies, 0.50)
+            d["p95_latency_ms"] = _percentile(latencies, 0.95)
+            d["failure_rate"] = round(d["failures"] / d["calls"], 4) if d["calls"] else 0.0
+            d["fallback_rate"] = round(d["fallback_calls"] / d["calls"], 4) if d["calls"] else 0.0
+            out.append(d)
+        return out
+
+
+def _percentile(sorted_values: list[int], q: float) -> int:
+    """Nearest-rank percentile of an already-sorted list. 0 when empty."""
+    if not sorted_values:
+        return 0
+    idx = max(0, min(len(sorted_values) - 1, int(round(q * (len(sorted_values) - 1)))))
+    return int(sorted_values[idx])
 
 
 def get_usage_today(provider: str | None = None) -> list[dict]:

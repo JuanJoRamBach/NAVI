@@ -34,7 +34,10 @@ from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.executor import strip_reasoning_tags
 from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, classify_family
 from providers.base import ChatMessage, ProviderError
-from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
+from providers.registry import (
+    ProviderNotConfigured, get_dispatcher_role, get_provider, role_name_for_context,
+)
+from storage.usage import set_call_context
 from storage.conversations import append_message, get_messages, get_task_state
 from tools.devslate_tools import LOCAL_TOOL_NAMES, TOOL_SCHEMAS, dispatch_local, format_task_state_for_prompt
 
@@ -109,6 +112,10 @@ async def run_devslate_turn(conversation_id: str, user_text: str, relay: ToolRel
             continue
         history_messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
 
+    set_call_context(
+        role=role_name_for_context("devslate"), mode="devslate",
+        conversation_id=conversation_id,
+    )
     try:
         role = get_dispatcher_role(context="devslate")
     except ProviderNotConfigured as e:
@@ -120,6 +127,7 @@ async def run_devslate_turn(conversation_id: str, user_text: str, relay: ToolRel
     last_error = None
 
     for i, attempt in enumerate(attempts):
+        set_call_context(attempt=i, provider=attempt["provider"], model=attempt["model"])
         try:
             provider = get_provider(attempt["provider"])
         except Exception as e:

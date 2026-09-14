@@ -29,7 +29,6 @@ from config.store import config
 from dispatcher.compaction import CONTEXT_TRIGGER_TOKENS, compact_context
 from dispatcher.executor import (
     CITATION_STYLE_PROMPT,
-    MAX_TOOL_ITERATIONS,
     _extract_tool_results,
     _parse_tool_args,
     run_tool_loop,
@@ -42,11 +41,14 @@ from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, classify_family
 from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ProviderError
-from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider, next_chat_tier
+from providers.registry import (
+    ProviderNotConfigured, get_dispatcher_role, get_provider, next_chat_tier, role_name_for_context,
+)
 from storage.context_store import (
     SOURCE_ASSISTANT, SOURCE_BRANCH_RESULT, append_entry, build_context_block,
-    estimate_tokens, get_friction_since, record_friction,
+    estimate_tokens, get_friction_since, record_friction, record_friction_sync,
 )
+from storage.usage import current_call_context, set_call_context
 from storage.conversations import (
     append_message, get_conversation, get_messages, get_task_state, set_task_state,
 )
@@ -82,7 +84,25 @@ def _collapse_repeated_paragraphs(text: str) -> str:
                 break
             seen.add(normalized)
         kept.append(p)
-    return "\n\n".join(kept)
+    collapsed = "\n\n".join(kept)
+    if collapsed != text:
+        # The safety net actually tripped, which is a real quality signal
+        # about the model that produced this — logged here, inside the
+        # function, rather than at one of the three call sites that used
+        # to be responsible for noticing. Only one of the three ever was,
+        # which is the same hand-placement problem the whole friction
+        # move is about: put the record where the event is.
+        ctx = current_call_context()
+        record_friction_sync(
+            "repetition_loop", severity=2,
+            conversation_id=ctx.get("conversation_id"),
+            detail=f"cut {len(text) - len(collapsed)} chars of repeat",
+            # Attributed to whichever model actually answered this turn —
+            # the attempt loop puts it on the ambient context, so this
+            # stays correct on a fallback without being passed down.
+            provider=ctx.get("provider"), model=ctx.get("model"),
+        )
+    return collapsed
 
 
 # A ceiling on how much replayed conversation rides along each turn.
@@ -271,6 +291,7 @@ def run_mode_chat(mode: str, text: str) -> str:
     # (stays "chat") so this doesn't silently change normal_chat/research/
     # brainstorm's existing behavior.
     role_context = "agent_work" if mode == "agent_work" else "chat"
+    set_call_context(role=role_name_for_context(role_context), mode=mode, tier=role_context)
     try:
         role = get_dispatcher_role(context=role_context)
     except ProviderNotConfigured as e:
@@ -288,6 +309,7 @@ def run_mode_chat(mode: str, text: str) -> str:
     attempts = config.get_attempts([{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", []))
     last_error = None
     for i, attempt in enumerate(attempts):
+        set_call_context(attempt=i, provider=attempt["provider"], model=attempt["model"])
         try:
             provider = get_provider(attempt["provider"])
         except Exception as e:
@@ -392,6 +414,16 @@ async def _settle_pending_branch_completion(conversation_id: str, text: str) -> 
     await set_task_state(conversation_id, None)
 
     if not _is_branch_accept(text):
+        # The branch claimed it was finished and the user did not agree.
+        # Same free ground-truth label as research's plan checkpoint: the
+        # model made a judgement, a human overruled it, and the disagreement
+        # is recorded rather than thrown away. Deliberately NOT severity 3
+        # — "not yet" on a completion claim is ordinary, where a cancelled
+        # research plan means the whole draft missed.
+        await record_friction(
+            "completion_rejected", severity=2, conversation_id=conversation_id,
+            detail=f"branch proposed done, user continued: {text.strip()[:200]}",
+        )
         return None  # declined, or moved on — either way, keep working
 
     conversation = await get_conversation(conversation_id)
@@ -470,6 +502,14 @@ async def run_stored_mode_chat(
     history = await get_messages(conversation_id, limit=RECENT_MESSAGE_WINDOW)
 
     role_context = "agent_work" if mode == "agent_work" else tier
+    # Tag every provider call this turn makes — including the tool loop's
+    # continuation calls, which inherit it through asyncio.to_thread
+    # without being tagged again. Set before the role lookup so a
+    # ProviderNotConfigured path is still attributable.
+    set_call_context(
+        role=role_name_for_context(role_context), mode=mode, tier=tier,
+        conversation_id=conversation_id,
+    )
     try:
         role = get_dispatcher_role(context=role_context)
     except ProviderNotConfigured as e:
@@ -650,6 +690,11 @@ async def run_stored_mode_chat(
     last_error = None
     for i, attempt in enumerate(attempts):
         print(f"[run_stored_mode_chat] attempt {i}: {attempt['provider']}/{attempt['model']}")
+        # attempt > 0 IS the fallback signal, recorded as data rather than
+        # narrated. The existing fallback_used friction event is written by
+        # hand in one branch further down; this is the same fact, available
+        # for every call on every role without anyone remembering to log it.
+        set_call_context(attempt=i, provider=attempt["provider"], model=attempt["model"])
         try:
             provider = get_provider(attempt["provider"])
         except Exception as e:
@@ -729,6 +774,7 @@ async def run_stored_mode_chat(
                 await record_friction(
                     "escalation_at_ceiling", severity=3, conversation_id=conversation_id,
                     detail=f"{tier}: {reason[:200]}",
+                    provider=attempt["provider"], model=attempt["model"],
                 )
                 response.tool_calls = [tc for tc in response.tool_calls if tc.name != "request_stronger_model"]
 
@@ -810,17 +856,11 @@ async def run_stored_mode_chat(
                     f"text={(response.text or '')[:200]!r} tool_calls={[tc.name for tc in response.tool_calls]} "
                     f"created_workflow_id={created_workflow_id}"
                 )
-                if iterations >= MAX_TOOL_ITERATIONS and response.tool_calls:
-                    # Hit the ceiling while STILL asking for more tools — the
-                    # model never reached an answer on its own. Distinct from
-                    # merely using every iteration and then replying, which is
-                    # fine. Recorded here rather than inside run_tool_loop
-                    # (that function is sync — see its own note).
-                    await record_friction(
-                        "tool_loop_exhausted", severity=2, conversation_id=conversation_id,
-                        detail=f"{attempt['provider']}/{attempt['model']} still requesting "
-                               f"{[tc.name for tc in response.tool_calls]} at limit",
-                    )
+                # tool_loop_exhausted used to be recorded here, because
+                # run_tool_loop is sync and the friction writer was async
+                # only. It is recorded inside run_tool_loop itself now
+                # (2026-09-14) — which is what makes it fire for that
+                # function's other four callers too, not just this one.
                 if iterations > 0 and not response.text and not response.tool_calls:
                     # run_tool_loop actually executed a real tool call here
                     # (e.g. create_workflow persisted a row, send_to_telegram
@@ -875,18 +915,9 @@ async def run_stored_mode_chat(
                 reply = _extract_tool_results(sent_messages) or "(empty reply)"
             else:
                 reply = strip_reasoning_tags(response.text) or "(empty reply)"
-            collapsed = _collapse_repeated_paragraphs(reply)
-            if collapsed != reply:
-                # The repetition-loop safety net actually tripped — a real
-                # quality signal that was previously just silently patched
-                # over. Logged as friction now (2026-09-13) rather than
-                # discarded; see storage/context_store.py on why all these
-                # signals land in one shared table.
-                await record_friction(
-                    "repetition_loop", severity=2, conversation_id=conversation_id,
-                    detail=f"{attempt['provider']}/{attempt['model']}",
-                )
-            reply = collapsed
+            # _collapse_repeated_paragraphs records the repetition_loop
+            # signal itself now — see its own note.
+            reply = _collapse_repeated_paragraphs(reply)
             if i > 0:
                 reply += f"\n\n⚡ (primary was unavailable, answered via {attempt['provider']}/{attempt['model']} instead)"
                 await record_friction(
@@ -955,6 +986,10 @@ async def run_agent_vault_chat(agent: dict, conversation_id: str, text: str) -> 
         messages.append(ChatMessage(role="assistant" if m["role"] == "navi" else m["role"], content=m["content"]))
     messages[-1].content = f"{messages[-1].content}\n\n[Current UTC time: {datetime.now(timezone.utc).isoformat()}]"
 
+    set_call_context(
+        role=role_name_for_context("agent_work"), mode="agent_vault",
+        conversation_id=conversation_id,
+    )
     try:
         role = get_dispatcher_role(context="agent_work")
     except ProviderNotConfigured as e:
@@ -975,6 +1010,7 @@ async def run_agent_vault_chat(agent: dict, conversation_id: str, text: str) -> 
     attempts = config.get_attempts([primary] + role.get("fallback", []))
     last_error = None
     for i, attempt in enumerate(attempts):
+        set_call_context(attempt=i, provider=attempt["provider"], model=attempt["model"])
         try:
             provider = get_provider(attempt["provider"])
         except Exception as e:

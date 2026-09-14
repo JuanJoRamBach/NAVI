@@ -37,7 +37,10 @@ from typing import Callable
 from dispatcher.executor import _extract_tool_results, _parse_tool_args, run_tool_loop
 from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ChatResponse, ProviderError
-from providers.registry import ProviderNotConfigured, get_dispatcher_role, get_provider
+from providers.registry import (
+    ProviderNotConfigured, get_dispatcher_role, get_provider, role_name_for_context,
+)
+from storage.usage import set_call_context
 from storage.agent_work import (
     complete_step, create_step, create_run, due_workflows, get_run, get_run_graph_snapshot,
     get_run_steps, get_workflow, get_workflow_by_webhook_token, list_runs, set_step_input,
@@ -227,13 +230,14 @@ def _call_for_node(
 
     attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
     last_error = None
-    for attempt in attempts:
+    for i, attempt in enumerate(attempts):
         try:
             provider = get_provider(attempt["provider"])
         except Exception as e:
             last_error = str(e)
             continue
         try:
+            set_call_context(role=role_name_for_context("agent_work"), mode="agent_work", attempt=i, provider=attempt["provider"], model=attempt["model"])
             response = provider.chat(model=attempt["model"], messages=messages, tools=tools, tool_choice=tool_choice)
         except ProviderError as e:
             last_error = str(e)
@@ -1410,13 +1414,14 @@ def resolve_schedule(description: str) -> dict:
 
     attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
     last_error = None
-    for attempt in attempts:
+    for i, attempt in enumerate(attempts):
         try:
             provider = get_provider(attempt["provider"])
         except Exception as e:
             last_error = str(e)
             continue
         try:
+            set_call_context(role=role_name_for_context("agent_work"), mode="schedule_resolve", attempt=i, provider=attempt["provider"], model=attempt["model"])
             response = provider.chat(
                 model=attempt["model"], messages=messages,
                 tools=[RESOLVE_SCHEDULE_TOOL_SCHEMA], tool_choice=RESOLVE_SCHEDULE_TOOL_CHOICE,

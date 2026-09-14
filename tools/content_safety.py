@@ -53,6 +53,7 @@ produces a genuinely borderline score.
 
 from providers.base import ChatMessage
 from providers.registry import get_provider
+from storage.usage import call_context
 
 # 86M primary, 22M fallback — verified live (2026-09-12) to return the
 # identical output shape (a raw probability string) and comparably
@@ -146,10 +147,15 @@ def _run_prompt_guard(model: str, text: str) -> str:
     budget = _MAX_SCREEN_TOKENS
     for attempt in range(2):
         try:
-            response = provider.chat(
-                model=model,
-                messages=[ChatMessage(role="user", content=_truncate_for_screening(text, budget))],
-            )
+            # Its own role, not the caller's: screening fires on every
+            # fetch regardless of who asked, and charging it to the
+            # calling conversation would make a chat that fetched three
+            # pages look like it made three extra model calls of its own.
+            with call_context(role="content_screening", attempt=attempt):
+                response = provider.chat(
+                    model=model,
+                    messages=[ChatMessage(role="user", content=_truncate_for_screening(text, budget))],
+                )
             return (response.text or "").strip()
         except Exception as e:  # noqa: BLE001 - re-raised below if the retry also fails
             if attempt == 0 and "context_length" in str(e).lower():

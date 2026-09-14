@@ -818,6 +818,58 @@ def usage_tools(days: int = 30, limit: int = 10) -> dict:
     return {"days": days, "most_used": get_most_used_tools(days=days, limit=limit)}
 
 
+@app.get("/usage/calls")
+def usage_calls(days: int = 7, group_by: str = "role") -> dict:
+    """Per-call rates, grouped by role, mode, tier or model (2026-09-14).
+
+    The denominator /usage/counters can't provide. That route reports
+    daily totals per (provider, model) — enough for "how many tokens
+    today", useless for "how often does this role have to fall back",
+    which needs to know who asked and how many calls there were in total.
+
+    Returns rates rather than raw counts on purpose: a count is a
+    function of traffic, and comparing two models by count says more
+    about which one gets used than which one works. See
+    storage/usage.py's get_call_stats."""
+    from storage.usage import get_call_stats
+
+    try:
+        rows = get_call_stats(days=days, group_by=group_by)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"days": days, "group_by": group_by, "groups": rows}
+
+
+@app.get("/usage/friction")
+async def usage_friction(days: int = 7) -> dict:
+    """What went wrong lately, what it cost, and how often — per call.
+
+    The friction log existed since 2026-09-13 and nothing read it, which
+    is how it stayed empty and unnoticed: only Normal Chat wrote to it,
+    only on catastrophic outcomes, and no surface would have shown a row
+    if one had appeared. This is the reader.
+
+    `per_1k_calls` is the number that matters. A raw count of, say, nine
+    timeouts is unreadable without knowing whether it happened across a
+    hundred calls or a hundred thousand — and the denominator lives in a
+    different database (usage.db's per-call rows), which is why this
+    route joins the two rather than either store doing it alone."""
+    from storage.context_store import get_friction_summary
+    from storage.usage import get_call_stats
+
+    kinds = await get_friction_summary(days=days)
+    total_calls = sum(g["calls"] for g in get_call_stats(days=days, group_by="role"))
+    for k in kinds:
+        k["per_1k_calls"] = round(1000 * k["events"] / total_calls, 2) if total_calls else None
+    return {
+        "days": days,
+        "total_calls": total_calls,
+        "total_events": sum(k["events"] for k in kinds),
+        "total_wasted_tokens": sum(k["wasted_tokens"] for k in kinds),
+        "kinds": kinds,
+    }
+
+
 @app.get("/usage/mistral")
 def usage_mistral() -> dict:
     """Separate route, fetched on-demand when the panel's Mistral card is
@@ -1312,7 +1364,14 @@ def config_models(task: str = Query(...)) -> dict:
         return {"task": task, "current": current, "candidates": [current] if current else [], "fetched_at": None}
 
     aa_index = fetch_aa_benchmarks(None)  # cache-only — no live fetch from a GET handler
-    candidates = list_candidates(task, snapshot.get("catalog", []), aa_index)
+    # The trust index PERSISTED in the snapshot, not a fresh read: the
+    # candidates are being ranked against the same catalog the snapshot
+    # froze, so scoring them against newer evidence than that catalog was
+    # ranked with would make this list disagree with the snapshot's own
+    # rankings for no visible reason.
+    candidates = list_candidates(
+        task, snapshot.get("catalog", []), aa_index, snapshot.get("trust_index"),
+    )
     return {
         "task": task,
         # Real, honest freshness signal (2026-09-11) — lets anyone check
@@ -1328,7 +1387,13 @@ def config_models(task: str = Query(...)) -> dict:
         # (no signal, not "bad") — the frontend should treat 0 as
         # "unranked," not the lowest real score.
         "candidates": [
-            {"provider": c["provider"], "model": c["id"], "context_length": c.get("context_length"), "quality": c.get("_quality", 0), "speed": c.get("_speed", 0)}
+            {"provider": c["provider"], "model": c["id"], "context_length": c.get("context_length"),
+             "quality": c.get("_quality", 0), "speed": c.get("_speed", 0),
+             # Present only on a model live evidence pushed down, and it
+             # carries the reason — the picker can show why rather than
+             # just silently listing it last. Absent means "nothing
+             # against it", which includes "never tried".
+             "demoted_reason": c.get("_demoted_reason")}
             for c in candidates
         ],
     }

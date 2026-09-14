@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from providers.base import ChatMessage, Provider
+from storage.usage import call_context
 
 MODEL = "openai/gpt-oss-safeguard-20b"
 POLICY_PATH = Path(__file__).resolve().parent / "policies" / "TOPIC_CONTINUITY.md"
@@ -54,11 +55,17 @@ def classify(
         f"Established topics:\n{build_topics_block(topics)}\n\n"
         f"New message to classify:\n{message}"
     )
-    response = provider.chat(
-        model=model,
-        messages=[
-            ChatMessage(role="system", content=policy),
-            ChatMessage(role="user", content=prompt),
-        ],
-    )
+    # Tagged as its own role so classification calls never get counted in
+    # whichever conversation happened to trigger them — this is an
+    # auxiliary judgment, not part of that turn's answer, and blending the
+    # two would inflate the caller's token and latency numbers with work
+    # it didn't ask for.
+    with call_context(role="topic_classifier"):
+        response = provider.chat(
+            model=model,
+            messages=[
+                ChatMessage(role="system", content=policy),
+                ChatMessage(role="user", content=prompt),
+            ],
+        )
     return (response.text or "").strip()

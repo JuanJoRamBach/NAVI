@@ -34,6 +34,7 @@ from storage.context_store import (
     retire_entries,
 )
 from storage.conversations import get_messages
+from storage.usage import call_context
 
 # The ceiling that triggers a compaction pass, and what a pass aims to
 # leave behind. Two numbers, not one, on purpose: if the trigger and the
@@ -304,7 +305,7 @@ async def compact_conversation(messages: list[ChatMessage], instruction: str) ->
     # timeout reached a user as "couldn't distil this page into a
     # document", with nothing anywhere saying why. An auxiliary call being
     # allowed to fail is not a reason for the failure to be invisible.
-    for attempt in attempts:
+    for i, attempt in enumerate(attempts):
         label = f"{attempt['provider']}/{attempt['model']}"
         try:
             provider = get_provider(attempt["provider"])
@@ -312,7 +313,16 @@ async def compact_conversation(messages: list[ChatMessage], instruction: str) ->
             print(f"[compact_conversation] {label}: provider unavailable — {e}")
             continue
         try:
-            response = await asyncio.to_thread(provider.chat, model=attempt["model"], messages=call_messages)
+            # Block form, not set_call_context: this function is called
+            # from inside other roles' turns (a branch spec mid-chat, a
+            # research plan mid-research), so the tag has to END with the
+            # call. Leaving context_synthesis set would mislabel every
+            # subsequent call the caller makes as this role's. The
+            # caller's own `mode` survives — call_context merges rather
+            # than replaces — so a synthesis call still records which
+            # surface asked for it.
+            with call_context(role="context_synthesis", attempt=i):
+                response = await asyncio.to_thread(provider.chat, model=attempt["model"], messages=call_messages)
         except ProviderError as e:
             if e.is_rate_limit:
                 config.mark_rate_limited(attempt["provider"], attempt["model"])

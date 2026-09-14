@@ -27,7 +27,9 @@ from dispatcher.reminders import add_reminder
 from dispatcher.slugify import assign_slugs
 from providers.base import ChatMessage, ChatResponse, Provider, ProviderError
 from providers.registry import ProviderNotConfigured, get_provider
+from storage.context_store import record_friction_sync
 from storage.filen import StorageError, save_bytes, save_result
+from storage.usage import current_call_context
 from tools.charts import CHART_TOOL_CHOICE, CHART_TOOL_NAME, CHART_TOOL_SCHEMA, ChartError, render_chart
 from tools.documents import DocumentRenderError, render as render_document
 from tools.registry import TOOL_SCHEMAS, schemas_for
@@ -105,6 +107,12 @@ GRAPH_DATA_SYSTEM_PROMPT = (
 # Ceiling on tool-call round-trips per step, so a model that keeps calling
 # tools instead of answering can't spin forever and burn the day's quota.
 MAX_TOOL_ITERATIONS = 5
+
+# Below this many characters, a tool result carried nothing the model
+# could actually use. Set low on purpose: the signal being caught is "the
+# search came back with nothing", not "the answer was brief" — a real
+# result, even a thin one, clears this easily.
+_EMPTY_TOOL_RESULT_CHARS = 40
 
 # Tools whose side effect is real and non-idempotent — calling one twice
 # with identical arguments doesn't "check again," it repeats the action
@@ -273,6 +281,18 @@ def run_tool_loop(
                 # "Instructions" — every other tool call ignores the key.
                 result_text = dispatch_tool(tc.name, args, {**context, "chat_messages": messages})
                 print(f"[run_tool_loop] iteration={iterations} RESULT tool={tc.name} result={result_text[:300]!r}")
+                # A tool that ran fine and came back with nothing useful.
+                # Not an error anywhere — dispatch returns a string, the
+                # loop feeds it back, the model works with nothing. It is
+                # one of the commonest real reasons an answer is thin, and
+                # until now it left no trace at all. The threshold is
+                # deliberately low: this is "essentially empty", not "short".
+                if len(result_text.strip()) < _EMPTY_TOOL_RESULT_CHARS:
+                    record_friction_sync(
+                        "tool_result_empty", severity=1,
+                        conversation_id=current_call_context().get("conversation_id"),
+                        detail=f"{tc.name} returned {len(result_text.strip())} chars",
+                    )
                 if tc.name in _ONCE_PER_TURN_TOOLS:
                     once_per_turn_executed[tc.name] = result_text
                 # save_source's content-quality guard (tools/registry.py)
@@ -299,13 +319,57 @@ def run_tool_loop(
         )
 
     print(f"[run_tool_loop] done after {iterations} iteration(s), final text={(response.text or '')[:200]!r}")
-    # NOTE: "hit MAX_TOOL_ITERATIONS while still requesting tools" is a real
-    # friction signal, but it's recorded by the CALLER (dispatcher/chat.py),
-    # not here — this function is sync and runs inside asyncio.to_thread, so
-    # it can't await the async friction writer, and spinning up a nested
-    # event loop just to log something would be worse than the signal is
-    # worth. Callers have `iterations` and `response.tool_calls` already.
+    # Recorded HERE now (2026-09-14), not by the caller. This used to say
+    # it couldn't be: the writer was async-only and this function is sync.
+    # storage/context_store.py's record_friction_sync removed that
+    # constraint, and the consequence of the old arrangement was real —
+    # dispatcher/chat.py was the only one of this function's FIVE callers
+    # that bothered, so Agent Work, Research, Agent Vault and Sources
+    # could exhaust the loop without leaving a trace anywhere.
+    #
+    # Still only counts the real failure: reaching the ceiling while the
+    # model is STILL asking for tools means it never got to an answer.
+    # Using every iteration and then replying is a full loop, not a
+    # failed one.
+    if iterations >= MAX_TOOL_ITERATIONS and response.tool_calls:
+        record_friction_sync(
+            "tool_loop_exhausted", severity=2,
+            conversation_id=current_call_context().get("conversation_id"),
+            detail=f"{model} still requesting {[tc.name for tc in response.tool_calls]} at limit",
+            # Every iteration re-sent the whole growing transcript, and the
+            # loop still produced no answer. That entire spend is what the
+            # exhaustion cost.
+            wasted_tokens=_transcript_tokens(messages),
+            provider=provider.name, model=model,
+        )
+    elif iterations >= MAX_TOOL_ITERATIONS - 1:
+        # Near-miss: it DID finish, but with at most one iteration to
+        # spare. Note the condition is deliberately not "tool_calls still
+        # pending" — the while guard above means pending tool calls imply
+        # the ceiling was hit, so that version of this check could never
+        # fire. Graded rather than binary on purpose: exhaustion alone
+        # only fires on outright failure, which is rare, so it can never
+        # show a trend building. This fires while there is still room to
+        # act on it.
+        record_friction_sync(
+            "tool_loop_near_limit", severity=1,
+            conversation_id=current_call_context().get("conversation_id"),
+            detail=f"{model} finished on iteration {iterations} of {MAX_TOOL_ITERATIONS}",
+        )
     return response, messages, iterations
+
+
+def _transcript_tokens(messages: list[ChatMessage]) -> int:
+    """Estimated size of a tool-loop transcript. Same estimator, same
+    caveat, as providers/base.py's own — see estimate_tokens."""
+    try:
+        from storage.context_store import estimate_tokens
+
+        return sum(
+            estimate_tokens(m.content) for m in messages if isinstance(m.content, str)
+        )
+    except Exception:
+        return 0
 
 
 def _extract_tool_results(messages: list[ChatMessage]) -> str:
