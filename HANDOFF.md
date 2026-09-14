@@ -36,8 +36,25 @@ Confirm it actually came up — do not assume, this is the exact failure
 mode that went unnoticed for days:
 
 ```bash
-sudo systemctl is-active navi && curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/
+sudo systemctl is-active navi && curl -sS -o /dev/null -w '%{http_code}\n' http://localhost:10000/
 ```
+
+**Port 10000, not 8000** (corrected 2026-09-14). `server.py`'s `PORT`
+defaults to 10000 — a leftover from the Render deployment that came with
+the code to Lightsail. This line said 8000 from the day it was written,
+which means the one check added specifically to catch the crash-loop
+outage could never have returned 200. Verify the port rather than trust
+this line if the service ever moves:
+
+```bash
+sudo ss -ltnp | grep python
+```
+
+`-sS`, not `-s`: plain `-s` silences curl's OWN errors too, so a refused
+connection prints nothing at all and reads like a hung terminal rather
+than a dead server. `-o /dev/null -w` then prints `000` for both "wrong
+port" and "server down", which is exactly the ambiguity that let this sit
+unnoticed. `-S` keeps the real reason visible.
 
 `active` plus `200` means it is genuinely serving. Anything else:
 
