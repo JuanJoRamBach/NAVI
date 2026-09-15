@@ -79,7 +79,9 @@ import os
 
 import requests
 
-from providers.base import ChatMessage, ChatResponse, Provider, ProviderError, ToolCall
+from providers.base import (
+    ChatMessage, ChatResponse, Provider, ProviderError, ToolCall, consume_openai_stream,
+)
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
@@ -103,6 +105,7 @@ def _serialize_message(m: ChatMessage) -> dict:
 
 class GeminiProvider(Provider):
     name = "gemini"
+    supports_streaming = True
 
     def _do_chat(
         self,
@@ -111,6 +114,7 @@ class GeminiProvider(Provider):
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
         extra_params: dict | None = None,
+        on_token=None,
     ) -> ChatResponse:
         payload = {
             "model": model,
@@ -121,6 +125,14 @@ class GeminiProvider(Provider):
             payload["tool_choice"] = tool_choice or "auto"
         if extra_params:
             payload.update(extra_params)
+        streaming = on_token is not None
+        if streaming:
+            payload["stream"] = True
+            # Without this the final usage frame never arrives and a
+            # streamed turn would record zero tokens — silently breaking
+            # the cost accounting for exactly the calls we most want to
+            # measure.
+            payload["stream_options"] = {"include_usage": True}
 
         try:
             resp = requests.post(
@@ -131,6 +143,7 @@ class GeminiProvider(Provider):
                 },
                 json=payload,
                 timeout=60,
+                stream=streaming,
             )
         except requests.RequestException as e:
             raise ProviderError(f"Gemini request failed: {e}")
@@ -158,11 +171,25 @@ class GeminiProvider(Provider):
                 is_overloaded=resp.status_code >= 500,
             )
 
-        data = resp.json()
-        choices = data.get("choices") or []
-        if not choices or not choices[0].get("message"):
-            raise ProviderError(f"Gemini returned a malformed response (no message): {str(data)[:300]}")
-        choice = choices[0]["message"]
+        if streaming:
+            # The SSE frames are consumed here and reassembled into the
+            # same shape a blocking call would have produced, so
+            # everything downstream — tool interception, usage recording,
+            # friction — is identical whether or not the user watched it
+            # arrive. `raw` is rebuilt rather than kept, since there is no
+            # single response body to keep.
+            text, raw_tool_calls, usage = consume_openai_stream(resp, on_token)
+            data = {
+                "choices": [{"message": {"content": text, "tool_calls": raw_tool_calls}}],
+                "usage": usage,
+            }
+            choice = data["choices"][0]["message"]
+        else:
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices or not choices[0].get("message"):
+                raise ProviderError(f"Gemini returned a malformed response (no message): {str(data)[:300]}")
+            choice = choices[0]["message"]
 
         tool_calls = []
         for tc in choice.get("tool_calls") or []:

@@ -79,7 +79,8 @@ from jobs.model_ranking import SNAPSHOT_SCHEMA_VERSION, fetch_aa_benchmarks, lis
 from push.sender import PushError, add_subscription, send_push, subscription_count
 from storage.filen import StorageError, download_for_reply, file_download_url
 from storage.conversations import (
-    create_conversation, ensure_conversation, get_conversation, get_messages, get_task_state,
+    await_turn, begin_turn, create_conversation, ensure_conversation, fail_turn, finish_turn,
+    get_conversation, get_messages, get_task_state,
 )
 from storage.agent_work import (
     create_workflow as create_workflow_definition,
@@ -1134,6 +1135,37 @@ async def webhook_discord() -> PlainTextResponse:
     return PlainTextResponse("ok")  # outbound-only phase — nothing to act on yet
 
 
+async def _replay_or_claim(client_message_id: str | None, conversation_id: str | None):
+    """Shared idempotency guard for every chat entry point.
+
+    Returns (payload_to_replay, claimed_id). A non-None payload means this
+    exact turn already ran and the caller must hand that back instead of
+    doing the work again. A None claimed_id means the client opted out by
+    not sending an id, and nothing is being tracked.
+
+    Lives here rather than inside each route so the behaviour cannot drift
+    between /chat/send, /chat/stream and anything added later — the same
+    reason the reply payload itself is built in one place.
+    """
+    if not client_message_id:
+        return None, None
+    seen = await begin_turn(client_message_id, conversation_id)
+    if seen is None:
+        return None, client_message_id  # we own this turn
+    if seen["status"] == "done":
+        return seen["payload"], None
+    # Still running, most likely in the request whose connection just
+    # died. Wait for the real answer rather than starting a second one.
+    payload = await await_turn(client_message_id)
+    if payload is not None:
+        return payload, None
+    # It never finished within the window. Let this request run it, and
+    # take over the claim so its own result is recorded.
+    await fail_turn(client_message_id)
+    await begin_turn(client_message_id, conversation_id)
+    return None, client_message_id
+
+
 async def _chat_reply_payload(reply: dict, conversation_id: str) -> dict:
     """The object a chat turn returns, built in ONE place.
 
@@ -1308,6 +1340,9 @@ async def chat_send(request: Request) -> JSONResponse:
     result = parse_message(text)
 
     if result.kind == "plain_chat":
+        replay, claimed = await _replay_or_claim(payload.get("client_message_id"), conversation_id)
+        if replay is not None:
+            return JSONResponse(replay)
         if not conversation_id:
             conversation_id = await create_conversation(mode=mode)
         # Research mode (2026-09-12) needs real stage-tracking (planning
@@ -1320,7 +1355,10 @@ async def chat_send(request: Request) -> JSONResponse:
             reply = await run_research_chat(conversation_id, text)
         else:
             reply = await run_stored_mode_chat(mode, conversation_id, text, auto_accept=auto_accept, reasoning_effort=reasoning_effort)
-        return JSONResponse(await _chat_reply_payload(reply, conversation_id))
+        out = await _chat_reply_payload(reply, conversation_id)
+        if claimed:
+            await finish_turn(claimed, out)
+        return JSONResponse(out)
 
 
     reply_text, _attachments = _handle_parse_result(result, "pwa", mode, channel="pwa")
@@ -1363,6 +1401,19 @@ async def chat_stream(request: Request):
         return JSONResponse(
             {"error": "streaming covers plain chat only — use /chat/send"}, status_code=400
         )
+    # Same guard as /chat/send. A stream is MORE likely to break mid-turn
+    # than a single request, so this matters more here, not less.
+    replay, claimed = await _replay_or_claim(payload.get("client_message_id"), conversation_id)
+    if replay is not None:
+        # Already answered. Hand the finished turn back down the same
+        # channel rather than as a different shape, so the client has one
+        # code path whether it got the live turn or a replay of it.
+        async def replayed():
+            yield _sse(events.DONE, replay)
+        return StreamingResponse(
+            replayed(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     if not conversation_id:
         conversation_id = await create_conversation(mode=mode)
 
@@ -1382,9 +1433,18 @@ async def chat_stream(request: Request):
                 mode, conversation_id, text, auto_accept=auto_accept,
                 reasoning_effort=reasoning_effort, emit=emit,
             )
-            await queue.put((events.DONE, await _chat_reply_payload(reply, conversation_id)))
+            out = await _chat_reply_payload(reply, conversation_id)
+            if claimed:
+                # Recorded BEFORE it goes on the queue: if the client is
+                # already gone, the result must still be replayable when
+                # they retry. Writing it only on successful delivery would
+                # lose exactly the case this exists for.
+                await finish_turn(claimed, out)
+            await queue.put((events.DONE, out))
         except Exception as e:  # noqa: BLE001
             print(f"[chat_stream] turn failed: {e}")
+            if claimed:
+                await fail_turn(claimed)  # release, so a retry can re-run
             await queue.put((events.ERROR, {"text": f"Something went wrong: {e}"}))
         finally:
             await queue.put(None)  # sentinel: close the stream
@@ -2136,9 +2196,19 @@ async def agents_chat(agent_id: str, request: Request) -> JSONResponse:
     text = (payload.get("text") or "").strip()
     if not text:
         return JSONResponse({"error": "text is required"}, status_code=400)
+    # Same turn-idempotency guard as the other chat entry points. A saved
+    # agent's chat runs the same shape of turn and can be retried the same
+    # way, so it gets the same protection rather than a different answer
+    # to the same question.
+    replay, claimed = await _replay_or_claim(payload.get("client_message_id"), agent_id)
+    if replay is not None:
+        return JSONResponse(replay)
     await ensure_conversation(agent_id, mode="agent_vault")
     result = await run_agent_vault_chat(agent, agent_id, text)
-    return JSONResponse({**result, "conversation_id": agent_id})
+    out = {**result, "conversation_id": agent_id}
+    if claimed:
+        await finish_turn(claimed, out)
+    return JSONResponse(out)
 
 
 @app.put("/agents/{agent_id}")

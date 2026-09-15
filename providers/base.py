@@ -7,9 +7,11 @@ from LocalCodeCli: one shape in, one shape out, so swapping or adding a
 provider never touches calling code.
 """
 
+import json
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Callable
 
 # Request counts, keyed by (provider_name, model) — always tracked at this
 # granularity regardless of whether a provider's real rate limit is
@@ -71,6 +73,78 @@ class ChatResponse:
     # Cloudflare). Providers with no comparable per-call cost metric
     # (Groq, OpenRouter, Ollama Cloud) just leave this None.
     usage_note: str | None = None
+
+
+# Called with each chunk of visible text as it arrives. Sync, because the
+# transports are sync — the dispatcher bridges it back to its event loop.
+StreamCallback = Callable[[str], None]
+
+
+def consume_openai_stream(resp, on_token: StreamCallback | None) -> tuple[str, list[dict], dict]:
+    """Reads an OpenAI-format SSE completion. Returns (text, tool_calls, usage).
+
+    One parser for every transport that speaks the OpenAI wire format,
+    which is all of NAVI's — the `data: {...}` frames, the `[DONE]`
+    sentinel and the `choices[0].delta` shape are identical across them.
+    Writing it per-provider would be eight chances to get the tool-call
+    reassembly subtly wrong.
+
+    TOOL CALLS ARE THE HARD PART, and they are why this cannot just
+    concatenate text. Arguments arrive as fragments of a JSON string split
+    across frames, addressed by `index` rather than by id, and the id and
+    name usually appear only in the first fragment. They are accumulated
+    here and handed back whole, so the dispatcher sees exactly what it
+    would have seen from a blocking call — which is what keeps "the model
+    proposes, the dispatcher decides" true while streaming. A tool call is
+    never shown to the user as it arrives; only visible text is.
+    """
+    text_parts: list[str] = []
+    # index -> partial tool call. dict, not list: providers may deliver
+    # indexes out of order or skip one entirely.
+    partial: dict[int, dict] = {}
+    usage: dict = {}
+
+    for raw_line in resp.iter_lines(decode_unicode=True):
+        if not raw_line or not raw_line.startswith("data:"):
+            continue
+        data = raw_line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            frame = json.loads(data)
+        except json.JSONDecodeError:
+            continue  # a keepalive or a malformed frame is not fatal
+        # Usage rides on a late frame when stream_options asked for it.
+        if frame.get("usage"):
+            usage = frame["usage"]
+        choices = frame.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        chunk = delta.get("content")
+        if chunk:
+            text_parts.append(chunk)
+            if on_token:
+                try:
+                    on_token(chunk)
+                except Exception as e:  # noqa: BLE001
+                    # A consumer that fails must not cost the user the
+                    # answer — the text is still accumulated and returned.
+                    print(f"[stream] on_token failed (non-fatal): {e}")
+        for tc in delta.get("tool_calls") or []:
+            idx = tc.get("index", 0)
+            slot = partial.setdefault(idx, {"id": None, "type": "function",
+                                            "function": {"name": "", "arguments": ""}})
+            if tc.get("id"):
+                slot["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                slot["function"]["name"] = fn["name"]
+            if fn.get("arguments"):
+                slot["function"]["arguments"] += fn["arguments"]
+
+    tool_calls = [partial[i] for i in sorted(partial)]
+    return "".join(text_parts), tool_calls, usage
 
 
 class ProviderError(Exception):
@@ -259,6 +333,15 @@ class Provider(ABC):
 
     name: str = "base"
 
+    # Whether this transport implements token streaming. Opt-in rather
+    # than assumed: a transport that hasn't been given a streaming branch
+    # simply never receives `on_token` and keeps behaving exactly as it
+    # did. That is what lets streaming land provider by provider, against
+    # real traffic, instead of as one eight-way change nobody can verify
+    # at once — and a provider that silently ignored the callback would
+    # look like it streamed and never emit a token.
+    supports_streaming: bool = False
+
     def __init__(self, api_key: str):
         self.api_key = api_key
 
@@ -269,9 +352,18 @@ class Provider(ABC):
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
         extra_params: dict | None = None,
+        on_token: StreamCallback | None = None,
     ) -> ChatResponse:
         """
         Send a chat completion request. Raises ProviderError on failure.
+
+        on_token (2026-09-15): called with each chunk of visible text as it
+        arrives. Forwarded ONLY to transports that declare
+        supports_streaming, so passing it is always safe — a provider
+        without a streaming branch answers exactly as before and the caller
+        simply receives no chunks. Tool-call fragments are never passed
+        here; they are reassembled and returned whole, so the dispatcher
+        still decides on a complete proposal.
 
         tool_choice lets a caller force a specific tool (e.g. /graph-data
         forcing render_chart) instead of leaving it to "auto", which is
@@ -338,7 +430,13 @@ class Provider(ABC):
         call_ctx = current_call_context()
         started = time.monotonic()
         try:
-            response = self._do_chat(model, messages, tools=tools, tool_choice=tool_choice, extra_params=extra_params)
+            if on_token is not None and self.supports_streaming:
+                response = self._do_chat(
+                    model, messages, tools=tools, tool_choice=tool_choice,
+                    extra_params=extra_params, on_token=on_token,
+                )
+            else:
+                response = self._do_chat(model, messages, tools=tools, tool_choice=tool_choice, extra_params=extra_params)
         except BaseException as e:
             # A failed call is still a call. Recording only successes
             # would make every rate computed from this table wrong in the

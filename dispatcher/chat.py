@@ -211,8 +211,28 @@ async def _call_with_watchdog(
     "a call we paid for" and "an answer anyone saw" stays visible in the
     data instead of looking like an ordinary successful call.
     """
+    # Bridge tokens from the provider's worker thread back to this loop.
+    #
+    # provider.chat is synchronous and runs in a thread; `emit` is a
+    # coroutine belonging to the request's event loop. run_coroutine_
+    # threadsafe is the sanctioned crossing between the two. Order is
+    # preserved because the coroutines are scheduled in call order onto a
+    # FIFO queue — tokens cannot arrive shuffled.
+    #
+    # No on_token when nobody is listening: a provider that would stream
+    # answers blocking instead, which is exactly right for /chat/send.
+    on_token = None
+    if emit is not None:
+        loop = asyncio.get_running_loop()
+
+        def on_token(chunk: str) -> None:  # noqa: F811
+            asyncio.run_coroutine_threadsafe(emit(events.TOKEN, {"text": chunk}), loop)
+
     task = asyncio.create_task(
-        asyncio.to_thread(provider.chat, model=model, messages=messages, tools=tools, extra_params=extra_params)
+        asyncio.to_thread(
+            provider.chat, model=model, messages=messages, tools=tools,
+            extra_params=extra_params, on_token=on_token,
+        )
     )
     done, _pending = await asyncio.wait({task}, timeout=CHAT_WARN_AFTER_S)
     if not done:
@@ -875,6 +895,14 @@ async def run_stored_mode_chat(
                     # different model, which the user would otherwise
                     # experience as an unexplained extra wait.
                     await emit_status(emit, events.escalating(higher), kind="escalate")
+                    # Anything already streamed came from the weaker model
+                    # and is about to be replaced by a different answer, so
+                    # tell the client to drop it. Without this the user
+                    # would watch one reply be silently overwritten by
+                    # another, which reads as a glitch rather than as the
+                    # deliberate hand-off it is.
+                    if emit is not None:
+                        await emit(events.RESET, {"reason": "escalated to a stronger model"})
                     # Re-run the same turn one tier up. _escalated_from
                     # stops the user's message being appended twice —
                     # it's already in history from the first pass.
