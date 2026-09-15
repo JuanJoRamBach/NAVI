@@ -49,7 +49,7 @@ import time
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 
 from dispatcher.agent_work import (
     WEBHOOK_RESPONSE_TIMEOUT_SECONDS, WorkflowError, check_due_workflows, discard_webhook_waiter,
@@ -60,6 +60,7 @@ from dispatcher.mcp_client import MCPError, approve_tools, discover_tools
 from dispatcher.mcp_oauth import MCPOAuthError, exchange_code_for_token, start_authorization
 from tools.mcp_marketplace import MCPMarketplaceError, search as search_mcp_marketplace
 from dispatcher.scheduler import register_job, start_scheduler
+from dispatcher import events
 from dispatcher.chat import run_agent_vault_chat, run_mode_chat, run_stored_mode_chat
 from dispatcher.compaction import CONTEXT_TRIGGER_TOKENS
 from dispatcher.branch import draft_branch_spec, format_spec_markdown, seed_branch_context
@@ -1133,6 +1134,49 @@ async def webhook_discord() -> PlainTextResponse:
     return PlainTextResponse("ok")  # outbound-only phase — nothing to act on yet
 
 
+async def _chat_reply_payload(reply: dict, conversation_id: str) -> dict:
+    """The object a chat turn returns, built in ONE place.
+
+    Shared by POST /chat/send and the SSE stream's final `done` event, so a
+    streaming client and a plain one end up with byte-identical results.
+    It was inline in /chat/send; two copies of a ten-field contract that
+    must agree is precisely the kind of duplication that drifts.
+
+    Most of these are set only in one specific flow and are absent
+    otherwise — the client treats a missing key and a null the same way.
+    """
+    return {
+        "reply": reply["text"],
+        "conversation_id": conversation_id,
+        "usage_note": reply.get("usage_note"),
+        "choices": reply.get("choices"),
+        # Which attempt in the fallback chain actually answered.
+        # run_stored_mode_chat always computed these; the route simply
+        # never forwarded them (2026-09-06, JuanJo: "I don't see which
+        # model was used"). The "⚡ (primary was unavailable...)" line in
+        # the body is a human sentence; these are the machine-readable
+        # version the model badge renders from.
+        "provider": reply.get("provider"),
+        "model": reply.get("model"),
+        # Set only when this turn's create_workflow actually ran — lets
+        # AgentWorkChat.tsx put the real graph on the canvas immediately.
+        "created_workflow_id": reply.get("created_workflow_id"),
+        # Set only when normal_chat called propose_research_mode.
+        "suggested_mode": reply.get("suggested_mode"),
+        # Set only on the single turn a conversation is judged to have
+        # stopped being compactable (_hit_the_floor).
+        "branch_suggestion": reply.get("branch_suggestion"),
+        # 0..1 against NAVI's own compaction ceiling — NOT a fraction of
+        # the answering model's context window, which would move for
+        # reasons unrelated to the conversation and read as single digits
+        # against a 128K window. Read AFTER the turn, so a turn that
+        # triggered compaction reports the post-compaction value and the
+        # bar visibly drops. Uncapped: >1 is a real state and the client
+        # clamps the bar rather than the server hiding it.
+        "context_fill": await _context_fill(conversation_id),
+    }
+
+
 async def _context_fill(conversation_id: str | None) -> float | None:
     """This conversation's memory usage as a fraction of the compaction
     ceiling, for the PWA's fullness bar.
@@ -1276,55 +1320,107 @@ async def chat_send(request: Request) -> JSONResponse:
             reply = await run_research_chat(conversation_id, text)
         else:
             reply = await run_stored_mode_chat(mode, conversation_id, text, auto_accept=auto_accept, reasoning_effort=reasoning_effort)
-        return JSONResponse({
-            "reply": reply["text"], "conversation_id": conversation_id,
-            "usage_note": reply.get("usage_note"), "choices": reply.get("choices"),
-            # run_stored_mode_chat already computes these (which attempt in
-            # its fallback chain actually answered) — this route just never
-            # forwarded them to the client before (2026-09-06, JuanJo: "I
-            # don't see which model was used... can't see how many
-            # tokens"). The fallback notice itself was always appended
-            # into reply["text"] as a "⚡ (primary was unavailable...)"
-            # line; these two fields are what let the frontend show a
-            # real model badge instead of relying on that string being
-            # parsed back out of the message body.
-            "provider": reply.get("provider"), "model": reply.get("model"),
-            # Set only when this turn's create_workflow call actually ran
-            # (dispatcher/chat.py's _extract_created_workflow_id) — lets
-            # AgentWorkChat.tsx load the real graph onto the canvas as
-            # nodes right after the chat builds it, instead of the
-            # workflow only ever showing up in the Workflows list.
-            "created_workflow_id": reply.get("created_workflow_id"),
-            # Set only when Normal Chat's model called propose_research_mode
-            # (Stage 3, 2026-09-12) — navi-pwa's App.tsx uses this to flip
-            # chatMode client-side the moment the user accepts, rather than
-            # sending the click back as plain text and hoping it's read as
-            # consent. Never set outside that one flow.
-            "suggested_mode": reply.get("suggested_mode"),
-            # Set only on the one turn a conversation is judged to have
-            # stopped being compactable (dispatcher/chat.py's
-            # _hit_the_floor). Carries the notice text so the client can
-            # render it with a "start a focused chat" action attached.
-            "branch_suggestion": reply.get("branch_suggestion"),
-            # How full this conversation's own memory is, 0..1 against the
-            # compaction ceiling — read AFTER the turn, so a turn that
-            # triggered compaction reports the post-compaction value and the
-            # bar visibly drops instead of sitting pinned at full.
-            #
-            # Deliberately NOT a fraction of the answering model's context
-            # window: which model answers changes per turn now (three tiers
-            # plus fallbacks), so that denominator would move for reasons
-            # that have nothing to do with the conversation, and against a
-            # 128K-1M window it would read single digits forever. This is
-            # NAVI's own budget, which is the thing that actually governs
-            # behaviour. Uncapped on purpose — >1 is a real state (a
-            # compaction pass that couldn't get under target) and the client
-            # clamps the bar rather than the server hiding it.
-            "context_fill": await _context_fill(conversation_id),
-        })
+        return JSONResponse(await _chat_reply_payload(reply, conversation_id))
+
 
     reply_text, _attachments = _handle_parse_result(result, "pwa", mode, channel="pwa")
     return JSONResponse({"reply": reply_text})
+
+
+@app.post("/chat/stream")
+async def chat_stream(request: Request):
+    """Same turn as POST /chat/send, narrated while it happens.
+
+    Server-Sent Events, not a WebSocket: this is strictly one-way
+    (server -> client) and SSE reconnects, passes through proxies and
+    needs no protocol upgrade. Dev Slate has a WebSocket only because it
+    genuinely relays file operations back the other way; nothing here
+    does.
+
+    /chat/send is untouched and stays the canonical route. A client that
+    doesn't opt in passes no emitter, every status call becomes a no-op,
+    and the behaviour is exactly what it was. This route is additive.
+
+    Event types: `status` (dispatcher-authored progress), `done` (the
+    complete /chat/send payload), `error`. `token` and `reset` are
+    reserved for token streaming and are not emitted yet.
+
+    Scope, deliberately: plain chat only. Typed /commands keep their own
+    save mechanisms and Research mode owns a separate state machine
+    (dispatcher/research.py) whose checkpoints would each need their own
+    status vocabulary — worth doing, not worth half-doing here.
+    """
+    payload = await request.json()
+    text = (payload.get("text") or "").strip()
+    conversation_id = payload.get("conversation_id")
+    mode = payload.get("mode") or "normal_chat"
+    auto_accept = payload.get("auto_accept", True)
+    raw_effort = payload.get("reasoning_effort")
+    reasoning_effort = raw_effort if raw_effort in ("low", "medium", "high") else None
+    if not text:
+        return JSONResponse({"error": "missing 'text'"}, status_code=400)
+    if parse_message(text).kind != "plain_chat" or mode == "research":
+        return JSONResponse(
+            {"error": "streaming covers plain chat only — use /chat/send"}, status_code=400
+        )
+    if not conversation_id:
+        conversation_id = await create_conversation(mode=mode)
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def emit(event_type: str, data: dict) -> None:
+        await queue.put((event_type, data))
+
+    async def run_turn() -> None:
+        # Runs as its own task so the generator below can forward events
+        # as they happen instead of after the turn finishes. Deliberately
+        # NOT cancelled if the client disconnects: the turn should still
+        # complete and persist its reply, or a closed tab would silently
+        # lose the answer it paid for.
+        try:
+            reply = await run_stored_mode_chat(
+                mode, conversation_id, text, auto_accept=auto_accept,
+                reasoning_effort=reasoning_effort, emit=emit,
+            )
+            await queue.put((events.DONE, await _chat_reply_payload(reply, conversation_id)))
+        except Exception as e:  # noqa: BLE001
+            print(f"[chat_stream] turn failed: {e}")
+            await queue.put((events.ERROR, {"text": f"Something went wrong: {e}"}))
+        finally:
+            await queue.put(None)  # sentinel: close the stream
+
+    asyncio.create_task(run_turn())
+
+    async def frames():
+        # conversation_id first, before any work: a new conversation needs
+        # its id at the client even if the turn then fails outright.
+        yield _sse(events.STATUS, {"text": "", "kind": "open", "conversation_id": conversation_id})
+        while True:
+            item = await queue.get()
+            if item is None:
+                return
+            event_type, data = item
+            yield _sse(event_type, data)
+
+    return StreamingResponse(
+        frames(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # nginx buffers proxied responses by default, which holds every
+            # event until the response completes and defeats the entire
+            # point of this route. This header turns that off per-response,
+            # so it works without editing the server's nginx config.
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _sse(event_type: str, data: dict) -> str:
+    """One Server-Sent Event frame. The blank line terminates it — without
+    it the client buffers forever waiting for more of the same event."""
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
 @app.post("/push/subscribe")

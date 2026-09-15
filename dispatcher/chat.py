@@ -37,6 +37,8 @@ from dispatcher.executor import (
 from dispatcher.branch import (
     COMPLETE_OPTIONS, completion_as_entry, draft_completion, format_completion_markdown,
 )
+from dispatcher import events
+from dispatcher.events import Emitter, emit_status
 from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, classify_family
 from dispatcher.provider_debug import save_failed_exchange
@@ -155,6 +157,99 @@ def _trim_history_to_budget(messages: list[ChatMessage]) -> list[ChatMessage]:
     if len(kept) < len(messages):
         print(f"[chat] history trimmed {len(messages)} -> {len(kept)} messages ({total} tokens, budget {HISTORY_TOKEN_BUDGET})")
     return kept
+
+
+# How long a NORMAL CHAT turn may take before NAVI says something, and
+# before it stops waiting and moves to the fallback.
+#
+# These are per-ROLE numbers, not per-provider ones. The transports each
+# carry their own timeout (Groq 30s, Cloudflare and Gemini 60s, Ollama
+# 190s) and those describe the TRANSPORT's patience — how long a socket
+# should stay open. This describes the USER's patience, which is a
+# different quantity and the one that actually matters for an interactive
+# reply. A background compaction pass taking 45s is fine; a person
+# watching a chat box for 45s is not.
+#
+# The numbers come from research rather than from NAVI's own latency
+# statistics, deliberately. A threshold derived from p95 would be circular
+# — it moves when behaviour moves, and killing slow calls removes them
+# from the distribution, which lowers p95, which kills more. Human
+# tolerance does not drift like that. A 2026 CHI study (240 participants,
+# TTFT at 2/9/20s) found 20s is where waiting stops reading as deliberation
+# and starts reading as inefficiency, and web-app satisfaction research
+# puts abandonment around 12s. 15 sits between the two: past the point
+# where a wait is comfortable, before the point where it reads as broken.
+#
+# JuanJo, 2026-09-15: "15 seconds sounds good for now, with testing we
+# will see if we change it." Treat both as starting points to tune against
+# real use, not as derived constants.
+CHAT_WARN_AFTER_S = 12.0
+CHAT_GIVE_UP_AFTER_S = 15.0
+
+
+async def _call_with_watchdog(
+    provider, model: str, messages: list[ChatMessage], tools, extra_params,
+    emit, next_label: str | None,
+):
+    """Runs one provider call, narrating it, and stops waiting past the budget.
+
+    Returns the ChatResponse, or None if the budget ran out — in which case
+    the caller should move to its next attempt.
+
+    IMPORTANT, AND STATED PLAINLY: this stops WAITING, it does not stop the
+    CALL. `asyncio.to_thread` cannot be cancelled, so the request keeps
+    running in its worker thread, finishes in its own time, and its tokens
+    are still spent and still recorded by providers/base.py. What the user
+    is spared is the wait, not the cost.
+
+    That is a real limitation of a non-streaming transport, not an
+    oversight: aborting for real needs a response we are reading
+    incrementally, which is what `stream=True` gives us. When streaming
+    lands, this function is where the genuine abort goes.
+
+    The abandonment is recorded rather than swallowed, so the gap between
+    "a call we paid for" and "an answer anyone saw" stays visible in the
+    data instead of looking like an ordinary successful call.
+    """
+    task = asyncio.create_task(
+        asyncio.to_thread(provider.chat, model=model, messages=messages, tools=tools, extra_params=extra_params)
+    )
+    done, _pending = await asyncio.wait({task}, timeout=CHAT_WARN_AFTER_S)
+    if not done:
+        await emit_status(emit, events.taking_long(model), kind="slow")
+        remaining = CHAT_GIVE_UP_AFTER_S - CHAT_WARN_AFTER_S
+        done, _pending = await asyncio.wait({task}, timeout=remaining)
+
+    if done:
+        return task.result()  # re-raises ProviderError for the caller to handle
+
+    # Budget spent. Let the orphaned task finish quietly rather than leave
+    # its exception unretrieved (which asyncio would otherwise log as an
+    # unhandled error on a perfectly understood situation).
+    def _swallow(finished: asyncio.Task) -> None:
+        # Retrieving the exception is what stops asyncio logging "Task
+        # exception was never retrieved" for a situation we understand
+        # completely. But .exception() RAISES on a cancelled task rather
+        # than returning, and this task can absolutely be cancelled — the
+        # event loop shutting down mid-call is the ordinary case. Guarding
+        # is the whole point; without it the cleanup throws its own error.
+        if not finished.cancelled():
+            finished.exception()
+
+    task.add_done_callback(_swallow)
+    await emit_status(
+        emit,
+        events.switching(model, next_label) if next_label
+        else f"{model} didn't answer in time.",
+        kind="switch",
+    )
+    record_friction_sync(
+        "answer_abandoned", severity=3,
+        conversation_id=current_call_context().get("conversation_id"),
+        detail=f"stopped waiting after {CHAT_GIVE_UP_AFTER_S:.0f}s; the call was still paid for",
+        provider=getattr(provider, "name", None), model=model,
+    )
+    return None
 
 
 async def _maybe_compact_context(conversation_id: str) -> bool:
@@ -459,6 +554,7 @@ def _is_branch_accept(text: str) -> bool:
 async def run_stored_mode_chat(
     mode: str, conversation_id: str, text: str, auto_accept: bool = True,
     reasoning_effort: str | None = None, tier: str = "chat", _escalated_from: str | None = None,
+    emit: Emitter | None = None,
 ) -> dict:
     """Persisted sibling of run_mode_chat above — appends the user's
     message, replays a windowed slice of REAL history (not just this one
@@ -718,7 +814,25 @@ async def run_stored_mode_chat(
             messages.insert(0, ChatMessage(role="system", content=system_content))
         try:
             sent_messages = messages
-            response = await asyncio.to_thread(provider.chat, model=attempt["model"], messages=messages, tools=tools, extra_params=extra_params)
+            # The label for whatever we would move to if this one runs out
+            # of time — named in the message rather than left vague, so the
+            # user reads a decision being made and not just a complaint.
+            _next = attempts[i + 1] if i + 1 < len(attempts) else None
+            next_label = f"{_next['provider']}/{_next['model']}" if _next else None
+            await emit_status(
+                emit,
+                events.asking(attempt["model"]) if i == 0
+                else events.unavailable(attempts[i - 1]["model"], attempt["model"]),
+                kind="asking" if i == 0 else "switch",
+            )
+            response = await _call_with_watchdog(
+                provider, attempt["model"], messages, tools, extra_params, emit, next_label,
+            )
+            if response is None:
+                # Budget spent. _call_with_watchdog has already told the
+                # user and recorded it; just move on to the next attempt.
+                last_error = f"{attempt['provider']}/{attempt['model']} exceeded the {CHAT_GIVE_UP_AFTER_S:.0f}s chat budget"
+                continue
             print(
                 f"[run_stored_mode_chat] attempt {i} FIRST reply: "
                 f"text={(response.text or '')[:200]!r} tool_calls={[tc.name for tc in response.tool_calls]}"
@@ -755,13 +869,19 @@ async def run_stored_mode_chat(
                     await record_friction(
                         "tier_escalation", severity=1, conversation_id=conversation_id,
                         detail=f"{tier} -> {higher} ({attempt['provider']}/{attempt['model']}): {reason[:200]}",
+                        provider=attempt["provider"], model=attempt["model"],
                     )
+                    # Told, not hidden. The turn is about to be re-run on a
+                    # different model, which the user would otherwise
+                    # experience as an unexplained extra wait.
+                    await emit_status(emit, events.escalating(higher), kind="escalate")
                     # Re-run the same turn one tier up. _escalated_from
                     # stops the user's message being appended twice —
                     # it's already in history from the first pass.
                     return await run_stored_mode_chat(
                         mode, conversation_id, text, auto_accept=auto_accept,
                         reasoning_effort=reasoning_effort, tier=higher, _escalated_from=tier,
+                        emit=emit,  # the re-run narrates itself too
                     )
                 # Already at the ceiling. Don't loop, don't fail — let the
                 # top-tier model answer as best it can, which is strictly
@@ -844,6 +964,13 @@ async def run_stored_mode_chat(
                 }
             if tools and response.tool_calls:
                 print(f"[run_stored_mode_chat] attempt {i}: entering run_tool_loop")
+                # Name the tools BEFORE running them: this is the part of a
+                # slow turn that is genuinely doing visible work, and it is
+                # the strongest material the labor-illusion research says
+                # to show. "Searching the web…" is a far better account of
+                # a 20-second wait than "Thinking…".
+                for tc in response.tool_calls:
+                    await emit_status(emit, events.running_tool(tc.name), kind="tool")
                 response, sent_messages, iterations = await asyncio.to_thread(
                     run_tool_loop, provider, attempt["model"], messages, response,
                     context={"command": f"chat-{mode}", "topic_slug": "chat"}, tools=tools, extra_params=extra_params,
