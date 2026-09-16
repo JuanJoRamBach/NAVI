@@ -33,7 +33,9 @@ import os
 
 import requests
 
-from providers.base import ChatMessage, ChatResponse, Provider, ProviderError, ToolCall
+from providers.base import (
+    ChatMessage, ChatResponse, Provider, ProviderError, ToolCall, consume_openai_stream,
+)
 
 BASE_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
 
@@ -51,6 +53,7 @@ def _serialize_message(m: ChatMessage) -> dict:
 
 class CloudflareProvider(Provider):
     name = "cloudflare"
+    supports_streaming = True
 
     def _do_chat(
         self,
@@ -59,6 +62,7 @@ class CloudflareProvider(Provider):
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
         extra_params: dict | None = None,
+        on_token=None,
     ) -> ChatResponse:
         account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
         if not account_id:
@@ -87,6 +91,10 @@ class CloudflareProvider(Provider):
             payload["tool_choice"] = tool_choice or "auto"
         if extra_params:
             payload.update(extra_params)
+        streaming = on_token is not None
+        if streaming:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
 
         try:
             resp = requests.post(
@@ -97,6 +105,7 @@ class CloudflareProvider(Provider):
                 },
                 json=payload,
                 timeout=60,
+                stream=streaming,
             )
         except requests.RequestException as e:
             raise ProviderError(f"Cloudflare request failed: {e}")
@@ -112,11 +121,19 @@ class CloudflareProvider(Provider):
                 is_overloaded=resp.status_code >= 500,
             )
 
-        data = resp.json()
-        choices = data.get("choices") or []
-        if not choices or not choices[0].get("message"):
-            raise ProviderError(f"Cloudflare returned a malformed response (no message): {str(data)[:300]}")
-        choice = choices[0]["message"]
+        if streaming:
+            # Reassembled into the same shape a blocking call would have
+            # produced, so everything below — Neuron extraction, tool
+            # calls, usage — reads identically either way.
+            text, raw_tool_calls, usage = consume_openai_stream(resp, on_token)
+            data = {"choices": [{"message": {"content": text, "tool_calls": raw_tool_calls}}], "usage": usage}
+            choice = data["choices"][0]["message"]
+        else:
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices or not choices[0].get("message"):
+                raise ProviderError(f"Cloudflare returned a malformed response (no message): {str(data)[:300]}")
+            choice = choices[0]["message"]
 
         tool_calls = []
         for tc in choice.get("tool_calls") or []:

@@ -24,7 +24,9 @@ import re
 
 import requests
 
-from providers.base import ChatMessage, ChatResponse, Provider, ProviderError, ToolCall
+from providers.base import (
+    ChatMessage, ChatResponse, Provider, ProviderError, ToolCall, consume_openai_stream,
+)
 
 BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -58,6 +60,7 @@ def _serialize_message(m: ChatMessage) -> dict:
 
 class GroqProvider(Provider):
     name = "groq"
+    supports_streaming = True
 
     def _do_chat(
         self,
@@ -66,6 +69,7 @@ class GroqProvider(Provider):
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
         extra_params: dict | None = None,
+        on_token=None,
     ) -> ChatResponse:
         payload = {
             "model": model,
@@ -76,6 +80,10 @@ class GroqProvider(Provider):
             payload["tool_choice"] = tool_choice or "auto"
         if extra_params:
             payload.update(extra_params)
+        streaming = on_token is not None
+        if streaming:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
 
         try:
             resp = requests.post(
@@ -86,6 +94,7 @@ class GroqProvider(Provider):
                 },
                 json=payload,
                 timeout=30,  # Groq is fast — no need for a long timeout
+                stream=streaming,
             )
         except requests.RequestException as e:
             raise ProviderError(f"Groq request failed: {e}")
@@ -125,11 +134,16 @@ class GroqProvider(Provider):
                 is_overloaded=resp.status_code >= 500,
             )
 
-        data = resp.json()
-        choices = data.get("choices") or []
-        if not choices or not choices[0].get("message"):
-            raise ProviderError(f"Groq returned a malformed response (no message): {str(data)[:300]}")
-        choice = choices[0]["message"]
+        if streaming:
+            text, raw_tool_calls, usage = consume_openai_stream(resp, on_token)
+            data = {"choices": [{"message": {"content": text, "tool_calls": raw_tool_calls}}], "usage": usage}
+            choice = data["choices"][0]["message"]
+        else:
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices or not choices[0].get("message"):
+                raise ProviderError(f"Groq returned a malformed response (no message): {str(data)[:300]}")
+            choice = choices[0]["message"]
 
         tool_calls = []
         for tc in choice.get("tool_calls") or []:
