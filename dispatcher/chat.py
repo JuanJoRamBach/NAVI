@@ -186,6 +186,21 @@ def _trim_history_to_budget(messages: list[ChatMessage]) -> list[ChatMessage]:
 CHAT_WARN_AFTER_S = 12.0
 CHAT_GIVE_UP_AFTER_S = 15.0
 
+# SCOPE, confirmed 2026-09-16 after JuanJo compared this to waiting on a
+# real coding-agent session ("I wait 2 minutes... some tasks take 8 to 10
+# minutes"): these two numbers govern ONE quick chat reply, nothing else.
+# _call_with_watchdog has exactly one call site, inside
+# run_stored_mode_chat, which is Normal Chat and Brainstorm only.
+# Research's execution stage (dispatcher/research.py) and Agent Work
+# (dispatcher/agent_work.py) each run their OWN attempt loop with a plain
+# provider.chat() call, bounded only by that transport's own connection
+# timeout (60-190s) times up to MAX_TOOL_ITERATIONS rounds — an
+# 8-10-minute job was never going to hit this, because it never calls
+# this function. Do not widen these numbers to accommodate a long job,
+# and do not narrow Research/Agent Work to match these — they are
+# answering a different question ("is this one reply taking too long for
+# someone watching a chat box") than a multi-step session is.
+
 
 async def _call_with_watchdog(
     provider, model: str, messages: list[ChatMessage], tools, extra_params,
