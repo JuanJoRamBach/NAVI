@@ -75,7 +75,7 @@ from tools.telegram_send import TelegramSendError, send_to_telegram
 from messaging.base import IncomingMessage, MessagingAdapter, MessagingError
 from messaging.discord import DiscordAdapter
 from messaging.telegram import TelegramAdapter
-from config.store import config
+from config.store import config, encryption_status
 from providers.base import ProviderError
 from providers.byok import (
     BYOK_TRANSPORTS, CustomOpenAIProvider, custom_provider_id, is_custom_provider, normalize_base_url,
@@ -1678,9 +1678,12 @@ def _key_row(provider: str) -> dict:
         source = "navi" if kind == "free" else "server"
     else:
         source = None
+    added_by, added_at = config.key_added(provider) if source == "yours" else (None, None)
     return {
         "provider": provider,
         "label": _provider_label(provider),
+        "added_by": added_by,
+        "added_at": added_at,
         "kind": kind,
         "connected": bool(effective),
         "source": source,
@@ -1695,6 +1698,9 @@ async def config_keys_list(request: Request) -> dict:
     await _require_role(request, "owner", "admin")
     paid = [p for p in BYOK_TRANSPORTS if config.get_provider_key(p)]
     return {
+        # How saved keys are protected, so Settings can say so plainly and
+        # warn when the server is still missing NAVI_SECRET_KEY.
+        "encryption": encryption_status(),
         "catalog": key_catalog(),
         # The free eight always show, connected or not, so the person can
         # see what NAVI runs on. Paid and "Other" rows appear once they
@@ -1708,12 +1714,18 @@ async def config_keys_save(request: Request) -> JSONResponse:
     """Checks the key with the provider BEFORE saving it, so a typo is
     refused here, with the provider's own reason, instead of surfacing as a
     failed chat turn. Nothing is saved when the check fails."""
-    await _require_role(request, "owner", "admin")
+    user = await _require_role(request, "owner", "admin")
     payload = await request.json()
     provider = payload.get("provider")
     api_key = (payload.get("api_key") or "").strip()
     if not api_key or any(c.isspace() for c in api_key):
         return JSONResponse({"error": "Paste the key on its own, with no spaces."}, status_code=400)
+    if len(api_key) > 512:
+        return JSONResponse({"error": "That's longer than any real API key. Check what was pasted."}, status_code=400)
+    wait = _key_check_wait(user["id"])
+    if wait:
+        return JSONResponse({"error": f"Too many key checks. Try again in {wait} minute{'s' if wait != 1 else ''}."},
+                            status_code=429)
 
     try:
         if provider == "other":
@@ -1725,11 +1737,11 @@ async def config_keys_save(request: Request) -> JSONResponse:
             models = await asyncio.to_thread(CustomOpenAIProvider.list_models_at, name, base_url, api_key)
             if not models:
                 return JSONResponse({"error": f"{name} accepted the key but listed no chat models."}, status_code=400)
-            config.save_custom_provider(provider, name, base_url, api_key, models)
+            config.save_custom_provider(provider, name, base_url, api_key, models, added_by=user["email"])
 
         elif provider in BYOK_TRANSPORTS:
             models = await asyncio.to_thread(BYOK_TRANSPORTS[provider].list_models, api_key)
-            config.set_provider_key(provider, api_key)
+            config.set_provider_key(provider, api_key, added_by=user["email"])
             config.set_provider_models(provider, models)
 
         elif provider in FREE_PROVIDERS:
@@ -1738,23 +1750,52 @@ async def config_keys_save(request: Request) -> JSONResponse:
                 return JSONResponse({"error": "A Cloudflare Account ID is 32 letters and numbers, "
                                               "shown on your Cloudflare dashboard."}, status_code=400)
             await asyncio.to_thread(check_free_key, provider, api_key, account_id)
-            config.set_provider_key(provider, api_key)
+            config.set_provider_key(provider, api_key, added_by=user["email"])
             if provider == "cloudflare":
                 config.set_cloudflare_account_id(account_id)
 
         else:
             return JSONResponse({"error": f"Unknown provider '{provider}'."}, status_code=400)
     except ProviderError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        # A provider's error text is shown as is, since it's the most useful
+        # explanation there is. A provider that echoes the key back in it
+        # would put the key on screen, so it is masked first.
+        return JSONResponse({"error": str(e).replace(api_key, "[your key]")}, status_code=400)
 
+    # Audit line in the server log: who, what, which key by its last four.
+    # Never the key.
+    print(f"[config.keys] {user['email']} added a key for {provider} (…{api_key[-4:]})")
     return JSONResponse({"ok": True, "row": _key_row(provider)})
+
+
+# Each key check is a real request to the provider, made by this server.
+# Capping them per person keeps Settings from being usable as a fast way
+# to test stolen keys against providers, and keeps NAVI's own server from
+# being the one a provider rate-limits or blocks for it. Generous for real
+# use: nobody legitimately checks ten keys in ten minutes.
+_KEY_CHECK_LIMIT = 10
+_KEY_CHECK_WINDOW_S = 600
+_key_checks: dict[str, list[float]] = {}
+
+
+def _key_check_wait(user_id: str) -> int:
+    """0 if this person may check a key now (and counts the check), else
+    the minutes until they may."""
+    now = time.time()
+    recent = [t for t in _key_checks.get(user_id, []) if now - t < _KEY_CHECK_WINDOW_S]
+    if len(recent) >= _KEY_CHECK_LIMIT:
+        _key_checks[user_id] = recent
+        return max(1, round((_KEY_CHECK_WINDOW_S - (now - recent[0])) / 60))
+    recent.append(now)
+    _key_checks[user_id] = recent
+    return 0
 
 
 @app.delete("/config/keys/{provider}")
 async def config_keys_delete(provider: str, request: Request) -> JSONResponse:
     """Removes a key someone pasted. For a free provider NAVI goes back to
     its own key; for anything else the provider disappears."""
-    await _require_role(request, "owner", "admin")
+    user = await _require_role(request, "owner", "admin")
     if not _provider_kind(provider):
         return JSONResponse({"error": f"Unknown provider '{provider}'."}, status_code=400)
     if _key_row(provider)["source"] != "yours":
@@ -1769,6 +1810,7 @@ async def config_keys_delete(provider: str, request: Request) -> JSONResponse:
                      "Switch back to NAVI's default routing first.",
         }, status_code=409)
     config.delete_provider_key(provider)
+    print(f"[config.keys] {user['email']} removed the key for {provider}")
     return JSONResponse({"ok": True, "row": _key_row(provider) if _provider_kind(provider) else None})
 
 
@@ -2564,6 +2606,27 @@ def _seed_keys_from_env() -> None:
 
 
 _seed_keys_from_env()
+
+
+def _reencrypt_secrets_at_start() -> None:
+    """Encrypts any secret still stored in plaintext and moves every secret
+    onto the current NAVI_SECRET_KEY (see ConfigStore.reencrypt_secrets).
+    Logged either way, so a deploy shows what happened. Never fatal: a
+    failure here must not stop the server from starting."""
+    try:
+        result = config.reencrypt_secrets()
+    except Exception as e:  # noqa: BLE001
+        print(f"[config.store] re-encrypting saved secrets failed: {type(e).__name__}: {e}")
+        return
+    status = encryption_status()
+    print(
+        f"[config.store] saved secrets: {result['reencrypted']} re-encrypted, "
+        f"{result['unreadable']} unreadable; key from "
+        f"{status['env_name'] or 'the local key file (set NAVI_SECRET_KEY)'}"
+    )
+
+
+_reencrypt_secrets_at_start()
 
 
 if __name__ == "__main__":

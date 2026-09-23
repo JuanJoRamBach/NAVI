@@ -88,6 +88,10 @@ class _OpenAICompatibleBYOK(Provider):
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
+    def _check_address(self) -> None:
+        """Nothing to check for the named providers: their addresses are
+        fixed in this file. CustomOpenAIProvider overrides it."""
+
     def _do_chat(
         self,
         model: str,
@@ -113,15 +117,22 @@ class _OpenAICompatibleBYOK(Provider):
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
 
+        self._check_address()
         try:
             resp = requests.post(
                 self.chat_url, headers=self._headers(), json=payload, timeout=60, stream=streaming,
+                # Never follow a redirect with a key attached: a redirect is
+                # how an allowed address could bounce the request somewhere
+                # the address check would have refused.
+                allow_redirects=False,
             )
         except requests.RequestException as e:
-            raise ProviderError(f"{self.label} request failed: {e}")
+            raise ProviderError(f"{self.label} request failed: {type(e).__name__}")
 
         if resp.status_code == 429:
             raise ProviderError(f"{self.label} rate limited: {resp.text[:300]}", is_rate_limit=True)
+        if 300 <= resp.status_code < 400:
+            raise ProviderError(f"{self.label} answered with a redirect, which NAVI doesn't follow.")
         if resp.status_code >= 400:
             raise ProviderError(
                 f"{self.label} error {resp.status_code}: {resp.text[:300]}",
@@ -174,9 +185,13 @@ class _OpenAICompatibleBYOK(Provider):
 
 def _get_model_list(label: str, url: str, headers: dict) -> list[dict]:
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=15, allow_redirects=False)
     except requests.RequestException as e:
-        raise ProviderError(f"Couldn't reach {label}: {e}")
+        # The exception's own text can quote the full request; only its kind
+        # goes back to the person, so nothing about the key can ride along.
+        raise ProviderError(f"Couldn't reach {label} ({type(e).__name__}).")
+    if 300 <= resp.status_code < 400:
+        raise ProviderError(f"{label} tried to redirect the request elsewhere. Check the address.")
     if resp.status_code in (401, 403):
         raise ProviderError(f"{label} rejected this key ({resp.status_code}).")
     if resp.status_code == 404:
@@ -251,6 +266,13 @@ class CustomOpenAIProvider(_OpenAICompatibleBYOK):
         self.label = label
         self.base_url = base_url
 
+    def _check_address(self) -> None:
+        # Re-checked on every call, not only when the key was saved: a
+        # hostname can resolve publicly on the day it's saved and to a
+        # private address later. One DNS lookup per turn is a small price
+        # for never sending a key into the server's own network.
+        normalize_base_url(self.base_url)
+
     @staticmethod
     def list_models_at(label: str, base_url: str, api_key: str) -> list[str]:
         data = _get_model_list(label, f"{base_url}/models", {"Authorization": f"Bearer {api_key}"})
@@ -278,8 +300,10 @@ def normalize_base_url(raw: str) -> str:
     (the cloud metadata service) or localhost would turn "Other" into a
     way to read things inside the server's own network. Owner/Admin only
     already, but a Settings field should not be able to do that at all.
-    Known remaining gap: a hostname that resolves publicly now and
-    privately later (DNS rebinding) is only checked at save time."""
+    Checked at save time and again before every call (see
+    CustomOpenAIProvider._check_address), and redirects are never
+    followed. What remains is the split second between the check and the
+    connection, which only a network-level egress rule could close."""
     url = (raw or "").strip().rstrip("/")
     for suffix in ("/chat/completions", "/models"):
         if url.endswith(suffix):

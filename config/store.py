@@ -27,72 +27,148 @@ CONFIG_PATH = Path(__file__).parent / "agent_config.json"
 _MCP_KEY_PATH = Path(__file__).parent / ".mcp_secret.key"
 
 _lock = threading.Lock()
-_fernet_cache = None
+_keyring_cache = None
+_warned_undecryptable: set[str] = set()
+
+# ---- Secrets at rest (reworked 2026-09-23) ----------------------------------
+#
+# Every secret this store holds — provider API keys, MCP bearer tokens,
+# OAuth refresh tokens and client secrets — is Fernet-encrypted.
+#
+# What this protects, stated plainly so nobody overclaims it: a COPY of
+# agent_config.json. The Filen backup (backup_to_filen ships this file on
+# every write), a stray copy on a laptop, a file attached to a support
+# message. It does NOT protect against someone who already controls the
+# server, since the key has to live there for NAVI to use the secrets.
+#
+# Where the encryption key comes from, in order:
+#   1. NAVI_SECRET_KEY in the server's .env. The right setup. A proper
+#      Fernet key, or any long passphrase. It may hold several keys
+#      separated by commas: the FIRST encrypts, every one decrypts. That is
+#      how the key is rotated without losing anything: put the new key
+#      first, keep the old one after it, restart (reencrypt_secrets moves
+#      everything onto the new key), then drop the old one.
+#   2. NAVI_MCP_SECRET_KEY, the older name, still honoured.
+#   3. config/.mcp_secret.key, generated on first use. Development only: it
+#      sits on the same disk as the config and is never backed up, so a
+#      server restored from the Filen backup onto a fresh machine could not
+#      read any of its secrets. When an env key IS set and this file also
+#      exists, the file is kept as a decrypt-only key, so switching a live
+#      server from the file to NAVI_SECRET_KEY loses nothing.
 
 
-def _get_fernet():
-    """Lazily builds the Fernet cipher used to encrypt MCP connection
-    credentials (bearer tokens) at rest â€” these are third-party secrets
-    (GitHub/Google/Slack/etc tokens) NAVI holds on the company's behalf,
-    a different risk class than the plaintext-JSON pattern the rest of
-    this store already uses for its own provider keys (that's a known,
-    separately-flagged gap â€” see IDEAS.md â€” not fixed here).
-
-    Prefers NAVI_MCP_SECRET_KEY (set once on Lightsail, never written to
-    disk or backed up to Filen) over a locally-generated key file â€” a key
-    that lives on the same disk as the data it encrypts only protects
-    against a narrower set of leaks (e.g. the Filen backup, since
-    backup_to_filen() ships this file's plaintext bytes as-is), which is
-    still real protection, just not as strong as a key kept elsewhere."""
-    global _fernet_cache
-    if _fernet_cache is not None:
-        return _fernet_cache
+def _fernet_from_secret(secret: str):
     from cryptography.fernet import Fernet
 
-    key_env = os.environ.get("NAVI_MCP_SECRET_KEY")
-    if key_env:
-        try:
-            _fernet_cache = Fernet(key_env.encode())
-        except Exception:
-            # Accept a human-typed passphrase, not just a properly-formed
-            # Fernet key â€” derive a valid 32-byte urlsafe-base64 key from it.
-            digest = hashlib.sha256(key_env.encode()).digest()
-            _fernet_cache = Fernet(base64.urlsafe_b64encode(digest))
-        return _fernet_cache
+    try:
+        return Fernet(secret.encode())
+    except Exception:
+        # A human-typed passphrase rather than a formed Fernet key: derive a
+        # valid 32-byte key from it. Unchanged from the original MCP scheme,
+        # so ciphertext written under a passphrase before this rework still
+        # decrypts.
+        return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
 
+
+def _env_secrets() -> tuple[list[str], str | None]:
+    for name in ("NAVI_SECRET_KEY", "NAVI_MCP_SECRET_KEY"):
+        raw = os.environ.get(name)
+        if raw:
+            return [s.strip() for s in raw.split(",") if s.strip()], name
+    return [], None
+
+
+def _keyring():
+    """MultiFernet over every usable key, the encrypting key first."""
+    global _keyring_cache
+    if _keyring_cache is not None:
+        return _keyring_cache
+    from cryptography.fernet import Fernet, MultiFernet
+
+    secrets, _ = _env_secrets()
+    fernets = [_fernet_from_secret(s) for s in secrets]
     if _MCP_KEY_PATH.exists():
-        _fernet_cache = Fernet(_MCP_KEY_PATH.read_bytes())
-        return _fernet_cache
+        # Decrypt-only when an env key leads; the key itself otherwise.
+        fernets.append(Fernet(_MCP_KEY_PATH.read_bytes().strip()))
+    if not fernets:
+        key = Fernet.generate_key()
+        _MCP_KEY_PATH.write_bytes(key)
+        try:
+            os.chmod(_MCP_KEY_PATH, 0o600)  # owner-only; a no-op on Windows
+        except OSError:
+            pass
+        print(
+            f"[config.store] WARNING: NAVI_SECRET_KEY is not set. Generated {_MCP_KEY_PATH} to "
+            "encrypt saved API keys. That key sits on the same disk as the keys and is not "
+            "backed up. Set NAVI_SECRET_KEY in the server's .env."
+        )
+        fernets.append(Fernet(key))
+    _keyring_cache = MultiFernet(fernets)
+    return _keyring_cache
 
-    key = Fernet.generate_key()
-    _MCP_KEY_PATH.write_bytes(key)
-    print(
-        f"[config.store] WARNING: NAVI_MCP_SECRET_KEY not set â€” generated a local key file "
-        f"at {_MCP_KEY_PATH}. Set the env var in production so the key isn't stored on the "
-        f"same disk (and same Filen backup) as the data it protects."
-    )
-    _fernet_cache = Fernet(key)
-    return _fernet_cache
+
+def _primary_fernet():
+    return _keyring()._fernets[0]
+
+
+def encryption_status() -> dict:
+    """What Settings shows about how saved keys are protected."""
+    secrets, env_name = _env_secrets()
+    return {
+        "source": "env" if secrets else "local_file",
+        "env_name": env_name,
+        # True while a leftover key file still has to be kept to read older
+        # secrets. reencrypt_secrets clears the need on the next restart.
+        "legacy_file_present": bool(secrets) and _MCP_KEY_PATH.exists(),
+    }
+
+
+def _is_token(value: str) -> bool:
+    # Every Fernet token starts with version byte 0x80, base64 "gAAAAA".
+    return value.startswith("gAAAAA")
 
 
 def _encrypt_secret(value: str | None) -> str | None:
     if value is None:
         return None
-    return _get_fernet().encrypt(value.encode()).decode()
+    return _keyring().encrypt(value.encode()).decode()
 
 
 def _decrypt_secret(value: str | None) -> str | None:
-    if value is None:
+    """The plaintext of a stored secret, or None if it can't be read.
+
+    Something that isn't a Fernet token is a secret saved before encryption
+    existed and comes back as-is (reencrypt_secrets encrypts it on the next
+    restart). A token no key can open — the key was lost or changed without
+    keeping the old one — comes back as None, never as ciphertext: handing
+    ciphertext on as if it were a key only produces a confusing auth failure
+    at the provider, and for a provider key it would also shadow a working
+    key in .env. Logged once per value so the cause is findable."""
+    if not value:
         return None
+    if not _is_token(value):
+        return value
     from cryptography.fernet import InvalidToken
 
     try:
-        return _get_fernet().decrypt(value.encode()).decode()
+        return _keyring().decrypt(value.encode()).decode()
     except InvalidToken:
-        # Either the wrong/rotated key, or a value saved before this
-        # encryption existed â€” treat as legacy plaintext rather than
-        # silently breaking every connection saved before this change.
-        return value
+        tag = hashlib.sha256(value.encode()).hexdigest()[:12]
+        if tag not in _warned_undecryptable:
+            _warned_undecryptable.add(tag)
+            print(
+                f"[config.store] WARNING: a saved secret ({tag}) can't be decrypted with the current "
+                "NAVI_SECRET_KEY. If the key was changed, put the old one after the new one, "
+                "comma-separated, and restart."
+            )
+        return None
+
+
+# Every place in the config a secret lives: (section, per-entry fields).
+_SECRET_FIELDS = (
+    ("providers", ("api_key",)),
+    ("mcp_connections", ("auth_header", "oauth_refresh_token", "oauth_client_secret")),
+)
 
 # Fallback environment variable per provider, consulted by
 # get_provider_key when the config store has nothing (see its docstring).
@@ -122,28 +198,6 @@ PROVIDER_KEY_ENV = {
 # can have either. Both are checked rather than one being silently missed.
 _EXTRA_KEY_ENV = {"ollama_cloud": ("OLLAMA_API_KEY",)}
 
-
-def _decrypt_provider_key(value: str | None) -> str | None:
-    """Like _decrypt_secret, but a value that IS a Fernet token and still
-    won't decrypt (the key file was lost, or NAVI_MCP_SECRET_KEY changed)
-    comes back as None rather than as ciphertext.
-
-    That difference matters here and not for MCP: get_provider_key lets a
-    stored key win over the environment, so returning ciphertext would
-    shadow a perfectly good .env key with garbage and every call would fail
-    auth. None lets the env fallback take over. Anything that is not a
-    Fernet token is a key saved before encryption existed and is returned
-    as-is — encryption applies from the next save, no migration pass."""
-    if not value:
-        return None
-    if not value.startswith("gAAAAA"):
-        return value
-    from cryptography.fernet import InvalidToken
-
-    try:
-        return _get_fernet().decrypt(value.encode()).decode()
-    except InvalidToken:
-        return None
 
 DEFAULTS = {
     "providers": {
@@ -599,18 +653,70 @@ class ConfigStore:
 
     # ---- Provider keys ----
 
-    def set_provider_key(self, provider: str, api_key: str):
+    def set_provider_key(self, provider: str, api_key: str, added_by: str | None = None):
         """Saves a provider key, encrypted at rest (2026-09-23).
 
         Until BYOK this file held every provider key in plaintext — a known
         gap flagged next to the MCP encryption. It stopped being acceptable
         once the keys could be someone's own paid account, so they now go
         through the same Fernet cipher MCP credentials use. Keys saved
-        before this still read fine (see _decrypt_provider_key)."""
-        self._data.setdefault("providers", {}).setdefault(provider, {})
-        self._data["providers"][provider]["api_key"] = _encrypt_secret(api_key)
-        self._data["providers"][provider]["enabled"] = True
+        before this still read fine (see _decrypt_secret), and are
+        encrypted on the next restart (reencrypt_secrets)."""
+        entry = self._data.setdefault("providers", {}).setdefault(provider, {})
+        entry["api_key"] = _encrypt_secret(api_key)
+        entry["enabled"] = True
+        # Who put this key here and when, shown next to it in Settings. Keys
+        # written by server code (env seeding, jobs) carry no person.
+        entry["added_by"] = added_by
+        entry["added_at"] = time.time() if added_by else None
         self._save()
+
+    def key_added(self, provider: str) -> tuple[str | None, float | None]:
+        entry = self._data.get("providers", {}).get(provider, {})
+        return entry.get("added_by"), entry.get("added_at")
+
+    def reencrypt_secrets(self) -> dict:
+        """Brings every stored secret onto the current encryption key.
+        Run once at server start.
+
+        - A secret saved before encryption existed is encrypted now, instead
+          of staying plaintext (and in every Filen backup) until someone
+          happens to save it again.
+        - A secret encrypted under an older key (the local key file, or a
+          key listed after the first in NAVI_SECRET_KEY) is re-encrypted
+          under the first key, which is what makes rotation complete.
+        - A secret no key can read is left exactly as it is and counted,
+          never overwritten: it may still open once the right key is back.
+
+        Saves once, and only if something changed, so an ordinary restart
+        doesn't rewrite the file or push a new backup."""
+        from cryptography.fernet import InvalidToken
+
+        primary = _primary_fernet()
+        changed = unreadable = 0
+        for section, fields in _SECRET_FIELDS:
+            for entry in (self._data.get(section) or {}).values():
+                if not isinstance(entry, dict):
+                    continue
+                for field in fields:
+                    value = entry.get(field)
+                    if not value:
+                        continue
+                    if _is_token(value):
+                        try:
+                            primary.decrypt(value.encode())
+                            continue  # already on the current key
+                        except InvalidToken:
+                            pass
+                    plain = _decrypt_secret(value)
+                    if plain is None:
+                        unreadable += 1
+                        continue
+                    entry[field] = _encrypt_secret(plain)
+                    changed += 1
+        if changed:
+            self._save()
+        return {"reencrypted": changed, "unreadable": unreadable}
 
     def delete_provider_key(self, provider: str):
         providers = self._data.get("providers", {})
@@ -623,7 +729,8 @@ class ConfigStore:
         else:
             cfg["api_key"] = None
             cfg["enabled"] = False
-            cfg.pop("account_id", None)
+            for field in ("account_id", "added_by", "added_at"):
+                cfg.pop(field, None)
             if "models" in cfg:
                 cfg["models"] = []
         self._save()
@@ -654,10 +761,14 @@ class ConfigStore:
 
     # ---- "Other" providers ----
 
-    def save_custom_provider(self, provider: str, label: str, base_url: str, api_key: str, models: list[str]):
+    def save_custom_provider(
+        self, provider: str, label: str, base_url: str, api_key: str, models: list[str],
+        added_by: str | None = None,
+    ):
         self._data.setdefault("providers", {})[provider] = {
             "api_key": _encrypt_secret(api_key), "enabled": True, "custom": True,
             "label": label, "base_url": base_url, "models": list(models),
+            "added_by": added_by, "added_at": time.time() if added_by else None,
         }
         self._save()
 
@@ -674,7 +785,7 @@ class ConfigStore:
         """The key saved in this store only — no environment fallback.
         Settings uses it to tell a key someone saved (removable) apart from
         one that comes from the server's .env (not removable from the UI)."""
-        return _decrypt_provider_key(self._data.get("providers", {}).get(provider, {}).get("api_key"))
+        return _decrypt_secret(self._data.get("providers", {}).get(provider, {}).get("api_key"))
 
     def set_provider_models(self, provider: str, models: list[str]):
         self._data.setdefault("providers", {}).setdefault(provider, {})["models"] = list(models)

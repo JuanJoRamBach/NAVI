@@ -326,7 +326,8 @@ def fetch_gemini_models(api_key: str | None) -> list[dict]:
     if not api_key:
         return []
     try:
-        resp = requests.get(GEMINI_MODELS_URL, params={"key": api_key}, timeout=20)
+        # Header, not ?key=: a key in a URL leaks into anything that logs URLs.
+        resp = requests.get(GEMINI_MODELS_URL, headers={"x-goog-api-key": api_key}, timeout=20)
         resp.raise_for_status()
         data = (resp.json() or {}).get("models") or []
     except (requests.RequestException, ValueError):

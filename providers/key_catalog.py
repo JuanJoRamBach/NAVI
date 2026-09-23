@@ -42,9 +42,13 @@ UNCHECKABLE = {"llm7"}
 
 def _probe(label: str, url: str, *, headers: dict | None = None, params: dict | None = None) -> None:
     try:
-        resp = requests.get(url, headers=headers or {}, params=params, timeout=15)
+        resp = requests.get(url, headers=headers or {}, params=params, timeout=15, allow_redirects=False)
     except requests.RequestException as e:
-        raise ProviderError(f"Couldn't reach {label}: {e}")
+        # Only the kind of failure goes back: the exception's own text can
+        # quote the whole request.
+        raise ProviderError(f"Couldn't reach {label} ({type(e).__name__}).")
+    if 300 <= resp.status_code < 400:
+        raise ProviderError(f"{label} answered with a redirect, which NAVI doesn't follow.")
     # Google answers a bad key with 400 API_KEY_INVALID rather than 401.
     if resp.status_code in (400, 401, 403):
         raise ProviderError(f"{label} rejected this key ({resp.status_code}).")
@@ -68,7 +72,11 @@ def check_free_key(provider: str, api_key: str, account_id: str | None = None) -
     elif provider == "ollama_cloud":
         _probe(label, "https://ollama.com/v1/models", headers=bearer)
     elif provider == "gemini":
-        _probe(label, "https://generativelanguage.googleapis.com/v1beta/models", params={"key": api_key})
+        # In a header, not the ?key= query string Google also accepts: a key
+        # in a URL ends up anywhere URLs are written down (error messages,
+        # proxy logs), a header doesn't.
+        _probe(label, "https://generativelanguage.googleapis.com/v1beta/models",
+               headers={"x-goog-api-key": api_key})
     elif provider == "cloudflare":
         if not account_id:
             raise ProviderError("Cloudflare also needs your Account ID.")
