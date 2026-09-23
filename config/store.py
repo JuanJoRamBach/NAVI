@@ -112,7 +112,15 @@ PROVIDER_KEY_ENV = {
     "nvidia_nim": "NVIDIA_NIM_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "xai": "XAI_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
 }
+
+# server.py's first-boot seeding has always read Ollama's key from
+# OLLAMA_API_KEY while the map above says OLLAMA_CLOUD_API_KEY, so a server
+# can have either. Both are checked rather than one being silently missed.
+_EXTRA_KEY_ENV = {"ollama_cloud": ("OLLAMA_API_KEY",)}
 
 
 def _decrypt_provider_key(value: str | None) -> str | None:
@@ -165,6 +173,12 @@ DEFAULTS = {
         # provider's live model list at save time (providers/byok.py).
         "deepseek": {"api_key": None, "enabled": False, "models": []},
         "anthropic": {"api_key": None, "enabled": False, "models": []},
+        "openai": {"api_key": None, "enabled": False, "models": []},
+        "xai": {"api_key": None, "enabled": False, "models": []},
+        "moonshot": {"api_key": None, "enabled": False, "models": []},
+        # "Other" providers are added here at runtime as "custom-<slug>",
+        # with `label` and `base_url` alongside the key (see
+        # save_custom_provider).
     },
     "roles": {
         # Two SEPARATE dispatcher roles, deliberately not sharing a quota bucket.
@@ -599,14 +613,62 @@ class ConfigStore:
         self._save()
 
     def delete_provider_key(self, provider: str):
-        cfg = self._data.get("providers", {}).get(provider)
+        providers = self._data.get("providers", {})
+        cfg = providers.get(provider)
         if cfg is None:
             return
-        cfg["api_key"] = None
-        cfg["enabled"] = False
-        if "models" in cfg:
-            cfg["models"] = []
+        if cfg.get("custom"):
+            # An "Other" entry has nothing left to show without its key.
+            del providers[provider]
+        else:
+            cfg["api_key"] = None
+            cfg["enabled"] = False
+            cfg.pop("account_id", None)
+            if "models" in cfg:
+                cfg["models"] = []
         self._save()
+
+    def env_provider_key(self, provider: str) -> str | None:
+        """The key the server's .env provides for this provider, if any —
+        what NAVI falls back to when no key is saved."""
+        names = (PROVIDER_KEY_ENV.get(provider), *_EXTRA_KEY_ENV.get(provider, ()))
+        for name in names:
+            if name and os.environ.get(name):
+                return os.environ[name]
+        return None
+
+    # ---- Cloudflare's account ID ----
+    #
+    # A Cloudflare token only works together with the account it belongs to.
+    # Bringing your own token therefore brings your own account ID too, and
+    # it has to live next to the token: using your token with NAVI's account
+    # ID from .env would fail every call.
+
+    def set_cloudflare_account_id(self, account_id: str):
+        self._data.setdefault("providers", {}).setdefault("cloudflare", {})["account_id"] = account_id
+        self._save()
+
+    def get_cloudflare_account_id(self) -> str | None:
+        stored = self._data.get("providers", {}).get("cloudflare", {}).get("account_id")
+        return stored or os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+
+    # ---- "Other" providers ----
+
+    def save_custom_provider(self, provider: str, label: str, base_url: str, api_key: str, models: list[str]):
+        self._data.setdefault("providers", {})[provider] = {
+            "api_key": _encrypt_secret(api_key), "enabled": True, "custom": True,
+            "label": label, "base_url": base_url, "models": list(models),
+        }
+        self._save()
+
+    def get_custom_provider(self, provider: str) -> dict | None:
+        cfg = self._data.get("providers", {}).get(provider)
+        if not cfg or not cfg.get("custom"):
+            return None
+        return {"label": cfg.get("label") or provider, "base_url": cfg.get("base_url")}
+
+    def custom_providers(self) -> list[str]:
+        return [name for name, cfg in self._data.get("providers", {}).items() if cfg.get("custom")]
 
     def stored_provider_key(self, provider: str) -> str | None:
         """The key saved in this store only — no environment fallback.
@@ -639,8 +701,7 @@ class ConfigStore:
         stored = self.stored_provider_key(provider)
         if stored:
             return stored
-        env_name = PROVIDER_KEY_ENV.get(provider)
-        return os.environ.get(env_name) if env_name else None
+        return self.env_provider_key(provider)
 
     def is_provider_enabled(self, provider: str) -> bool:
         return self._data.get("providers", {}).get(provider, {}).get("enabled", False)

@@ -44,6 +44,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import re
 import threading
 import time
 
@@ -76,7 +77,10 @@ from messaging.discord import DiscordAdapter
 from messaging.telegram import TelegramAdapter
 from config.store import config
 from providers.base import ProviderError
-from providers.byok import BYOK_TRANSPORTS
+from providers.byok import (
+    BYOK_TRANSPORTS, CustomOpenAIProvider, custom_provider_id, is_custom_provider, normalize_base_url,
+)
+from providers.key_catalog import FREE_PROVIDERS, UNCHECKABLE, catalog as key_catalog, check_free_key
 from jobs.model_ranking import SNAPSHOT_SCHEMA_VERSION, fetch_aa_benchmarks, list_candidates, load_snapshot, refresh_snapshot
 from push.sender import PushError, add_subscription, send_push, subscription_count
 from storage.filen import StorageError, download_for_reply, file_download_url
@@ -171,7 +175,11 @@ app = FastAPI(title="NAVI")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=PWA_CORS_ORIGINS,
-    allow_methods=["GET", "POST", "DELETE"],
+    # PUT was missing until 2026-09-23, so the browser refused every PUT
+    # before sending it: saving workflow edits, updating a saved agent,
+    # changing a role, deactivating a user. Adding it opens nothing new;
+    # every request still passes the API key gate and its own role checks.
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Content-Type", "X-Navi-Api-Key", "Authorization"],
 )
 
@@ -1531,8 +1539,9 @@ def config_models(task: str = Query(...)) -> dict:
     # the ranking snapshot only knows the free catalog, so a quality score
     # here would be invented.
     byok_candidates = [
-        {"provider": p, "model": m, "context_length": None, "quality": 0, "speed": 0, "byok": True}
-        for p in BYOK_TRANSPORTS if config.get_provider_key(p)
+        {"provider": p, "label": _provider_label(p), "model": m,
+         "context_length": None, "quality": 0, "speed": 0, "byok": True}
+        for p in (*BYOK_TRANSPORTS, *config.custom_providers()) if config.get_provider_key(p)
         for m in config.get_provider_models(p)
     ]
 
@@ -1617,65 +1626,150 @@ async def config_role_reset(request: Request) -> JSONResponse:
 # came from, and its last four characters so a person can tell two keys
 # apart.
 
-def _byok_status(provider: str) -> dict:
+_ROLE_LABELS = {
+    "normal_chat": "Chat", "normal_chat_exploratory": "Chat (exploratory)",
+    "normal_chat_serious": "Chat (serious)", "dev_slate_chat": "Dev Slate",
+    "agent_work": "Agent Work", "context_synthesis": "Memory and plans",
+    "dispatcher_autonomous": "Scheduled jobs",
+}
+
+
+def _provider_kind(provider: str) -> str | None:
+    if provider in FREE_PROVIDERS:
+        return "free"
+    if provider in BYOK_TRANSPORTS:
+        return "paid"
+    if is_custom_provider(provider) and config.get_custom_provider(provider):
+        return "custom"
+    return None
+
+
+def _provider_label(provider: str) -> str:
+    kind = _provider_kind(provider)
+    if kind == "free":
+        return FREE_PROVIDERS[provider]
+    if kind == "paid":
+        return BYOK_TRANSPORTS[provider].label
+    if kind == "custom":
+        return config.get_custom_provider(provider)["label"]
+    return provider
+
+
+def _key_row(provider: str) -> dict:
+    """One row of "Connected APIs". Carries whose key is in use and its
+    last four characters, never the key.
+
+    source:
+      "yours"  — pasted in Settings; can be removed.
+      "navi"   — a free provider running on NAVI's own key (the server's
+                 .env). There's nothing to remove.
+      "server" — a paid provider whose key sits in the server's .env; also
+                 not removable from here.
+      None     — no key at all.
+    A free provider's saved key that equals the .env key counts as NAVI's:
+    older servers copied .env keys into the store on first boot."""
+    kind = _provider_kind(provider)
     stored = config.stored_provider_key(provider)
-    effective = config.get_provider_key(provider)
+    env = config.env_provider_key(provider)
+    effective = stored or env
+    if stored and not (kind == "free" and stored == env):
+        source = "yours"
+    elif effective:
+        source = "navi" if kind == "free" else "server"
+    else:
+        source = None
     return {
         "provider": provider,
-        "label": BYOK_TRANSPORTS[provider].label,
-        "configured": bool(effective),
-        # "saved" can be removed from Settings; "env" lives in the server's
-        # .env and can't be, so the UI must not offer a Remove that does
-        # nothing.
-        "source": "saved" if stored else ("env" if effective else None),
+        "label": _provider_label(provider),
+        "kind": kind,
+        "connected": bool(effective),
+        "source": source,
         "hint": effective[-4:] if effective else None,
-        "models": config.get_provider_models(provider),
+        "models": len(config.get_provider_models(provider)) if kind != "free" else None,
+        "checkable": provider not in UNCHECKABLE,
     }
 
 
 @app.get("/config/keys")
 async def config_keys_list(request: Request) -> dict:
     await _require_role(request, "owner", "admin")
-    return {"providers": [_byok_status(p) for p in BYOK_TRANSPORTS]}
+    paid = [p for p in BYOK_TRANSPORTS if config.get_provider_key(p)]
+    return {
+        "catalog": key_catalog(),
+        # The free eight always show, connected or not, so the person can
+        # see what NAVI runs on. Paid and "Other" rows appear once they
+        # have a key.
+        "connected": [_key_row(p) for p in (*FREE_PROVIDERS, *paid, *config.custom_providers())],
+    }
 
 
 @app.post("/config/keys")
 async def config_keys_save(request: Request) -> JSONResponse:
-    """Checks the key against the provider BEFORE saving it — listing the
-    models it can use is the check — so a typo is refused here, with the
-    provider's own reason, instead of surfacing as a failed chat turn."""
+    """Checks the key with the provider BEFORE saving it, so a typo is
+    refused here, with the provider's own reason, instead of surfacing as a
+    failed chat turn. Nothing is saved when the check fails."""
     await _require_role(request, "owner", "admin")
     payload = await request.json()
     provider = payload.get("provider")
     api_key = (payload.get("api_key") or "").strip()
-    if provider not in BYOK_TRANSPORTS:
-        return JSONResponse({"error": f"unknown provider '{provider}'"}, status_code=400)
-    if not api_key:
-        return JSONResponse({"error": "paste a key first"}, status_code=400)
+    if not api_key or any(c.isspace() for c in api_key):
+        return JSONResponse({"error": "Paste the key on its own, with no spaces."}, status_code=400)
+
     try:
-        models = await asyncio.to_thread(BYOK_TRANSPORTS[provider].list_models, api_key)
+        if provider == "other":
+            name = (payload.get("name") or "").strip()
+            provider = custom_provider_id(name)
+            if not provider:
+                return JSONResponse({"error": "Give this provider a name."}, status_code=400)
+            base_url = await asyncio.to_thread(normalize_base_url, payload.get("base_url") or "")
+            models = await asyncio.to_thread(CustomOpenAIProvider.list_models_at, name, base_url, api_key)
+            if not models:
+                return JSONResponse({"error": f"{name} accepted the key but listed no chat models."}, status_code=400)
+            config.save_custom_provider(provider, name, base_url, api_key, models)
+
+        elif provider in BYOK_TRANSPORTS:
+            models = await asyncio.to_thread(BYOK_TRANSPORTS[provider].list_models, api_key)
+            config.set_provider_key(provider, api_key)
+            config.set_provider_models(provider, models)
+
+        elif provider in FREE_PROVIDERS:
+            account_id = (payload.get("account_id") or "").strip() or None
+            if provider == "cloudflare" and not re.fullmatch(r"[0-9a-fA-F]{32}", account_id or ""):
+                return JSONResponse({"error": "A Cloudflare Account ID is 32 letters and numbers, "
+                                              "shown on your Cloudflare dashboard."}, status_code=400)
+            await asyncio.to_thread(check_free_key, provider, api_key, account_id)
+            config.set_provider_key(provider, api_key)
+            if provider == "cloudflare":
+                config.set_cloudflare_account_id(account_id)
+
+        else:
+            return JSONResponse({"error": f"Unknown provider '{provider}'."}, status_code=400)
     except ProviderError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    config.set_provider_key(provider, api_key)
-    config.set_provider_models(provider, models)
-    return JSONResponse({"ok": True, **_byok_status(provider)})
+
+    return JSONResponse({"ok": True, "row": _key_row(provider)})
 
 
 @app.delete("/config/keys/{provider}")
 async def config_keys_delete(provider: str, request: Request) -> JSONResponse:
+    """Removes a key someone pasted. For a free provider NAVI goes back to
+    its own key; for anything else the provider disappears."""
     await _require_role(request, "owner", "admin")
-    if provider not in BYOK_TRANSPORTS:
-        return JSONResponse({"error": f"unknown provider '{provider}'"}, status_code=400)
-    # Refuse rather than silently strand a role: deleting the key a role is
-    # pinned to would make every turn on it fail with "no API key set".
+    if not _provider_kind(provider):
+        return JSONResponse({"error": f"Unknown provider '{provider}'."}, status_code=400)
+    if _key_row(provider)["source"] != "yours":
+        return JSONResponse({"error": "This key comes from the server's settings, not from here."}, status_code=400)
+    # Refuse rather than strand a role: if nothing takes this key's place,
+    # every turn on a role still using it would fail with "no API key".
     in_use = config.roles_using_provider(provider)
-    if in_use:
+    if in_use and not config.env_provider_key(provider):
+        names = ", ".join(_ROLE_LABELS.get(r, r) for r in in_use)
         return JSONResponse({
-            "error": f"{BYOK_TRANSPORTS[provider].label} is still in use by: {', '.join(in_use)}. "
-                     "Switch those back to default routing first.",
+            "error": f"{_provider_label(provider)} is still in use by {names}. "
+                     "Switch back to NAVI's default routing first.",
         }, status_code=409)
     config.delete_provider_key(provider)
-    return JSONResponse({"ok": True, **_byok_status(provider)})
+    return JSONResponse({"ok": True, "row": _key_row(provider) if _provider_kind(provider) else None})
 
 
 # ---- Dev Slate: Slate (conversation) management ----

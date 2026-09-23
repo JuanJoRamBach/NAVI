@@ -474,10 +474,13 @@ def get_savings_summary(days: int = 30) -> dict:
     on someone's own paid DeepSeek or Claude key cost real money, so
     counting it toward "what you'd have paid otherwise" would report
     savings on spend that actually happened."""
-    from providers.byok import BYOK_TRANSPORTS  # here, not at module top: providers.base imports this module
+    from providers.byok import BYOK_TRANSPORTS, CUSTOM_PREFIX  # here, not at module top: providers.base imports this module
 
     paid = tuple(BYOK_TRANSPORTS)
-    exclude = f"AND provider NOT IN ({', '.join('?' * len(paid))})" if paid else ""
+    exclude = (
+        f"AND provider NOT IN ({', '.join('?' * len(paid))}) "
+        f"AND provider NOT LIKE '{CUSTOM_PREFIX}%'"
+    )
     with _connect() as conn:
         conn.row_factory = sqlite3.Row
         totals = dict(conn.execute(

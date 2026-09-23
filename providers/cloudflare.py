@@ -29,8 +29,6 @@ way still gets a real usage_note, just possibly not Neuron-denominated
 until this is confirmed live.
 """
 
-import os
-
 import requests
 
 from providers.base import (
@@ -64,7 +62,11 @@ class CloudflareProvider(Provider):
         extra_params: dict | None = None,
         on_token=None,
     ) -> ChatResponse:
-        account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+        # Saved in Settings alongside a brought Cloudflare token, else .env.
+        # Imported here, not at module top, same as providers/base.py does.
+        from config.store import config
+
+        account_id = config.get_cloudflare_account_id()
         if not account_id:
             raise ProviderError("CLOUDFLARE_ACCOUNT_ID not set")
 

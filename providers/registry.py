@@ -9,7 +9,7 @@ transport class, add one line here. Nothing else in the codebase changes.
 
 from config.store import config
 from providers.base import Provider
-from providers.byok import BYOK_TRANSPORTS
+from providers.byok import BYOK_TRANSPORTS, CustomOpenAIProvider, is_custom_provider
 from providers.cloudflare import CloudflareProvider
 from providers.gemini import GeminiProvider
 from providers.gmi import GMIProvider
@@ -37,7 +37,9 @@ _TRANSPORTS: dict[str, type[Provider]] = {
 
 
 def is_byok_provider(name: str) -> bool:
-    return name in BYOK_TRANSPORTS
+    """A paid provider reached only through someone's own key — the named
+    ones and every "Other" entry."""
+    return name in BYOK_TRANSPORTS or is_custom_provider(name)
 
 
 class ProviderNotConfigured(Exception):
@@ -46,6 +48,13 @@ class ProviderNotConfigured(Exception):
 
 def get_provider(name: str) -> Provider:
     """Returns a ready-to-use provider instance, or raises if no key is set."""
+    if is_custom_provider(name):
+        custom = config.get_custom_provider(name)
+        api_key = config.get_provider_key(name)
+        if not custom or not api_key:
+            raise ProviderNotConfigured(f"'{name}' is no longer set up. Add it again in Settings.")
+        return CustomOpenAIProvider(api_key=api_key, name=name, label=custom["label"], base_url=custom["base_url"])
+
     if name not in _TRANSPORTS:
         raise ValueError(f"Unknown provider: {name}")
 

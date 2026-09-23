@@ -521,7 +521,9 @@ def fetch_cloudflare_models(api_key: str | None) -> list[dict]:
     models known to need a paid billing method regardless of Neuron
     budget, confirmed directly against a live response.
     """
-    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+    from config.store import config  # imported late, same as refresh_snapshot below
+
+    account_id = config.get_cloudflare_account_id()
     if not api_key or not account_id:
         return []
 
