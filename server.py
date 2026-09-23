@@ -75,7 +75,7 @@ from tools.telegram_send import TelegramSendError, send_to_telegram
 from messaging.base import IncomingMessage, MessagingAdapter, MessagingError
 from messaging.discord import DiscordAdapter
 from messaging.telegram import TelegramAdapter
-from config.store import config, encryption_status
+from config.store import NOT_FOR_CLIENT_DATA, config, encryption_status
 from providers.base import ProviderError
 from providers.byok import (
     BYOK_TRANSPORTS, CustomOpenAIProvider, custom_provider_id, is_custom_provider, normalize_base_url,
@@ -1525,6 +1525,10 @@ def config_models(task: str = Query(...)) -> dict:
     role_name = {"devslate": "dev_slate_chat", "agent_work": "agent_work", "normal_chat": "normal_chat"}.get(task)
     current_role = config.get_role(role_name) if role_name else None
     current = {"provider": current_role["provider"], "model": current_role["model"]} if current_role else None
+    if current and current["provider"] in NOT_FOR_CLIENT_DATA:
+        # The chat shows this over its input for as long as the model is
+        # selected (navi-pwa's ClientDataWarning).
+        current["client_data_warning"] = NOT_FOR_CLIENT_DATA[current["provider"]]
     # Whether the role is still on NAVI's shipped routing — lets the picker
     # offer "back to default" only when there's somewhere to go back from.
     default_role = config.default_role(role_name) if role_name else None
@@ -1582,7 +1586,10 @@ def config_models(task: str = Query(...)) -> dict:
              # carries the reason — the picker can show why rather than
              # just silently listing it last. Absent means "nothing
              # against it", which includes "never tried".
-             "demoted_reason": c.get("_demoted_reason")}
+             "demoted_reason": c.get("_demoted_reason"),
+             # Present on a provider whose terms don't protect what's sent
+             # to it; the picker warns and asks before selecting it.
+             "client_data_warning": NOT_FOR_CLIENT_DATA.get(c["provider"])}
             for c in candidates
         ] + byok_candidates,
     }
@@ -1690,6 +1697,7 @@ def _key_row(provider: str) -> dict:
         "hint": effective[-4:] if effective else None,
         "models": len(config.get_provider_models(provider)) if kind != "free" else None,
         "checkable": provider not in UNCHECKABLE,
+        "client_data_warning": NOT_FOR_CLIENT_DATA.get(provider),
     }
 
 
@@ -1701,7 +1709,7 @@ async def config_keys_list(request: Request) -> dict:
         # How saved keys are protected, so Settings can say so plainly and
         # warn when the server is still missing NAVI_SECRET_KEY.
         "encryption": encryption_status(),
-        "catalog": key_catalog(),
+        "catalog": [{**c, "client_data_warning": NOT_FOR_CLIENT_DATA.get(c["id"])} for c in key_catalog()],
         # The free eight always show, connected or not, so the person can
         # see what NAVI runs on. Paid and "Other" rows appear once they
         # have a key.

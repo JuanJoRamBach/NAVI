@@ -36,6 +36,7 @@ from typing import Callable
 
 from dispatcher.executor import _extract_tool_results, _parse_tool_args, run_tool_loop
 from dispatcher.provider_debug import save_failed_exchange
+from config.store import config
 from providers.base import ChatMessage, ChatResponse, ProviderError
 from providers.registry import (
     ProviderNotConfigured, get_dispatcher_role, get_provider, role_name_for_context,
@@ -228,7 +229,10 @@ def _call_for_node(
     except ProviderNotConfigured as e:
         raise WorkflowError(f"role 'agent_work' isn't configured: {e}")
 
-    attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
+    # Through get_attempts like every other chain: it demotes endpoints
+    # cooling down and keeps providers unsafe for client data out of
+    # fallback positions.
+    attempts = config.get_attempts([{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", []))
     last_error = None
     for i, attempt in enumerate(attempts):
         try:
@@ -1412,7 +1416,7 @@ def resolve_schedule(description: str) -> dict:
         ChatMessage(role="user", content=description),
     ]
 
-    attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
+    attempts = config.get_attempts([{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", []))
     last_error = None
     for i, attempt in enumerate(attempts):
         try:

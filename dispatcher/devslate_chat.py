@@ -33,6 +33,7 @@ from typing import Awaitable, Callable
 from dispatcher.mode_briefs import get_mode_brief
 from dispatcher.executor import strip_reasoning_tags
 from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, classify_family
+from config.store import config
 from providers.base import ChatMessage, ProviderError
 from providers.registry import (
     ProviderNotConfigured, get_dispatcher_role, get_provider, role_name_for_context,
@@ -123,7 +124,10 @@ async def run_devslate_turn(conversation_id: str, user_text: str, relay: ToolRel
         await append_message(conversation_id, "navi", text)
         return {"text": text, "provider": None, "model": None}
 
-    attempts = [{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", [])
+    # Through get_attempts like every other chain: it demotes endpoints
+    # cooling down and keeps providers unsafe for client data out of
+    # fallback positions.
+    attempts = config.get_attempts([{"provider": role["provider"], "model": role["model"]}] + role.get("fallback", []))
     last_error = None
 
     for i, attempt in enumerate(attempts):

@@ -3,8 +3,13 @@ jobs/test_tool_calling.py
 
 "Can this (provider, model) actually do tool calling?" — provider-agnostic.
 
-    venv/bin/python -m jobs.test_tool_calling <provider> <model>
+    venv/bin/python -m jobs.test_tool_calling <provider> <model> [--forced]
     venv/bin/python -m jobs.test_tool_calling cloudflare @cf/nvidia/nemotron-3-120b-a12b
+
+--forced names the tool in tool_choice instead of leaving it to the model.
+That's what /graph-data and /remind do (render_chart, set_reminder), and a
+model can handle "auto" fine and still reject or ignore a named choice, so
+check a model with --forced before routing either command to it.
 
 This keeps coming up and it's never been answerable without writing a
 throwaway script. A catalog's own `tools` flag is not enough on its own —
@@ -39,19 +44,20 @@ WEATHER_TOOL = [{
 }]
 
 
-def check(provider_name: str, model: str) -> bool:
+def check(provider_name: str, model: str, forced: bool = False) -> bool:
     try:
         provider = get_provider(provider_name)
     except (ProviderNotConfigured, ValueError) as e:
         print(f"FAIL: {e}")
         return False
 
-    print(f"=== {provider_name} / {model} ===")
+    print(f"=== {provider_name} / {model}{' (forced)' if forced else ''} ===")
     try:
         r = provider.chat(
             model=model,
             messages=[ChatMessage(role="user", content="What's the weather in Valencia? Use the tool.")],
             tools=WEATHER_TOOL,
+            tool_choice={"type": "function", "function": {"name": "get_weather"}} if forced else None,
         )
     except ProviderError as e:
         print(f"FAIL: {e}")
@@ -77,10 +83,11 @@ def check(provider_name: str, model: str) -> bool:
 
 
 def main() -> None:
-    if len(sys.argv) < 3:
+    args = [a for a in sys.argv[1:] if a != "--forced"]
+    if len(args) < 2:
         print(__doc__)
         sys.exit(2)
-    sys.exit(0 if check(sys.argv[1], sys.argv[2]) else 1)
+    sys.exit(0 if check(args[0], args[1], forced="--forced" in sys.argv) else 1)
 
 
 if __name__ == "__main__":

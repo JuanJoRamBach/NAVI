@@ -197,6 +197,26 @@ PROVIDER_KEY_ENV = {
     "moonshot": "MOONSHOT_API_KEY",
 }
 
+# Providers whose terms don't protect what's sent to them (checked against
+# each provider's own terms, 2026-09-23). NAVI never routes to them on its
+# own: get_attempts drops them from every fallback position, whatever the
+# config says, and none is a default primary. They stay available when a
+# person picks one by hand, and the UI then warns on the chat itself.
+NOT_FOR_CLIENT_DATA = {
+    # Terms license it to use prompts to "improve the Service", give no
+    # retention period for them, don't name the model companies it forwards
+    # to, and say it is not for production use.
+    "llm7": "Its terms let it use what you send to improve its service.",
+    # Its only published privacy notice covers website visitors; nothing
+    # says what happens to content sent to its API.
+    "gmi": "It publishes no terms for what you send its API.",
+    # NAVI only uses OpenRouter's free endpoints, and OpenRouter's own help
+    # center says most of those "train on, or may publish, the prompts they
+    # receive".
+    "openrouter": "Its free models may train on or publish what you send.",
+}
+
+
 # server.py's first-boot seeding has always read Ollama's key from
 # OLLAMA_API_KEY while the map above says OLLAMA_CLOUD_API_KEY, so a server
 # can have either. Both are checked rather than one being silently missed.
@@ -353,18 +373,23 @@ DEFAULTS = {
         # per-model on Gemini's free tier, so idle and exploratory sit on
         # two DIFFERENT Flash-Lite models to get two independent 500/day
         # pools rather than sharing one. Both are 1M context.
+        #
+        # Last hop is Mistral, not LLM7 (2026-09-23): LLM7's terms license
+        # it to use prompts to "improve the Service" and say it isn't for
+        # production, so it may not sit anywhere a chat can reach it
+        # without someone choosing it. See NOT_FOR_CLIENT_DATA.
         "normal_chat": {
             "provider": "gemini", "model": "gemini-3.1-flash-lite",
             "fallback": [
                 {"provider": "cloudflare", "model": "@cf/openai/gpt-oss-20b"},
-                {"provider": "llm7", "model": "minimax-m2.7"},
+                {"provider": "mistral", "model": "mistral-small-latest"},
             ],
         },
         "normal_chat_exploratory": {
             "provider": "gemini", "model": "gemini-3.5-flash-lite",
             "fallback": [
                 {"provider": "cloudflare", "model": "@cf/qwen/qwen3.8-27b"},
-                {"provider": "llm7", "model": "minimax-m2.7"},
+                {"provider": "mistral", "model": "mistral-small-latest"},
             ],
         },
         # Serious leads with Cloudflare because its Neurons budget absorbs
@@ -380,7 +405,7 @@ DEFAULTS = {
             "provider": "cloudflare", "model": "@cf/nvidia/nemotron-3-120b-a12b",
             "fallback": [
                 {"provider": "gemini", "model": "gemini-3.8-flash"},
-                {"provider": "llm7", "model": "minimax-m2.7"},
+                {"provider": "mistral", "model": "mistral-small-latest"},
             ],
         },
         "dispatcher_autonomous": {"provider": "groq", "model": "openai/gpt-oss-120b"},
@@ -407,9 +432,14 @@ DEFAULTS = {
         # file content even enters the picture â€” unchanged reasoning from
         # before this fallback swap, still applies regardless of which
         # model ends up in the fallback slot.
+        # 2026-09-23: that LLM7 fallback is gone twice over — LLM7 retired
+        # gpt-oss on 2026-09-12 (live configs were already moved to
+        # Ministral by that day's migration; this default never was), and
+        # LLM7 is no longer allowed in any fallback (NOT_FOR_CLIENT_DATA).
+        # Default now matches what live servers already run.
         "dev_slate_chat": {
             "provider": "cloudflare", "model": "@cf/qwen/qwen2.5-coder-32b-instruct",
-            "fallback": [{"provider": "llm7", "model": "gpt-oss"}],
+            "fallback": [{"provider": "mistral", "model": "ministral-8b-latest"}],
         },
         # context_synthesis (2026-09-13): every whole-conversation
         # synthesis job â€” context.md compaction (dispatcher/compaction.py's
@@ -504,8 +534,15 @@ DEFAULTS = {
             # forced render_chart call). The two originally hardcoded here
             # went stale within the same day they were written â€” exactly
             # the churn problem the daily-ranking job is meant to solve.
-            "primary": {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
-            "fallback": [{"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}],
+            #
+            # Moved off OpenRouter 2026-09-23: its free endpoints train on
+            # or may publish prompts (OpenRouter's own help center: "Most
+            # free endpoints train on, or may publish, the prompts they
+            # receive"), and a chart is built from the user's own figures.
+            # Groq neither trains nor keeps prompts; the forced
+            # render_chart call was live-tested on it the same day.
+            "primary": {"provider": "groq", "model": "openai/gpt-oss-120b"},
+            "fallback": [{"provider": "cloudflare", "model": "@cf/openai/gpt-oss-120b"}],
         },
         "summarize": {
             # Own quota bucket, same reasoning as dispatcher_autonomous vs
@@ -530,8 +567,10 @@ DEFAULTS = {
             # Needs a forced tool_choice call (same requirement as
             # graph-data's render_chart) â€” reusing the same openrouter
             # models already verified to support that.
-            "primary": {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"},
-            "fallback": [{"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}],
+            # Moved to Groq 2026-09-23 with graph-data, same reason; the
+            # forced set_reminder call was live-tested on it.
+            "primary": {"provider": "groq", "model": "openai/gpt-oss-120b"},
+            "fallback": [{"provider": "cloudflare", "model": "@cf/openai/gpt-oss-120b"}],
         },
         # source_fetch: the Sources tab's "Batch Dispatch" â€” searches each
         # term against the user's Trusted Sites registry (enforced in
@@ -932,7 +971,18 @@ class ConfigStore:
         demoted, not dropped, so a chain where every entry happens to be
         cooling down still gets tried in its original order rather than
         failing outright. Callers build the flat attempts list exactly as
-        before and pass it through this before looping it."""
+        before and pass it through this before looping it.
+
+        Also DROPS any NOT_FOR_CLIENT_DATA provider from a fallback
+        position (2026-09-23). The first entry is the one someone chose, so
+        it stays even if it's one of them: picking LLM7 by hand is allowed
+        and warned about. What must never happen is a chat quietly landing
+        there because its chosen model failed. Enforced here, the one place
+        every chain passes through, rather than trusted to each config."""
+        candidates = [
+            c for i, c in enumerate(candidates)
+            if i == 0 or c.get("provider") not in NOT_FOR_CLIENT_DATA
+        ]
         now = time.time()
         cooldowns = self._data.get("rate_limit_cooldowns", {})
 
@@ -1599,3 +1649,58 @@ def _migrate_context_synthesis_primary_2026_09_14():
 
 
 _migrate_context_synthesis_primary_2026_09_14()
+
+
+_OLD_OPENROUTER_FREE_PRIMARY = {"provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free"}
+
+
+def _migrate_client_data_safe_routing_2026_09_23():
+    """Takes the NOT_FOR_CLIENT_DATA providers out of every default route on
+    an already-materialized config.json.
+
+    - Fallback chains: every such entry is removed, and a chain that loses
+      its last hop gets Mistral in its place so it doesn't shrink. Runs on
+      every start, not once: get_attempts already refuses to use these in a
+      fallback position, so this just keeps the stored config truthful
+      about it (the Routing panel shows these chains).
+    - Primaries of roles are NOT touched. A primary on one of these got
+      there because someone picked it, and that's allowed — the chat shows
+      the warning instead.
+    - /graph-data and /remind move to Groq only if they still sit on the
+      OpenRouter default. Nothing in the UI edits command routing, so the
+      old default is the only way they can be there."""
+    changed = False
+    replacement = {"provider": "mistral", "model": "mistral-small-latest"}
+
+    for name, role in list((config._data.get("roles") or {}).items()):
+        fallback = role.get("fallback") or []
+        kept = [f for f in fallback if f.get("provider") not in NOT_FOR_CLIENT_DATA]
+        if len(kept) != len(fallback):
+            providers_left = {role.get("provider")} | {f.get("provider") for f in kept}
+            if replacement["provider"] not in providers_left:
+                kept.append(dict(replacement))
+            config.set_role(name, role["provider"], role["model"], fallback=kept)
+            changed = True
+
+    for command in ("graph-data", "remind"):
+        routing = config.get_task_routing(command)
+        if routing and routing.get("primary") == _OLD_OPENROUTER_FREE_PRIMARY:
+            config.set_task_routing(
+                command,
+                {"provider": "groq", "model": "openai/gpt-oss-120b"},
+                [{"provider": "cloudflare", "model": "@cf/openai/gpt-oss-120b"}],
+            )
+            changed = True
+
+    for command, routing in list((config._data.get("task_routing") or {}).items()):
+        fallback = routing.get("fallback") or []
+        kept = [f for f in fallback if f.get("provider") not in NOT_FOR_CLIENT_DATA]
+        if len(kept) != len(fallback):
+            config.set_task_routing(command, routing["primary"], kept)
+            changed = True
+
+    if changed:
+        print("[config] routing: providers not safe for client data removed from default routes", flush=True)
+
+
+_migrate_client_data_safe_routing_2026_09_23()
