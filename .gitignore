@@ -100,6 +100,11 @@ aa_benchmarks_cache.json
 # measurements are worth keeping in history.
 benchmarks/
 
+# Deploy and server notes (2026-09-23) — kept local, same reasoning as
+# IDEAS.md above: operating notes for whoever is running this server, not
+# project documentation to publish with the code.
+HANDOFF.md
+
 # The "what is NAVI" handoff written for a separate chat exploring a
 # game-dev/designer harness (2026-09-14) — cross-project continuity
 # notes, same reasoning as IDEAS.md and MARKET_RESEARCH.md above: written
