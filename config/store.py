@@ -110,7 +110,32 @@ PROVIDER_KEY_ENV = {
     "gmi": "GMI_API_KEY",
     "ollama_cloud": "OLLAMA_CLOUD_API_KEY",
     "nvidia_nim": "NVIDIA_NIM_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
 }
+
+
+def _decrypt_provider_key(value: str | None) -> str | None:
+    """Like _decrypt_secret, but a value that IS a Fernet token and still
+    won't decrypt (the key file was lost, or NAVI_MCP_SECRET_KEY changed)
+    comes back as None rather than as ciphertext.
+
+    That difference matters here and not for MCP: get_provider_key lets a
+    stored key win over the environment, so returning ciphertext would
+    shadow a perfectly good .env key with garbage and every call would fail
+    auth. None lets the env fallback take over. Anything that is not a
+    Fernet token is a key saved before encryption existed and is returned
+    as-is — encryption applies from the next save, no migration pass."""
+    if not value:
+        return None
+    if not value.startswith("gAAAAA"):
+        return value
+    from cryptography.fernet import InvalidToken
+
+    try:
+        return _get_fernet().decrypt(value.encode()).decode()
+    except InvalidToken:
+        return None
 
 DEFAULTS = {
     "providers": {
@@ -133,6 +158,13 @@ DEFAULTS = {
         # not a blog summary. Don't enable this without a paid NVIDIA AI
         # Enterprise subscription.
         "nvidia_nim": {"api_key": None, "enabled": False},
+        # Bring-your-own-key (2026-09-23). Never in any default role or
+        # fallback chain: paid per token on the key owner's own account, so
+        # NAVI only uses them when someone saves a key in Settings AND
+        # explicitly picks one of their models. `models` is filled from the
+        # provider's live model list at save time (providers/byok.py).
+        "deepseek": {"api_key": None, "enabled": False, "models": []},
+        "anthropic": {"api_key": None, "enabled": False, "models": []},
     },
     "roles": {
         # Two SEPARATE dispatcher roles, deliberately not sharing a quota bucket.
@@ -554,11 +586,40 @@ class ConfigStore:
     # ---- Provider keys ----
 
     def set_provider_key(self, provider: str, api_key: str):
-        """Called when the user sends the agent a new API key in chat."""
+        """Saves a provider key, encrypted at rest (2026-09-23).
+
+        Until BYOK this file held every provider key in plaintext — a known
+        gap flagged next to the MCP encryption. It stopped being acceptable
+        once the keys could be someone's own paid account, so they now go
+        through the same Fernet cipher MCP credentials use. Keys saved
+        before this still read fine (see _decrypt_provider_key)."""
         self._data.setdefault("providers", {}).setdefault(provider, {})
-        self._data["providers"][provider]["api_key"] = api_key
+        self._data["providers"][provider]["api_key"] = _encrypt_secret(api_key)
         self._data["providers"][provider]["enabled"] = True
         self._save()
+
+    def delete_provider_key(self, provider: str):
+        cfg = self._data.get("providers", {}).get(provider)
+        if cfg is None:
+            return
+        cfg["api_key"] = None
+        cfg["enabled"] = False
+        if "models" in cfg:
+            cfg["models"] = []
+        self._save()
+
+    def stored_provider_key(self, provider: str) -> str | None:
+        """The key saved in this store only — no environment fallback.
+        Settings uses it to tell a key someone saved (removable) apart from
+        one that comes from the server's .env (not removable from the UI)."""
+        return _decrypt_provider_key(self._data.get("providers", {}).get(provider, {}).get("api_key"))
+
+    def set_provider_models(self, provider: str, models: list[str]):
+        self._data.setdefault("providers", {}).setdefault(provider, {})["models"] = list(models)
+        self._save()
+
+    def get_provider_models(self, provider: str) -> list[str]:
+        return list(self._data.get("providers", {}).get(provider, {}).get("models") or [])
 
     def get_provider_key(self, provider: str) -> str | None:
         """Config store first, environment second.
@@ -575,7 +636,7 @@ class ConfigStore:
         Store wins over env deliberately: a key set at runtime through
         the real config route is an explicit, deliberate act and must not
         be shadowed by a stale environment variable."""
-        stored = self._data.get("providers", {}).get(provider, {}).get("api_key")
+        stored = self.stored_provider_key(provider)
         if stored:
             return stored
         env_name = PROVIDER_KEY_ENV.get(provider)
@@ -600,6 +661,35 @@ class ConfigStore:
             "provider": provider, "model": model, "fallback": fallback or [],
         }
         self._save()
+
+    @staticmethod
+    def default_role(role: str) -> dict | None:
+        return DEFAULTS["roles"].get(role)
+
+    def roles_using_provider(self, provider: str) -> list[str]:
+        """Every role that would call this provider, as primary or anywhere
+        in its fallback chain."""
+        return [
+            name for name, role in (self._data.get("roles") or {}).items()
+            if role and (role.get("provider") == provider
+                         or any(f.get("provider") == provider for f in role.get("fallback") or []))
+        ]
+
+    def reset_role(self, role: str) -> dict | None:
+        """Puts a role back on its shipped default, fallback chain included.
+
+        A manual pick clears the fallback chain (see POST /config/role), so
+        before this, picking a model and then picking the old one back did
+        NOT restore the original routing — it left the old primary with no
+        fallbacks at all. Trying a BYOK model and coming back is exactly that
+        round trip, so it needs a real way home. Returns None for a role
+        with no default."""
+        default = DEFAULTS["roles"].get(role)
+        if default is None:
+            return None
+        self._data.setdefault("roles", {})[role] = json.loads(json.dumps(default))
+        self._save()
+        return self._data["roles"][role]
 
     # ---- Task routing (per-command primary/fallback) ----
 

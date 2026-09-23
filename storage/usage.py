@@ -468,28 +468,37 @@ def get_savings_summary(days: int = 30) -> dict:
     near-free tier, so the honest, defensible claim is about token
     volume against real reference prices, not a real-vs-real dollar
     comparison that would need per-provider pricing this file doesn't
-    track (a separate, larger piece of work, not this one)."""
+    track (a separate, larger piece of work, not this one).
+
+    Bring-your-own-key providers are left out entirely (2026-09-23): a call
+    on someone's own paid DeepSeek or Claude key cost real money, so
+    counting it toward "what you'd have paid otherwise" would report
+    savings on spend that actually happened."""
+    from providers.byok import BYOK_TRANSPORTS  # here, not at module top: providers.base imports this module
+
+    paid = tuple(BYOK_TRANSPORTS)
+    exclude = f"AND provider NOT IN ({', '.join('?' * len(paid))})" if paid else ""
     with _connect() as conn:
         conn.row_factory = sqlite3.Row
         totals = dict(conn.execute(
-            """
+            f"""
             SELECT
                 COALESCE(SUM(requests), 0) AS total_requests,
                 COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens,
                 COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens
             FROM usage_daily
-            WHERE day_utc >= date('now', ?)
+            WHERE day_utc >= date('now', ?) {exclude}
             """,
-            (f"-{days} days",),
+            (f"-{days} days", *paid),
         ).fetchone())
         cf_rows = conn.execute(
-            """
+            f"""
             SELECT reference_model, COALESCE(SUM(usd), 0) AS usd
             FROM usage_reference_costs
-            WHERE day_utc >= date('now', ?)
+            WHERE day_utc >= date('now', ?) {exclude}
             GROUP BY reference_model
             """,
-            (f"-{days} days",),
+            (f"-{days} days", *paid),
         ).fetchall()
     totals["days"] = days
     totals["counterfactual_usd"] = {row["reference_model"]: row["usd"] for row in cf_rows}

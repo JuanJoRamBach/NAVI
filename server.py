@@ -75,6 +75,8 @@ from messaging.base import IncomingMessage, MessagingAdapter, MessagingError
 from messaging.discord import DiscordAdapter
 from messaging.telegram import TelegramAdapter
 from config.store import config
+from providers.base import ProviderError
+from providers.byok import BYOK_TRANSPORTS
 from jobs.model_ranking import SNAPSHOT_SCHEMA_VERSION, fetch_aa_benchmarks, list_candidates, load_snapshot, refresh_snapshot
 from push.sender import PushError, add_subscription, send_push, subscription_count
 from storage.filen import StorageError, download_for_reply, file_download_url
@@ -1515,9 +1517,30 @@ def config_models(task: str = Query(...)) -> dict:
     role_name = {"devslate": "dev_slate_chat", "agent_work": "agent_work", "normal_chat": "normal_chat"}.get(task)
     current_role = config.get_role(role_name) if role_name else None
     current = {"provider": current_role["provider"], "model": current_role["model"]} if current_role else None
+    # Whether the role is still on NAVI's shipped routing — lets the picker
+    # offer "back to default" only when there's somewhere to go back from.
+    default_role = config.default_role(role_name) if role_name else None
+    is_default = bool(
+        default_role and current_role
+        and current_role.get("provider") == default_role["provider"]
+        and current_role.get("model") == default_role["model"]
+        and (current_role.get("fallback") or []) == (default_role.get("fallback") or [])
+    )
+    # Models reachable through a key someone saved in Settings. Listed
+    # after the ranked free models and flagged, never ranked among them:
+    # the ranking snapshot only knows the free catalog, so a quality score
+    # here would be invented.
+    byok_candidates = [
+        {"provider": p, "model": m, "context_length": None, "quality": 0, "speed": 0, "byok": True}
+        for p in BYOK_TRANSPORTS if config.get_provider_key(p)
+        for m in config.get_provider_models(p)
+    ]
 
     if not snapshot:
-        return {"task": task, "current": current, "candidates": [current] if current else [], "fetched_at": None}
+        return {
+            "task": task, "current": current, "is_default": is_default,
+            "candidates": ([current] if current else []) + byok_candidates, "fetched_at": None,
+        }
 
     aa_index = fetch_aa_benchmarks(None)  # cache-only — no live fetch from a GET handler
     # The trust index PERSISTED in the snapshot, not a fresh read: the
@@ -1536,6 +1559,7 @@ def config_models(task: str = Query(...)) -> dict:
         # than assuming from the code alone that it must be.
         "fetched_at": snapshot.get("fetched_at"),
         "current": current,
+        "is_default": is_default,
         # quality/speed (2026-09-06) are the same real numbers
         # list_candidates ranks by, not new computation here — lets the
         # picker UI show/group by real signal instead of a flat list.
@@ -1551,7 +1575,7 @@ def config_models(task: str = Query(...)) -> dict:
              # against it", which includes "never tried".
              "demoted_reason": c.get("_demoted_reason")}
             for c in candidates
-        ],
+        ] + byok_candidates,
     }
 
 
@@ -1571,6 +1595,87 @@ async def config_role(request: Request) -> JSONResponse:
         return JSONResponse({"error": f"provider '{provider}' has no API key configured"}, status_code=400)
     config.set_role(role, provider, model, fallback=[])
     return JSONResponse({"ok": True, "role": config.get_role(role)})
+
+
+@app.post("/config/role/reset")
+async def config_role_reset(request: Request) -> JSONResponse:
+    """Puts a role back on NAVI's shipped routing, fallback chain included —
+    the way home after trying a model by hand (see ConfigStore.reset_role)."""
+    payload = await request.json()
+    role = payload.get("role")
+    restored = config.reset_role(role) if role else None
+    if restored is None:
+        return JSONResponse({"error": f"no default routing for role '{role}'"}, status_code=400)
+    return JSONResponse({"ok": True, "role": restored})
+
+
+# ---- Bring your own key (2026-09-23) ----
+#
+# Owner/Admin only: a saved key spends money on someone's own account, and
+# once saved, any member's chat can end up on it. The key itself never
+# leaves the server — responses carry only whether one is set, where it
+# came from, and its last four characters so a person can tell two keys
+# apart.
+
+def _byok_status(provider: str) -> dict:
+    stored = config.stored_provider_key(provider)
+    effective = config.get_provider_key(provider)
+    return {
+        "provider": provider,
+        "label": BYOK_TRANSPORTS[provider].label,
+        "configured": bool(effective),
+        # "saved" can be removed from Settings; "env" lives in the server's
+        # .env and can't be, so the UI must not offer a Remove that does
+        # nothing.
+        "source": "saved" if stored else ("env" if effective else None),
+        "hint": effective[-4:] if effective else None,
+        "models": config.get_provider_models(provider),
+    }
+
+
+@app.get("/config/keys")
+async def config_keys_list(request: Request) -> dict:
+    await _require_role(request, "owner", "admin")
+    return {"providers": [_byok_status(p) for p in BYOK_TRANSPORTS]}
+
+
+@app.post("/config/keys")
+async def config_keys_save(request: Request) -> JSONResponse:
+    """Checks the key against the provider BEFORE saving it — listing the
+    models it can use is the check — so a typo is refused here, with the
+    provider's own reason, instead of surfacing as a failed chat turn."""
+    await _require_role(request, "owner", "admin")
+    payload = await request.json()
+    provider = payload.get("provider")
+    api_key = (payload.get("api_key") or "").strip()
+    if provider not in BYOK_TRANSPORTS:
+        return JSONResponse({"error": f"unknown provider '{provider}'"}, status_code=400)
+    if not api_key:
+        return JSONResponse({"error": "paste a key first"}, status_code=400)
+    try:
+        models = await asyncio.to_thread(BYOK_TRANSPORTS[provider].list_models, api_key)
+    except ProviderError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    config.set_provider_key(provider, api_key)
+    config.set_provider_models(provider, models)
+    return JSONResponse({"ok": True, **_byok_status(provider)})
+
+
+@app.delete("/config/keys/{provider}")
+async def config_keys_delete(provider: str, request: Request) -> JSONResponse:
+    await _require_role(request, "owner", "admin")
+    if provider not in BYOK_TRANSPORTS:
+        return JSONResponse({"error": f"unknown provider '{provider}'"}, status_code=400)
+    # Refuse rather than silently strand a role: deleting the key a role is
+    # pinned to would make every turn on it fail with "no API key set".
+    in_use = config.roles_using_provider(provider)
+    if in_use:
+        return JSONResponse({
+            "error": f"{BYOK_TRANSPORTS[provider].label} is still in use by: {', '.join(in_use)}. "
+                     "Switch those back to default routing first.",
+        }, status_code=409)
+    config.delete_provider_key(provider)
+    return JSONResponse({"ok": True, **_byok_status(provider)})
 
 
 # ---- Dev Slate: Slate (conversation) management ----

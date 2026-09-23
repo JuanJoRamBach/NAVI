@@ -44,7 +44,8 @@ from dispatcher.prompt_family import adapt_request_params, adapt_system_prompt, 
 from dispatcher.provider_debug import save_failed_exchange
 from providers.base import ChatMessage, ProviderError
 from providers.registry import (
-    ProviderNotConfigured, get_dispatcher_role, get_provider, next_chat_tier, role_name_for_context,
+    ProviderNotConfigured, get_dispatcher_role, get_provider, is_byok_provider, next_chat_tier,
+    role_name_for_context,
 )
 from storage.context_store import (
     SOURCE_ASSISTANT, SOURCE_BRANCH_RESULT, append_entry, build_context_block,
@@ -686,6 +687,12 @@ async def run_stored_mode_chat(
     # the privilege. It also removes the only way to reach the
     # escalation-at-ceiling branch by accident.
     if "request_stronger_model" in tool_names and not next_chat_tier(tier):
+        tool_names.remove("request_stronger_model")
+    # A model picked through someone's own key (DeepSeek, Claude) is an
+    # explicit choice, usually made to see how THAT model does. Escalating
+    # to the next free tier would quietly answer with a different model and
+    # spoil the comparison, so there is nothing to escalate to.
+    if "request_stronger_model" in tool_names and is_byok_provider(role.get("provider", "")):
         tool_names.remove("request_stronger_model")
     tools = schemas_for(tool_names) if tool_names else None
     base_system_parts = [brief.system_prompt]

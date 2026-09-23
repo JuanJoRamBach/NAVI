@@ -9,6 +9,7 @@ transport class, add one line here. Nothing else in the codebase changes.
 
 from config.store import config
 from providers.base import Provider
+from providers.byok import BYOK_TRANSPORTS
 from providers.cloudflare import CloudflareProvider
 from providers.gemini import GeminiProvider
 from providers.gmi import GMIProvider
@@ -29,7 +30,14 @@ _TRANSPORTS: dict[str, type[Provider]] = {
     "gemini": GeminiProvider,
     # nvidia_nim deliberately NOT added — its free tier's own Terms of
     # Service prohibit production use (see config/store.py's note).
+    # Bring-your-own-key providers (DeepSeek, Claude): only reachable once
+    # someone saves a key in Settings AND picks one of their models.
+    **BYOK_TRANSPORTS,
 }
+
+
+def is_byok_provider(name: str) -> bool:
+    return name in BYOK_TRANSPORTS
 
 
 class ProviderNotConfigured(Exception):
