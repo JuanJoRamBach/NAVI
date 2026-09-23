@@ -1764,7 +1764,7 @@ async def config_keys_save(request: Request) -> JSONResponse:
 
     # Audit line in the server log: who, what, which key by its last four.
     # Never the key.
-    print(f"[config.keys] {user['email']} added a key for {provider} (…{api_key[-4:]})")
+    print(f"[config.keys] {user['email']} added a key for {provider} (…{api_key[-4:]})", flush=True)
     return JSONResponse({"ok": True, "row": _key_row(provider)})
 
 
@@ -1810,7 +1810,7 @@ async def config_keys_delete(provider: str, request: Request) -> JSONResponse:
                      "Switch back to NAVI's default routing first.",
         }, status_code=409)
     config.delete_provider_key(provider)
-    print(f"[config.keys] {user['email']} removed the key for {provider}")
+    print(f"[config.keys] {user['email']} removed the key for {provider}", flush=True)
     return JSONResponse({"ok": True, "row": _key_row(provider) if _provider_kind(provider) else None})
 
 
@@ -2616,13 +2616,17 @@ def _reencrypt_secrets_at_start() -> None:
     try:
         result = config.reencrypt_secrets()
     except Exception as e:  # noqa: BLE001
-        print(f"[config.store] re-encrypting saved secrets failed: {type(e).__name__}: {e}")
+        print(f"[config.store] re-encrypting saved secrets failed: {type(e).__name__}: {e}", flush=True)
         return
     status = encryption_status()
+    # flush: under systemd, stdout is block-buffered unless PYTHONUNBUFFERED
+    # is set, so a plain print can sit unwritten for hours. This is the line
+    # a deploy is checked by; it has to reach the journal immediately.
     print(
         f"[config.store] saved secrets: {result['reencrypted']} re-encrypted, "
         f"{result['unreadable']} unreadable; key from "
-        f"{status['env_name'] or 'the local key file (set NAVI_SECRET_KEY)'}"
+        f"{status['env_name'] or 'the local key file (set NAVI_SECRET_KEY)'}",
+        flush=True,
     )
 
 

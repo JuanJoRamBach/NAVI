@@ -100,7 +100,10 @@ def _keyring():
         print(
             f"[config.store] WARNING: NAVI_SECRET_KEY is not set. Generated {_MCP_KEY_PATH} to "
             "encrypt saved API keys. That key sits on the same disk as the keys and is not "
-            "backed up. Set NAVI_SECRET_KEY in the server's .env."
+            "backed up. Set NAVI_SECRET_KEY in the server's .env.",
+            # flush: under systemd stdout is buffered, and a security warning
+            # sitting unwritten in a buffer is one nobody can find.
+            flush=True,
         )
         fernets.append(Fernet(key))
     _keyring_cache = MultiFernet(fernets)
@@ -159,7 +162,8 @@ def _decrypt_secret(value: str | None) -> str | None:
             print(
                 f"[config.store] WARNING: a saved secret ({tag}) can't be decrypted with the current "
                 "NAVI_SECRET_KEY. If the key was changed, put the old one after the new one, "
-                "comma-separated, and restart."
+                "comma-separated, and restart.",
+                flush=True,
             )
         return None
 
