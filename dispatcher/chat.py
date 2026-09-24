@@ -55,6 +55,7 @@ from storage.usage import current_call_context, set_call_context
 from storage.conversations import (
     append_message, get_conversation, get_messages, get_task_state, set_task_state,
 )
+from storage.knowledge import brief_block
 from tools.registry import schemas_for
 
 RECENT_MESSAGE_WINDOW = 20
@@ -698,6 +699,20 @@ async def run_stored_mode_chat(
     base_system_parts = [brief.system_prompt]
     if tools:
         base_system_parts.append(CITATION_STYLE_PROMPT)
+    # Company and project briefs (storage/knowledge.py, 2026-09-24). In the
+    # system message, unlike context.md below, and on purpose: a brief is
+    # an instruction the company set, so it needs the system message's
+    # authority, not to ride along with the user's own words. The prefix-
+    # cache cost the context.md comment warns about applies, but a brief
+    # only changes when a change is approved or the chat moves project,
+    # not when a chat flags an insight, so the cost is rare. Agent Work is
+    # left out, same as for context.md: it is deliberately stateless.
+    project_id = None
+    if mode != "agent_work":
+        project_id = ((await get_conversation(conversation_id)) or {}).get("project_id")
+        briefs = await asyncio.to_thread(brief_block, project_id)
+        if briefs:
+            base_system_parts.append(briefs)
     # context.md (2026-09-13) — the conversation's distilled durable memory,
     # riding along on every turn so a fact established 50 messages ago still
     # reaches the model after RECENT_MESSAGE_WINDOW scrolled past it. Sits
@@ -1023,7 +1038,13 @@ async def run_stored_mode_chat(
                     await emit_status(emit, events.running_tool(tc.name), kind="tool")
                 response, sent_messages, iterations = await asyncio.to_thread(
                     run_tool_loop, provider, attempt["model"], messages, response,
-                    context={"command": f"chat-{mode}", "topic_slug": "chat"}, tools=tools, extra_params=extra_params,
+                    # conversation_id and project_id scope search_knowledge
+                    # and suggest_knowledge to this chat's own project.
+                    context={
+                        "command": f"chat-{mode}", "topic_slug": "chat",
+                        "conversation_id": conversation_id, "project_id": project_id,
+                    },
+                    tools=tools, extra_params=extra_params,
                 )
                 created_workflow_id = _extract_created_workflow_id(sent_messages)
                 print(

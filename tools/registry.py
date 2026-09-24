@@ -405,6 +405,63 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_knowledge",
+            "description": "Searches what this company has written down about itself and, "
+                            "when this chat is in a project, about that project: policies, "
+                            "client facts, decisions, how things are done here. Use it "
+                            "BEFORE assuming anything company- or client-specific that the "
+                            "briefs above don't already answer (who a client is, a price "
+                            "rule, a house style, a past decision). Don't use it for general "
+                            "knowledge or for things the user just told you.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "A few keywords, not a sentence: \"refund policy\", "
+                                        "\"Acme invoicing\".",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "suggest_knowledge",
+            "description": "Suggests adding ONE lasting fact to the company's knowledge, or "
+                            "the current project's, for an Owner, Admin or project editor to "
+                            "approve. Nothing is added until a person approves it. Use it "
+                            "when the user has stated something that will matter to other "
+                            "people's work too (a client preference, a rule, a decision and "
+                            "its reason), not for things that only matter in this chat — "
+                            "those belong in flag_key_insight. Tell the user in your reply "
+                            "that you've suggested it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "A short label, under 120 characters."},
+                    "text": {
+                        "type": "string",
+                        "description": "The fact, self-contained, readable months from now by "
+                                        "someone who never saw this chat.",
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["project", "company"],
+                        "description": "\"project\" when it's about this chat's project or "
+                                        "client (the usual case), \"company\" when it holds for "
+                                        "the whole company.",
+                    },
+                },
+                "required": ["title", "text", "scope"],
+            },
+        },
+    },
 ]
 
 # ask_user_choice, propose_research_mode, propose_plan_ready,
@@ -491,6 +548,42 @@ class ToolExecutionError(Exception):
     pass
 
 
+def _dispatch_knowledge(name: str, arguments: dict, context: dict) -> str:
+    """Company and project knowledge (storage/knowledge.py, 2026-09-24).
+
+    Scope comes from `context`, set by the dispatcher from the conversation
+    itself, never from the model: a chat can only search the company's
+    knowledge and its OWN project's, whatever a model asks for. Which
+    project a conversation is in was already checked against the person's
+    access when it was set (server.py's _apply_project)."""
+    from storage import knowledge
+
+    project_id = context.get("project_id")
+    if name == "search_knowledge":
+        scopes = [knowledge.COMPANY] + ([knowledge.project_scope(project_id)] if project_id else [])
+        hits = knowledge.search(scopes, arguments.get("query") or "")
+        if not hits:
+            return "Nothing in the company's knowledge matches that. Don't guess company-specific facts; ask the user."
+        lines = []
+        for h in hits:
+            where = "company" if h["scope"] == knowledge.COMPANY else "this project"
+            lines.append(f"[{where}] {h['title']}: {h['body']}")
+        return "\n\n".join(lines)
+
+    scope_arg = (arguments.get("scope") or "project").lower()
+    if scope_arg == "project" and not project_id:
+        scope_arg = "company"  # a chat outside any project can only suggest for the company
+    scope = knowledge.COMPANY if scope_arg == "company" else knowledge.project_scope(project_id)
+    try:
+        knowledge.suggest_entry_from_chat(
+            scope, arguments.get("title") or "", arguments.get("text") or "", context.get("conversation_id"),
+        )
+    except knowledge.KnowledgeError as e:
+        return f"Not suggested: {e}"
+    who = "an Owner or Admin" if scope == knowledge.COMPANY else "one of the project's editors"
+    return f"Suggested. It waits for {who} to approve it before NAVI uses it. Tell the user you've suggested it."
+
+
 def dispatch(name: str, arguments: dict, context: dict) -> str:
     """
     Runs a tool call and returns its result as a plain string (what gets
@@ -520,6 +613,9 @@ def dispatch(name: str, arguments: dict, context: dict) -> str:
             # function never touches an MCP server directly, on purpose —
             # JuanJo: "I don't want to mix them."
             return dispatch_mcp_tool(name, arguments, context)
+
+        if name in ("search_knowledge", "suggest_knowledge"):
+            return _dispatch_knowledge(name, arguments, context)
 
         if name == "web_search":
             query = arguments["query"]

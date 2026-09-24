@@ -127,6 +127,21 @@ async def ensure_conversation(conversation_id: str, mode: str) -> None:
         await db.commit()
 
 
+async def set_conversation_project(conversation_id: str, project_id: str | None) -> None:
+    """Puts a conversation in a project (storage/knowledge.py), or takes it
+    out with None. The column existed from the start and nothing set it
+    until projects were built (2026-09-24). Takes effect from the next
+    turn: that turn reads the project's brief and searches its library.
+    The caller has already checked the person may use the project."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_schema(db)
+        await db.execute(
+            "UPDATE conversations SET project_id = ?, updated_at = ? WHERE id = ?",
+            (project_id, time.time(), conversation_id),
+        )
+        await db.commit()
+
+
 async def get_conversation(conversation_id: str) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_schema(db)

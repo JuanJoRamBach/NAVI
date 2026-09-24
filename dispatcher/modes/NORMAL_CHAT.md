@@ -1,5 +1,5 @@
 ---
-tools: [web_search, fetch_page, send_to_telegram, ask_user_choice, create_document, propose_research_mode, flag_key_insight, request_stronger_model, propose_branch_complete]
+tools: [web_search, fetch_page, send_to_telegram, ask_user_choice, create_document, propose_research_mode, flag_key_insight, request_stronger_model, propose_branch_complete, search_knowledge, suggest_knowledge]
 ---
 # Normal Chat Mode
 

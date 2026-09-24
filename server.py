@@ -86,8 +86,9 @@ from push.sender import PushError, add_subscription, send_push, subscription_cou
 from storage.filen import StorageError, download_for_reply, file_download_url
 from storage.conversations import (
     await_turn, begin_turn, create_conversation, ensure_conversation, fail_turn, finish_turn,
-    get_conversation, get_messages, get_task_state,
+    get_conversation, get_messages, get_task_state, set_conversation_project,
 )
+from storage import knowledge
 from storage.agent_work import (
     create_workflow as create_workflow_definition,
     delete_all_runs, delete_run,
@@ -1355,6 +1356,11 @@ async def chat_send(request: Request) -> JSONResponse:
             return JSONResponse(replay)
         if not conversation_id:
             conversation_id = await create_conversation(mode=mode)
+        refused = await _apply_project(request, payload, conversation_id)
+        if refused is not None:
+            if claimed:
+                await fail_turn(claimed)
+            return refused
         # Research mode (2026-09-12) needs real stage-tracking (planning
         # -> readiness checkpoint -> plan confirmation -> execution) that
         # no other mode has an equivalent of — dispatcher/research.py owns
@@ -1426,6 +1432,11 @@ async def chat_stream(request: Request):
         )
     if not conversation_id:
         conversation_id = await create_conversation(mode=mode)
+    refused = await _apply_project(request, payload, conversation_id)
+    if refused is not None:
+        if claimed:
+            await fail_turn(claimed)
+        return refused
 
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -1623,6 +1634,178 @@ async def config_role_reset(request: Request) -> JSONResponse:
     if restored is None:
         return JSONResponse({"error": f"no default routing for role '{role}'"}, status_code=400)
     return JSONResponse({"ok": True, "role": restored})
+
+
+# ---- Company and project knowledge (2026-09-24) ----
+#
+# Every rule (who may edit, who may approve, the Owner exception, stale
+# approvals, append-only history) lives in storage/knowledge.py, not here,
+# so no route can forget one. These routes only establish WHO is asking
+# and turn a refusal into a readable error.
+
+def _valid_scope(scope: str | None) -> str:
+    if scope == knowledge.COMPANY or (scope or "").startswith(knowledge.PROJECT_PREFIX):
+        return scope
+    raise knowledge.KnowledgeError("Unknown scope.")
+
+
+async def _knowledge_call(request: Request, fn, *args, **kwargs) -> JSONResponse:
+    user = await _current_user(request)
+    if user is None:
+        return JSONResponse({"error": "login required"}, status_code=401)
+    try:
+        result = await asyncio.to_thread(fn, user, *args, **kwargs)
+    except knowledge.KnowledgeError as e:
+        return JSONResponse({"error": str(e)}, status_code=e.status)
+    return JSONResponse(result if isinstance(result, dict) else {"items": result})
+
+
+@app.get("/knowledge/overview")
+async def knowledge_overview(request: Request) -> JSONResponse:
+    """What the Settings screens open with: my projects and what's waiting
+    for me to act on."""
+    def overview(user):
+        return {
+            "me": {"id": user["id"], "email": user["email"], "role": user["role"]},
+            "projects": knowledge.list_projects(user),
+            "waiting": knowledge.waiting_for(user),
+            "limits": knowledge.BRIEF_LIMITS,
+        }
+    return await _knowledge_call(request, overview)
+
+
+@app.post("/projects")
+async def projects_create(request: Request) -> JSONResponse:
+    payload = await request.json()
+    return await _knowledge_call(request, knowledge.create_project, payload.get("name"))
+
+
+@app.post("/projects/{project_id}/archive")
+async def projects_archive(project_id: str, request: Request) -> JSONResponse:
+    return await _knowledge_call(request, lambda u: knowledge.archive_project(u, project_id) or {"ok": True})
+
+
+@app.get("/projects/{project_id}/members")
+async def projects_members(project_id: str, request: Request) -> JSONResponse:
+    """Members with their names, plus everyone who could be added. Owners
+    and Admins are listed as editors of every project, since they are."""
+    people = {u["id"]: u for u in await list_users() if u.get("is_active")}
+
+    def members(user):
+        rows = knowledge.list_members(user, project_id)
+        listed = {r["user_id"] for r in rows}
+        out = [
+            {"user_id": r["user_id"], "email": people[r["user_id"]]["email"], "name": people[r["user_id"]].get("name"),
+             "access": r["access"], "via_role": False}
+            for r in rows if r["user_id"] in people
+        ]
+        out += [
+            {"user_id": p["id"], "email": p["email"], "name": p.get("name"), "access": "edit", "via_role": True}
+            for p in people.values() if p["role"] in ("owner", "admin") and p["id"] not in listed
+        ]
+        addable = [
+            {"user_id": p["id"], "email": p["email"], "name": p.get("name")}
+            for p in people.values() if p["role"] == "member" and p["id"] not in listed
+        ]
+        return {"members": out, "addable": addable, "project": knowledge.get_project(user, project_id)}
+    return await _knowledge_call(request, members)
+
+
+@app.post("/projects/{project_id}/members")
+async def projects_set_member(project_id: str, request: Request) -> JSONResponse:
+    payload = await request.json()
+    target = await get_user_by_id(payload.get("user_id") or "")
+    if not target:
+        return JSONResponse({"error": "That person doesn't exist."}, status_code=404)
+    access = payload.get("access")
+    return await _knowledge_call(
+        request, lambda u: knowledge.set_member(u, project_id, target, access) or {"ok": True},
+    )
+
+
+@app.get("/knowledge/brief")
+async def knowledge_brief(request: Request, scope: str = Query(...)) -> JSONResponse:
+    return await _knowledge_call(request, lambda u: knowledge.brief_state(u, _valid_scope(scope)))
+
+
+@app.post("/knowledge/brief")
+async def knowledge_brief_propose(request: Request) -> JSONResponse:
+    payload = await request.json()
+    return await _knowledge_call(
+        request, lambda u: knowledge.propose_brief(u, _valid_scope(payload.get("scope")), payload.get("text")),
+    )
+
+
+@app.post("/knowledge/brief/{version_id}/approve")
+async def knowledge_brief_approve(version_id: str, request: Request) -> JSONResponse:
+    return await _knowledge_call(request, knowledge.approve_brief, version_id)
+
+
+@app.post("/knowledge/brief/{version_id}/reject")
+async def knowledge_brief_reject(version_id: str, request: Request) -> JSONResponse:
+    payload = await request.json() if await request.body() else {}
+    return await _knowledge_call(request, knowledge.reject_brief, version_id, payload.get("note"))
+
+
+@app.post("/knowledge/brief/{version_id}/review")
+async def knowledge_brief_review(version_id: str, request: Request) -> JSONResponse:
+    payload = await request.json() if await request.body() else {}
+    return await _knowledge_call(request, knowledge.review_brief, version_id, bool(payload.get("flag")), payload.get("note"))
+
+
+@app.post("/knowledge/brief/{version_id}/restore")
+async def knowledge_brief_restore(version_id: str, request: Request) -> JSONResponse:
+    return await _knowledge_call(request, knowledge.revert_brief, version_id)
+
+
+@app.get("/knowledge/entries")
+async def knowledge_entries(request: Request, scope: str = Query(...)) -> JSONResponse:
+    return await _knowledge_call(request, lambda u: knowledge.list_entries(u, _valid_scope(scope)))
+
+
+@app.post("/knowledge/entries")
+async def knowledge_entries_add(request: Request) -> JSONResponse:
+    payload = await request.json()
+    return await _knowledge_call(
+        request,
+        lambda u: knowledge.add_entry(u, _valid_scope(payload.get("scope")), payload.get("title"), payload.get("body")),
+    )
+
+
+@app.post("/knowledge/entries/{entry_id}/decide")
+async def knowledge_entries_decide(entry_id: str, request: Request) -> JSONResponse:
+    payload = await request.json()
+    return await _knowledge_call(request, knowledge.decide_entry, entry_id, bool(payload.get("approve")), payload.get("note"))
+
+
+@app.post("/knowledge/entries/{entry_id}/retire")
+async def knowledge_entries_retire(entry_id: str, request: Request) -> JSONResponse:
+    payload = await request.json() if await request.body() else {}
+    return await _knowledge_call(request, knowledge.retire_entry, entry_id, payload.get("reason"))
+
+
+@app.get("/knowledge/history")
+async def knowledge_history(request: Request, scope: str = Query(...)) -> JSONResponse:
+    return await _knowledge_call(request, lambda u: knowledge.history(u, _valid_scope(scope)))
+
+
+async def _apply_project(request: Request, payload: dict, conversation_id: str) -> JSONResponse | None:
+    """Puts the conversation in the project the client sent, if it sent
+    one ("project_id": null takes it out). Refused unless this person can
+    use that project: the project decides which brief the model follows and
+    which library it searches, so it can't be chosen by anyone who asks."""
+    if "project_id" not in payload:
+        return None
+    project_id = payload.get("project_id") or None
+    conversation = await get_conversation(conversation_id)
+    if conversation and conversation.get("project_id") == project_id:
+        return None
+    if project_id:
+        user = await _current_user(request)
+        if not user or not await asyncio.to_thread(knowledge.project_access, user, project_id):
+            return JSONResponse({"error": "You don't have access to that project."}, status_code=403)
+    await set_conversation_project(conversation_id, project_id)
+    return None
 
 
 # ---- Bring your own key (2026-09-23) ----

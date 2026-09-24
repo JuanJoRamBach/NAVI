@@ -1,5 +1,5 @@
 ---
-tools: [web_search, fetch_page, ask_user_choice]
+tools: [web_search, fetch_page, ask_user_choice, search_knowledge]
 ---
 # Research Chat Mode — Execution Stage
 

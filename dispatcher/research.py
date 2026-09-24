@@ -62,8 +62,9 @@ from providers.registry import (
 )
 from storage.context_store import record_friction
 from storage.usage import set_call_context
-from storage.conversations import append_message, get_messages, get_task_state, set_task_state
+from storage.conversations import append_message, get_conversation, get_messages, get_task_state, set_task_state
 from storage.filen import StorageError, file_download_url, save_bytes
+from storage.knowledge import brief_block
 from tools.registry import schemas_for
 from tools.report_render import ReportRenderError, convert_docx_to_pdf, render_research_report_docx
 
@@ -199,8 +200,19 @@ async def run_research_chat(conversation_id: str, text: str) -> dict:
     return await _run_planning_turn(conversation_id)
 
 
+async def _with_briefs(conversation_id: str, system_prompt: str) -> tuple[str, str | None]:
+    """The mode brief plus the company's and project's briefs
+    (storage/knowledge.py), and the conversation's project for the tool
+    context. Planning only gets the briefs: it runs no tool loop, so it
+    can't search the library; execution can."""
+    project_id = ((await get_conversation(conversation_id)) or {}).get("project_id")
+    briefs = await asyncio.to_thread(brief_block, project_id)
+    return (f"{system_prompt}\n\n{briefs}" if briefs else system_prompt), project_id
+
+
 async def _run_planning_turn(conversation_id: str) -> dict:
     brief = get_mode_brief("research")
+    system_base, _project_id = await _with_briefs(conversation_id, brief.system_prompt)
     history = await get_messages(conversation_id, limit=RECENT_MESSAGE_WINDOW)
     tools = schemas_for(brief.tools)
     history_messages = _history_to_messages(history)
@@ -229,7 +241,7 @@ async def _run_planning_turn(conversation_id: str) -> dict:
             last_error = str(e)
             continue
         family = classify_family(attempt["provider"], attempt["model"])
-        system_content = adapt_system_prompt(brief.system_prompt, family, attempt["model"])
+        system_content = adapt_system_prompt(system_base, family, attempt["model"])
         extra_params = adapt_request_params(family, attempt["provider"], has_tools=True) or None
         messages = list(history_messages)
         if system_content is not None:
@@ -307,6 +319,7 @@ def _parse_report_json(text: str) -> dict | None:
 
 async def _run_execution(conversation_id: str, plan: dict) -> dict:
     brief = get_mode_brief("research_execute")
+    system_base, project_id = await _with_briefs(conversation_id, brief.system_prompt)
     tools = schemas_for(brief.tools)
     task_message = (
         f"The user has reviewed and accepted this research plan:\n\n{_format_plan_markdown(plan)}\n\n"
@@ -340,7 +353,7 @@ async def _run_execution(conversation_id: str, plan: dict) -> dict:
             last_error = str(e)
             continue
         family = classify_family(attempt["provider"], attempt["model"])
-        system_content = adapt_system_prompt(brief.system_prompt, family, attempt["model"])
+        system_content = adapt_system_prompt(system_base, family, attempt["model"])
         extra_params = adapt_request_params(family, attempt["provider"], has_tools=True) or None
         messages = [ChatMessage(role="user", content=task_message)]
         if system_content is not None:
@@ -352,7 +365,10 @@ async def _run_execution(conversation_id: str, plan: dict) -> dict:
             if tools and response.tool_calls:
                 response, _sent_messages, _iterations = await asyncio.to_thread(
                     run_tool_loop, provider, attempt["model"], messages, response,
-                    context={"command": "research-execute", "topic_slug": slugify(plan.get("goal") or "research")},
+                    context={
+                        "command": "research-execute", "topic_slug": slugify(plan.get("goal") or "research"),
+                        "conversation_id": conversation_id, "project_id": project_id,
+                    },
                     tools=tools, extra_params=extra_params,
                 )
             report = _parse_report_json(response.text or "")

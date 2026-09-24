@@ -41,6 +41,11 @@ agents.db
 # holds real password hashes/session tokens, not just app state.
 auth.db
 
+# storage/knowledge.py's SQLite store (company and project briefs, their
+# libraries and their change history, 2026-09-24) — same reasoning, and it
+# holds a company's own knowledge.
+knowledge.db
+
 # Local-only running notes across Claude Code sessions — scratch
 # continuity, not project documentation, not meant to be committed.
 # Auto-loaded via CLAUDE.md's @IDEAS.md import.
